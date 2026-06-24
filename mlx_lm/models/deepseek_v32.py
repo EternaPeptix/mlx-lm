@@ -55,7 +55,7 @@ class ModelArgs(BaseModelArgs):
     # Indexer RoPE/eps knobs. These DEFAULTS reproduce DeepSeek-V3.2 exactly
     # (interleaved RoPE via traditional=True, LayerNorm eps 1e-5). GLM-5.2 overrides
     # them in glm_moe_dsa.py to non-interleaved RoPE (traditional=False) + eps 1e-6.
-    indexer_rope_traditional: bool = True
+    indexer_rope_traditional: bool = False
     indexer_norm_eps: float = 1e-5
 
 
