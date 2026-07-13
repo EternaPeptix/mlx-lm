@@ -235,7 +235,15 @@ class GlmMoeDsaModel(DeepseekV32Model):
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         prev_topk_indices = None
-        import mlx.core as _mx
+        import os as _os, mlx.core as _mx
+        # JACCL forces collectives onto the CPU stream and all_sum pulls GPU data
+        # to CPU (mlx/distributed/jaccl/jaccl.cpp). When MLX builds a deep lazy
+        # graph across many layers, the CPU-stream collectives race in the
+        # GPU<->CPU sync path and IOSurfaceSharedEvent deadlocks. Periodically
+        # forcing eval serializes the graph just enough to prevent the race.
+        # Stride 26 (3 evals over 78 layers) recovers ~97% of peak decode tok/s
+        # while reliably preventing the deadlock. Tunable via env.
+        _eval_stride = int(_os.environ.get("EXO_JACCL_EVAL_STRIDE", "26"))
         for i in range(self.num_layers):
             _li = self.start_idx + i
             h_attn, prev_topk_indices = self.layers[_li].self_attn(
@@ -249,7 +257,7 @@ class GlmMoeDsaModel(DeepseekV32Model):
             # lazily-built layers, which deadlocks IOSurfaceSharedEvent.
             # See mlx-src/mlx/distributed/jaccl/jaccl.cpp:communication_stream
             # forcing all collectives to the CPU stream.
-            if self.pipeline_size == 1:
+            if self.pipeline_size == 1 and _eval_stride > 0 and (i + 1) % _eval_stride == 0:
                 _mx.eval(h)
 
         # Send to the next process in the pipeline
