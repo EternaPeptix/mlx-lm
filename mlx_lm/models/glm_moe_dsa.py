@@ -14,6 +14,16 @@ from .deepseek_v32 import (
 )
 from .deepseek_v32 import Model as DSV32Model
 
+# EXO_MTP_DSA_PATCH_APPLIED
+# Lazy import of the MTP draft head. Lives in the exo package so it can
+# evolve without re-patching this vendored file.
+def _load_mtp_head_class():
+    try:
+        from exo.worker.engines.mlx.mtp import MTPHead
+        return MTPHead
+    except Exception:
+        return None
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -54,6 +64,7 @@ class ModelArgs(BaseModelArgs):
     index_topk_pattern: Optional[Any] = None
     index_topk_freq: int = 1
     index_skip_topk_offset: int = 2
+    num_nextn_predict_layers: Optional[int] = 0  # MTP/NextN layers (EXO_MTP patch)
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
@@ -224,10 +235,22 @@ class GlmMoeDsaModel(DeepseekV32Model):
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         prev_topk_indices = None
+        import mlx.core as _mx
         for i in range(self.num_layers):
-            h, prev_topk_indices = self.layers[self.start_idx + i](
-                h, mask, cache[i], prev_topk_indices
+            _li = self.start_idx + i
+            h_attn, prev_topk_indices = self.layers[_li].self_attn(
+                self.layers[_li].input_layernorm(h), mask, cache[i], prev_topk_indices
             )
+            h = h + h_attn
+            h_mlp = self.layers[_li].mlp(self.layers[_li].post_attention_layernorm(h))
+            h = h + h_mlp
+            # Serialize the distributed collectives so JACCL's CPU-stream
+            # all_sum (in ShardedToAllLinear / ShardedMoE) doesn't race across
+            # lazily-built layers, which deadlocks IOSurfaceSharedEvent.
+            # See mlx-src/mlx/distributed/jaccl/jaccl.cpp:communication_stream
+            # forcing all collectives to the CPU stream.
+            if self.pipeline_size == 1:
+                _mx.eval(h)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -246,6 +269,30 @@ class Model(DSV32Model):
     def __init__(self, config: ModelArgs):
         super().__init__(config)
         self.model = GlmMoeDsaModel(config)
+        # MTP (NextN) draft head for speculative decoding. Built only when
+        # EXO_MTP_SPECULATIVE is set AND the checkpoint carries an MTP layer
+        # (num_nextn_predict_layers > 0). Otherwise stays None and the whole
+        # speculative path is inert — zero behavior change vs upstream.
+        import os as _os
+        self.mtp_head = None
+        _has_mtp = bool(getattr(config, "num_nextn_predict_layers", 0))
+        if _os.environ.get("EXO_MTP_SPECULATIVE", "").lower() in ("1", "true", "yes") and _has_mtp:
+            _MTPHead = _load_mtp_head_class()
+            if _MTPHead is not None:
+                # Locate the standalone MTP shard (model.mtp-head.safetensors).
+                # It's kept OUT of the main index so exo's download-integrity
+                # check doesn't wipe it. Explicit path wins; else search the
+                # standard exo model dirs one level deep.
+                _shard = _os.environ.get("EXO_MTP_SHARD")
+                if not _shard:
+                    _models_dir = _os.path.expanduser("~/.exo/models")
+                    if _os.path.isdir(_models_dir):
+                        for _d in _os.listdir(_models_dir):
+                            _p = _os.path.join(_models_dir, _d, "model.mtp-head.safetensors")
+                            if _os.path.isfile(_p):
+                                _shard = _p
+                                break
+                self.mtp_head = _MTPHead(config, shard_path=_shard)
 
     def make_cache(self):
         # Shared layers run no indexer, so they get no indexer KVCache.
