@@ -7,6 +7,21 @@ from typing import Callable, Dict, List, Optional
 import mlx.core as mx
 
 
+class _GreedySampler:
+    """Argmax sampler carrying an explicit capability marker."""
+
+    _mlx_lm_is_greedy = True
+
+    def __call__(self, logprobs: mx.array) -> mx.array:
+        return mx.argmax(logprobs, axis=-1)
+
+
+def is_greedy_sampler(sampler: Callable[[mx.array], mx.array]) -> bool:
+    """Return whether ``sampler`` is the exact argmax sampler made here."""
+
+    return isinstance(sampler, _GreedySampler)
+
+
 def make_sampler(
     temp: float = 0.0,
     top_p: float = 0.0,
@@ -44,7 +59,7 @@ def make_sampler(
             A sampler which takes log-probabilities and returns tokens.
     """
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+        return _GreedySampler()
 
     # Create sampler chain
     sampling_methods = []

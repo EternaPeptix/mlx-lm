@@ -29,7 +29,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import is_greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -466,6 +466,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    greedy_vocab_parallel_no_logprobs: bool = False,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -497,6 +498,11 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        greedy_vocab_parallel_no_logprobs (bool): Request the compact
+          vocabulary-parallel argmax path. It is used only with a marked greedy
+          sampler, no logits processors, no input embeddings, and a compatible
+          sharded model. The yielded logprobs vector is empty when active.
+          Default: ``False``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -533,7 +539,22 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    sampler = sampler or make_sampler(temp=0.0)
+    supports_compact_greedy = getattr(
+        model,
+        "supports_vocab_parallel_greedy",
+        None,
+    )
+    compact_greedy = getattr(model, "vocab_parallel_greedy", None)
+    use_compact_greedy = (
+        greedy_vocab_parallel_no_logprobs
+        and input_embeddings is None
+        and not logits_processors
+        and is_greedy_sampler(sampler)
+        and callable(supports_compact_greedy)
+        and bool(supports_compact_greedy())
+        and callable(compact_greedy)
+    )
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
@@ -547,6 +568,14 @@ def generate_step(
         nonlocal tokens
 
         with mx.stream(generation_stream):
+            if use_compact_greedy:
+                sampled = compact_greedy(
+                    input_tokens[None],
+                    cache=prompt_cache,
+                )
+                quantize_cache_fn(prompt_cache)
+                return sampled, mx.array([], dtype=mx.float32)
+
             logits = _model_call(
                 input_tokens=input_tokens[None],
                 input_embeddings=(
@@ -1088,6 +1117,10 @@ def stream_generate(
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        # Compact greedy produces no target logprobs and is only valid for the
+        # ordinary one-token path. Speculative verification needs full target
+        # distributions, so an opt-in request falls back here.
+        kwargs.pop("greedy_vocab_parallel_no_logprobs", None)
         # ``async_lookahead`` controls the ordinary one-token generator.
         # Speculative generation manages its own target-round submission and
         # transaction lifecycle, so forwarding this otherwise valid

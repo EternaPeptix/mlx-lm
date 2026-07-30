@@ -1972,6 +1972,21 @@ class LanguageModel(nn.Module):
             return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
+    def supports_vocab_parallel_greedy(self) -> bool:
+        return isinstance(self.lm_head, VocabParallelHead)
+
+    def vocab_parallel_greedy(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        """Run one decode forward and exchange only per-rank argmax candidates."""
+
+        if not isinstance(self.lm_head, VocabParallelHead):
+            raise RuntimeError("Kimi K3 vocabulary-parallel head is not active")
+        hidden = self.model(inputs, cache)
+        return self.lm_head.greedy_token(hidden[:, -1, :])
+
     @property
     def layers(self):
         return self.model.layers[self.model.start_idx : self.model.end_idx]
@@ -2364,11 +2379,12 @@ class LanguageModel(nn.Module):
 
 
 class VocabParallelHead(nn.Module):
-    """Row-shard an untied LM head and reconstruct full-vocabulary logits.
+    """Row-shard an untied LM head.
 
-    This preserves the standard model contract for sampling and logprobs
-    while avoiding replicated projection work.  The vocabulary axis is moved
-    to the front because MLX ``all_gather`` concatenates its leading axis.
+    The ordinary call reconstructs full-vocabulary logits, preserving the
+    standard model contract for processors, sampling, and logprobs. The
+    explicitly requested greedy path instead exchanges one ``(score, global
+    token id)`` candidate per rank and returns the exact global argmax.
     """
 
     def __init__(self, lm_head: nn.Module, group: mx.distributed.Group):
@@ -2389,6 +2405,49 @@ class VocabParallelHead(nn.Module):
         )
         return mx.contiguous(mx.moveaxis(full_vocab_first, 0, -1))
 
+    def greedy_token(self, x: mx.array) -> mx.array:
+        """Return the full-vocabulary argmax with deterministic lowest-id ties."""
+
+        if x.ndim != 2:
+            raise ValueError("vocabulary-parallel greedy sampling requires [B, H]")
+
+        local_logits = self.local_head(x)
+        local_vocab_size = local_logits.shape[-1]
+        full_vocab_size = local_vocab_size * self.group.size()
+        if full_vocab_size > (1 << 24):
+            raise ValueError(
+                "vocabulary-parallel greedy sampling requires token ids "
+                "representable exactly as float32"
+            )
+
+        local_id = mx.argmax(local_logits, axis=-1)
+        local_score = mx.take_along_axis(
+            local_logits,
+            local_id[..., None],
+            axis=-1,
+        ).squeeze(-1)
+        global_id = local_id + self.group.rank() * local_vocab_size
+
+        # A leading singleton lets all_gather concatenate candidates in rank
+        # order. MLX argmax resolves equal scores to the first rank, while each
+        # local argmax resolves to its first local index; together these match
+        # full-vocabulary argmax's lowest-global-token-id tie break.
+        candidate = mx.stack(
+            [
+                local_score.astype(mx.float32),
+                global_id.astype(mx.float32),
+            ],
+            axis=-1,
+        )[None]
+        candidates = mx.distributed.all_gather(candidate, group=self.group)
+        winner_rank = mx.argmax(candidates[..., 0], axis=0)
+        winner_id = mx.take_along_axis(
+            candidates[..., 1],
+            winner_rank[None],
+            axis=0,
+        )[0]
+        return winner_id.astype(mx.uint32)
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -2403,6 +2462,16 @@ class Model(nn.Module):
         cache: Optional[List[Any]] = None,
     ) -> mx.array:
         return self.language_model(inputs, cache)
+
+    def supports_vocab_parallel_greedy(self) -> bool:
+        return self.language_model.supports_vocab_parallel_greedy()
+
+    def vocab_parallel_greedy(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        return self.language_model.vocab_parallel_greedy(inputs, cache)
 
     @property
     def model(self):
