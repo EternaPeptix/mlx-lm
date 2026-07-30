@@ -17,7 +17,11 @@ def compute_g_safe(A_log, a, dt_bias, lower_bound):
     )
 
 
-def _make_gated_delta_kernel(has_mask=False, vectorized=False):
+def _make_gated_delta_kernel(
+    has_mask=False,
+    vectorized=False,
+    return_state_history=False,
+):
     if not mx.metal.is_available():
         return None
     mask_source = "mask[b_idx * T + t]" if has_mask else "true"
@@ -33,6 +37,19 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         g_setup = "auto g_ = g + b_idx * T * Hv;"
         g_access = "g_[hv_idx]"
         g_advance = "g_ += Hv;"
+
+    state_history_write = (
+        """
+            auto h_state =
+                state_history + ((n * T + t) * Dv + dv_idx) * Dk;
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              h_state[s_idx] = static_cast<StT>(state[i]);
+            }
+        """
+        if return_state_history
+        else ""
+    )
 
     source = f"""
         auto n = thread_position_in_grid.z;
@@ -98,6 +115,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
           y += Hv * Dv;
           {g_advance}
           beta_ += Hv;
+          {state_history_write}
         }}
         for (int i = 0; i < n_per_t; ++i) {{
           auto s_idx = n_per_t * dk_idx + i;
@@ -113,11 +131,17 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         suffix += "_vec"
     if has_mask:
         suffix += "_mask"
+    if return_state_history:
+        suffix += "_history"
 
     return mx.fast.metal_kernel(
         name=f"gated_delta_step{suffix}",
         input_names=inputs,
-        output_names=["y", "state_out"],
+        output_names=(
+            ["y", "state_out", "state_history"]
+            if return_state_history
+            else ["y", "state_out"]
+        ),
         source=source,
     )
 
@@ -127,6 +151,20 @@ _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
     has_mask=True, vectorized=True
+)
+_gated_delta_kernel_history = _make_gated_delta_kernel(return_state_history=True)
+_gated_delta_kernel_masked_history = _make_gated_delta_kernel(
+    has_mask=True,
+    return_state_history=True,
+)
+_gated_delta_kernel_vec_history = _make_gated_delta_kernel(
+    vectorized=True,
+    return_state_history=True,
+)
+_gated_delta_kernel_vec_masked_history = _make_gated_delta_kernel(
+    has_mask=True,
+    vectorized=True,
+    return_state_history=True,
 )
 
 
@@ -183,24 +221,44 @@ def gated_delta_kernel(
     beta: mx.array,
     state: mx.array,
     mask: Optional[mx.array] = None,
-) -> Tuple[mx.array, mx.array]:
+    return_state_history: bool = False,
+) -> Tuple[mx.array, ...]:
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
     state_type = state.dtype
     if g.ndim == 4:
-        kernel = _gated_delta_kernel_vec
+        kernel = (
+            _gated_delta_kernel_vec_history
+            if return_state_history
+            else _gated_delta_kernel_vec
+        )
         inputs = [q, k, v, g, beta, state, T]
         if mask is not None:
-            kernel = _gated_delta_kernel_vec_masked
+            kernel = (
+                _gated_delta_kernel_vec_masked_history
+                if return_state_history
+                else _gated_delta_kernel_vec_masked
+            )
             inputs.append(mask)
     else:
-        kernel = _gated_delta_kernel
+        kernel = (
+            _gated_delta_kernel_history if return_state_history else _gated_delta_kernel
+        )
         inputs = [q, k, v, g, beta, state, T]
         if mask is not None:
-            kernel = _gated_delta_kernel_masked
+            kernel = (
+                _gated_delta_kernel_masked_history
+                if return_state_history
+                else _gated_delta_kernel_masked
+            )
             inputs.append(mask)
 
+    output_shapes = [(B, T, Hv, Dv), state.shape]
+    output_dtypes = [input_type, state_type]
+    if return_state_history:
+        output_shapes.append((B, Hv, T, Dv, Dk))
+        output_dtypes.append(state_type)
     return kernel(
         inputs=inputs,
         template=[
@@ -213,8 +271,8 @@ def gated_delta_kernel(
         ],
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
-        output_shapes=[(B, T, Hv, Dv), state.shape],
-        output_dtypes=[input_type, state_type],
+        output_shapes=output_shapes,
+        output_dtypes=output_dtypes,
     )
 
 
@@ -226,7 +284,8 @@ def gated_delta_ops(
     beta: mx.array,
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
-) -> Tuple[mx.array, mx.array]:
+    return_state_history: bool = False,
+) -> Tuple[mx.array, ...]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
     Supports both scalar and vectorized gating.
@@ -251,6 +310,7 @@ def gated_delta_ops(
         k = mx.repeat(k, repeat_factor, -2)
 
     ys = []
+    state_history = []
     for t in range(T):
         y, state = _gated_delta_step_ops(
             q[:, t],
@@ -262,7 +322,11 @@ def gated_delta_ops(
             None if mask is None else mask[:, t],
         )
         ys.append(y)
+        if return_state_history:
+            state_history.append(state)
     y = mx.stack(ys, axis=1)
+    if return_state_history:
+        return y, state, mx.stack(state_history, axis=2)
     return y, state
 
 
@@ -279,7 +343,8 @@ def gated_delta_update(
     use_kernel: bool = True,
     lower_bound: Optional[float] = None,
     beta_scale: float = 1.0,
-) -> Tuple[mx.array, mx.array]:
+    return_state_history: bool = False,
+) -> Tuple[mx.array, ...]:
     beta = mx.sigmoid(b)
     if beta_scale != 1.0:
         beta = beta * beta_scale
@@ -299,5 +364,23 @@ def gated_delta_update(
         or k.shape[-1] < 32
         or k.shape[-1] % 32 != 0
     ):
-        return gated_delta_ops(q, k, v, g, beta, state, mask)
-    return gated_delta_kernel(q, k, v, g, beta, state, mask)
+        return gated_delta_ops(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            mask,
+            return_state_history=return_state_history,
+        )
+    return gated_delta_kernel(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        mask,
+        return_state_history=return_state_history,
+    )

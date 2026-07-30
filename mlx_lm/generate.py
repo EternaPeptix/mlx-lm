@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
@@ -210,6 +210,26 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--prompt-lookup-num-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Enable prompt-lookup speculative decoding and draft this many "
+            "tokens per target verification without loading a draft model."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-lookup-max-ngram-size",
+        type=int,
+        default=4,
+        help="Maximum suffix n-gram size used by prompt-lookup drafting.",
+    )
+    parser.add_argument(
+        "--speculative-round-stats",
+        action="store_true",
+        help="Write per-round speculative acceptance statistics as JSON to stderr.",
+    )
     return parser
 
 
@@ -287,9 +307,105 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class SpeculativeRoundStats:
+    """Outcome of one target-model speculative verification round."""
+
+    round_index: int
+    source: str
+    drafted_tokens: int
+    accepted_tokens: int
+    committed_tokens: int
+    target_cache_tokens: int
+    cancelled: bool = False
+
+
+class PromptLookupDrafter:
+    """Draft continuations by matching token suffixes in the existing context."""
+
+    def __init__(
+        self,
+        tokens: Sequence[int],
+        *,
+        max_ngram_size: int = 4,
+        max_candidates: int = 256,
+    ):
+        if max_ngram_size < 2:
+            raise ValueError("prompt lookup requires max_ngram_size >= 2")
+        if max_candidates < 1:
+            raise ValueError("prompt lookup requires max_candidates >= 1")
+        self.max_ngram_size = max_ngram_size
+        self.max_candidates = max_candidates
+        self.tokens: List[int] = []
+        self._positions: dict[int, List[int]] = {}
+        self.append(tokens)
+
+    def append(self, tokens: Sequence[int]):
+        """Add committed sequence tokens to the lookup index."""
+
+        for token in tokens:
+            token = int(token)
+            position = len(self.tokens)
+            self.tokens.append(token)
+            self._positions.setdefault(token, []).append(position)
+
+    def draft(self, num_tokens: int) -> List[int]:
+        """Return a best-effort continuation from an earlier matching suffix."""
+
+        if num_tokens <= 0 or len(self.tokens) < 2:
+            return []
+
+        current_end = len(self.tokens) - 1
+        positions = self._positions.get(self.tokens[current_end], ())
+        best_match = 0
+        best_continuation: List[int] = []
+        candidates_checked = 0
+
+        for candidate_end in reversed(positions):
+            if candidate_end >= current_end:
+                continue
+            if candidates_checked >= self.max_candidates:
+                break
+            candidates_checked += 1
+
+            max_match = min(
+                self.max_ngram_size,
+                candidate_end + 1,
+                current_end + 1,
+            )
+            match = 0
+            while (
+                match < max_match
+                and self.tokens[candidate_end - match]
+                == self.tokens[current_end - match]
+            ):
+                match += 1
+            if match < 2 or match <= best_match:
+                continue
+
+            continuation_start = candidate_end + 1
+            continuation = self.tokens[
+                continuation_start : continuation_start + num_tokens
+            ]
+            if continuation:
+                best_match = match
+                best_continuation = continuation
+                if match == self.max_ngram_size and len(continuation) == num_tokens:
+                    break
+
+        return list(best_continuation)
+
+
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
+    if any(
+        int(getattr(entry, "speculative_width", 0)) > 0 for entry in prompt_cache
+    ):
+        raise ValueError(
+            "KV cache quantization cannot run during an active speculative "
+            "cache transaction"
+        )
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
@@ -481,9 +597,14 @@ def generate_step(
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
-    draft_model: nn.Module,
+    draft_model: Optional[nn.Module] = None,
     *,
     num_draft_tokens: int = 2,
+    prompt_lookup_num_tokens: Optional[int] = None,
+    prompt_lookup_max_ngram_size: int = 4,
+    speculative_round_callback: Optional[
+        Callable[[SpeculativeRoundStats], None]
+    ] = None,
     max_tokens: int = 256,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
@@ -499,9 +620,18 @@ def speculative_generate_step(
     Args:
         prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
-        draft_model (nn.Module): The draft model for speculative decoding.
+        draft_model (nn.Module, optional): The draft model for speculative decoding.
+          This is mutually exclusive with ``prompt_lookup_num_tokens``.
         num_draft_tokens (int, optional): The number of draft tokens for
           speculative decoding. Default: ``2``.
+        prompt_lookup_num_tokens (int, optional): Enable prompt-lookup speculative
+          decoding and propose at most this many tokens per verification. Prompt
+          lookup operates on the target tokenizer's token ids and does not require
+          a draft model. Default: ``None``.
+        prompt_lookup_max_ngram_size (int): Maximum suffix n-gram size considered
+          by prompt lookup. Default: ``4``.
+        speculative_round_callback (Callable, optional): Called after each
+          verification round with :class:`SpeculativeRoundStats`.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
         sampler (Callable[[mx.array], mx.array], optional): A sampler for sampling a
@@ -510,7 +640,8 @@ def speculative_generate_step(
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
         prompt_cache (List[Any], optional): A pre-computed prompt cache. Note, if
-          provided, the cache will be updated in place. The cache must be trimmable.
+          provided, the cache will be updated in place. The cache must be trimmable
+          unless the target model implements transactional speculative-cache hooks.
         prefill_step_size (int): Step size for processing the prompt.
         kv_bits (int, optional): Number of bits to use for KV cache quantization.
           None implies no cache quantization. Default: ``None``.
@@ -520,26 +651,78 @@ def speculative_generate_step(
 
     Yields:
         Tuple[mx.array, mx.array, bool]: One token, a vector of log probabilities,
-          and a bool indicating if the token was generated by the draft model
+          and a bool indicating if the token came from a speculative proposal.
     """
 
+    prompt_lookup = prompt_lookup_num_tokens is not None
+    if draft_model is None and not prompt_lookup:
+        raise ValueError(
+            "Speculative decoding requires a draft model or prompt lookup"
+        )
+    if draft_model is not None and prompt_lookup:
+        raise ValueError(
+            "A draft model and prompt lookup cannot be enabled together"
+        )
+    if prompt_lookup and prompt_lookup_num_tokens <= 0:
+        raise ValueError("prompt_lookup_num_tokens must be greater than zero")
+    if num_draft_tokens < 0:
+        raise ValueError("num_draft_tokens cannot be negative")
+    if max_tokens < -1:
+        raise ValueError("max_tokens must be -1 or non-negative")
+
+    draft_limit = (
+        int(prompt_lookup_num_tokens) if prompt_lookup else num_draft_tokens
+    )
+    draft_source = "prompt_lookup" if prompt_lookup else "draft_model"
     y = prompt.astype(mx.uint32)
     prev_tokens = None
 
     # Create the KV cache for generation
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
+        draft_cache = (
+            None if prompt_lookup else cache.make_prompt_cache(draft_model)
+        )
     else:
-        model_cache = prompt_cache[: len(model.layers)]
-        draft_cache = prompt_cache[len(model.layers) :]
+        if prompt_lookup:
+            model_cache = prompt_cache
+            draft_cache = None
+        else:
+            model_cache = prompt_cache[: len(model.layers)]
+            draft_cache = prompt_cache[len(model.layers) :]
 
-    if not cache.can_trim_prompt_cache(model_cache):
+    speculative_cache_hooks = (
+        "begin_speculative_cache",
+        "resolve_speculative_cache",
+        "cancel_speculative_cache",
+    )
+    transactional_target = all(
+        callable(getattr(model, name, None)) for name in speculative_cache_hooks
+    )
+    if transactional_target and kv_bits is not None:
+        raise ValueError(
+            "Checkpointed speculative decoding does not support KV cache "
+            "quantization"
+        )
+    if transactional_target and draft_limit > 7:
+        raise ValueError(
+            "Checkpointed speculative decoding supports at most 7 draft tokens"
+        )
+
+    if not cache.can_trim_prompt_cache(model_cache) and not transactional_target:
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
         )
 
+    lookup_drafter = (
+        PromptLookupDrafter(
+            y.tolist(),
+            max_ngram_size=prompt_lookup_max_ngram_size,
+        )
+        if prompt_lookup
+        else None
+    )
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
     quantize_cache_fn = functools.partial(
@@ -558,12 +741,13 @@ def speculative_generate_step(
         y = sampler(logprobs)
         return y, logprobs
 
-    def _step(model, cache, y, n_predict=1):
+    def _step(model, cache, y, n_predict=1, quantize=True):
         with mx.stream(generation_stream):
             logits = model(y[None], cache=cache)
             logits = logits[:, -n_predict:, :]
 
-            quantize_cache_fn(cache)
+            if quantize:
+                quantize_cache_fn(cache)
             if logits_processors:
                 nonlocal prev_tokens
                 out_y, out_logprobs = [], []
@@ -595,12 +779,18 @@ def speculative_generate_step(
         return y
 
     def _rewind_cache(num_draft, num_accept):
-        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        if not transactional_target:
+            cache.trim_prompt_cache(model_cache, num_draft - num_accept)
+        if draft_cache is not None:
+            cache.trim_prompt_cache(
+                draft_cache, max(num_draft - num_accept - 1, 0)
+            )
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
             return mx.array([], mx.uint32)
+        if lookup_drafter is not None:
+            return mx.array(lookup_drafter.draft(num_draft), mx.uint32)
         ys = []
         for _ in range(num_draft):
             y, _ = _step(draft_model, draft_cache, y)
@@ -609,56 +799,151 @@ def speculative_generate_step(
         return mx.concatenate(ys)
 
     with mx.stream(generation_stream):
-        draft_y = _prefill(draft_model, draft_cache, y)
+        draft_y = (
+            None
+            if prompt_lookup
+            else _prefill(draft_model, draft_cache, y)
+        )
         y = _prefill(model, model_cache, y)
+
+    if max_tokens == 0:
+        return
 
     ntoks = 0
     # Set these so the finally block doesn't raise
     num_draft = 0
     n = 0
+    round_index = 0
+    round_started = False
+    round_reported = False
+    round_emitted = 0
+    target_transaction = None
+    target_forward_ready = False
+
+    def _report_round(*, target_cache_tokens: int, cancelled: bool):
+        nonlocal round_reported
+        round_reported = True
+        if speculative_round_callback is not None:
+            speculative_round_callback(
+                SpeculativeRoundStats(
+                    round_index=round_index,
+                    source=draft_source,
+                    drafted_tokens=num_draft,
+                    accepted_tokens=n,
+                    committed_tokens=round_emitted,
+                    target_cache_tokens=target_cache_tokens,
+                    cancelled=cancelled,
+                )
+            )
+
     try:
         while True:
-            num_draft = min(max_tokens - ntoks, num_draft_tokens)
-            draft_tokens = _draft_generate(draft_y, num_draft)
+            round_started = True
+            round_reported = False
+            round_emitted = 0
+            target_forward_ready = False
+            target_transaction = None
+            n = 0
+            num_draft = 0
+
+            remaining = (
+                draft_limit if max_tokens == -1 else max_tokens - ntoks
+            )
+            draft_tokens = _draft_generate(
+                draft_y if draft_y is not None else y,
+                min(remaining, draft_limit),
+            )
+            num_draft = int(draft_tokens.size)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
-            tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+            if transactional_target and y.size > 1:
+                target_transaction = model.begin_speculative_cache(
+                    model_cache, int(y.size)
+                )
+            tokens, logprobs = _step(
+                model,
+                model_cache,
+                y,
+                num_draft + 1,
+                quantize=not transactional_target,
+            )
             mx.eval(tokens, draft_tokens)
+            target_forward_ready = True
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
-            n = 0
-            while n < num_draft:
-                tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
-                if tn != dtn:
-                    break
+
+            accepted = 0
+            while accepted < num_draft and tokens[accepted] == draft_tokens[accepted]:
+                accepted += 1
+
+            while n < accepted:
+                tn, lpn = tokens[n], logprobs[n]
                 n += 1
                 ntoks += 1
+                round_emitted += 1
                 yield tn, lpn, True
-                if ntoks == max_tokens:
+                if max_tokens != -1 and ntoks == max_tokens:
                     break
-            if ntoks < max_tokens:
+            if max_tokens == -1 or ntoks < max_tokens:
                 ntoks += 1
+                round_emitted += 1
                 yield tokens[n], logprobs[n], False
 
-            if ntoks == max_tokens:
+            if target_transaction is not None:
+                model.resolve_speculative_cache(target_transaction, n + 1)
+                target_transaction = None
+
+            if lookup_drafter is not None:
+                lookup_drafter.append(tokens[:round_emitted])
+            _report_round(target_cache_tokens=n + 1, cancelled=False)
+            round_index += 1
+
+            if max_tokens != -1 and ntoks == max_tokens:
                 break
 
             y = mx.array([tokens[n]], mx.uint32)
-            draft_y = y
+            if not prompt_lookup:
+                draft_y = y
 
-            # If we accepted all the draft tokens, include the last
-            # draft token in the next draft step since it hasn't been
-            # processed yet by the draft model
-            if n == num_draft:
-                draft_y = mx.concatenate(
-                    [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
-                )
+                # If we accepted all the draft tokens, include the last
+                # draft token in the next draft step since it hasn't been
+                # processed yet by the draft model
+                if n == num_draft and num_draft > 0:
+                    draft_y = mx.concatenate(
+                        [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
+                    )
 
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
             _rewind_cache(num_draft, n)
+    except BaseException:
+        target_cache_tokens = 0
+        cancelled = not target_forward_ready
+        if target_transaction is not None and target_transaction.active:
+            if target_forward_ready:
+                model.resolve_speculative_cache(target_transaction, n + 1)
+                target_cache_tokens = n + 1
+                cancelled = False
+            else:
+                model.cancel_speculative_cache(target_transaction)
+        elif target_forward_ready:
+            target_cache_tokens = n + 1
+        target_transaction = None
+        if round_started and not round_reported:
+            try:
+                _report_round(
+                    target_cache_tokens=target_cache_tokens,
+                    cancelled=cancelled,
+                )
+            except BaseException:
+                # Preserve the generation failure rather than masking it with
+                # a telemetry callback failure.
+                pass
+        raise
     finally:
+        if target_transaction is not None and target_transaction.active:
+            model.cancel_speculative_cache(target_transaction)
         _rewind_cache(num_draft, n)
 
 
@@ -668,6 +953,11 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    prompt_lookup_num_tokens: Optional[int] = None,
+    prompt_lookup_max_ngram_size: int = 4,
+    speculative_round_callback: Optional[
+        Callable[[SpeculativeRoundStats], None]
+    ] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -683,6 +973,13 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        prompt_lookup_num_tokens (int, optional): Enable prompt-lookup speculative
+          decoding without an external draft model. This is mutually exclusive
+          with ``draft_model``. Default: ``None``.
+        prompt_lookup_max_ngram_size (int): Maximum suffix n-gram size used for
+          prompt lookup. Default: ``4``.
+        speculative_round_callback (Callable, optional): Called with per-round
+          acceptance and commit statistics during speculative decoding.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -706,8 +1003,17 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if draft_model is not None and prompt_lookup_num_tokens is not None:
+        raise ValueError(
+            "A draft model and prompt lookup cannot be enabled together"
+        )
+    speculative = draft_model is not None or prompt_lookup_num_tokens is not None
+    if not speculative:
         kwargs.pop("num_draft_tokens", None)
+        if speculative_round_callback is not None:
+            raise ValueError(
+                "speculative_round_callback requires speculative decoding"
+            )
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -717,7 +1023,13 @@ def stream_generate(
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
+            prompt,
+            model,
+            draft_model,
+            prompt_lookup_num_tokens=prompt_lookup_num_tokens,
+            prompt_lookup_max_ngram_size=prompt_lookup_max_ngram_size,
+            speculative_round_callback=speculative_round_callback,
+            **kwargs,
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
@@ -2171,12 +2483,33 @@ def main():
     else:
         prompt = tokenizer.encode(prompt)
 
+    if (
+        args.draft_model is not None
+        and args.prompt_lookup_num_tokens is not None
+    ):
+        raise ValueError(
+            "--draft-model and --prompt-lookup-num-tokens are mutually exclusive"
+        )
     if args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
         if draft_tokenizer.vocab_size != tokenizer.vocab_size:
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
+    speculative_round_callback = None
+    if args.speculative_round_stats:
+        if draft_model is None and args.prompt_lookup_num_tokens is None:
+            raise ValueError(
+                "--speculative-round-stats requires speculative decoding"
+            )
+
+        def speculative_round_callback(stats):
+            print(
+                json.dumps(asdict(stats), sort_keys=True),
+                file=sys.stderr,
+                flush=True,
+            )
+
     sampler = make_sampler(
         args.temp,
         args.top_p,
@@ -2201,6 +2534,9 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        prompt_lookup_num_tokens=args.prompt_lookup_num_tokens,
+        prompt_lookup_max_ngram_size=args.prompt_lookup_max_ngram_size,
+        speculative_round_callback=speculative_round_callback,
     )
     if not args.verbose:
         print(response)

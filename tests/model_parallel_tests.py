@@ -189,6 +189,120 @@ class TestModelParallel(unittest.TestCase):
                 model.shard_vocab_head(group)
                 self.assertIs(model.language_model.lm_head, wrapped)
 
+    def test_kimi_k3_speculative_cache_tp2_width_two_and_eight(self):
+        group = mx.distributed.init()
+        if group.size() != 2:
+            self.skipTest("requires mlx.launch with exactly two ranks")
+
+        from mlx_lm.models import kimi_k3
+        from mlx_lm.models.cache import ArraysCache
+
+        mx.random.seed(7)
+        args = kimi_k3.ModelArgs.from_dict(_kimi_k3_config())
+        model = kimi_k3.Model(args)
+        model.set_dtype(mx.bfloat16)
+        model.eval()
+        model.shard(group)
+
+        prefix = mx.array([[1, 2]], dtype=mx.uint32)
+
+        def populated_cache():
+            prompt_cache = model.make_cache()
+            logits = model(prefix, cache=prompt_cache)
+            mx.eval(logits, [entry.state for entry in prompt_cache])
+            return prompt_cache
+
+        def assert_cache_close(left, right):
+            self.assertEqual(len(left), len(right))
+            for left_entry, right_entry in zip(left, right, strict=True):
+                self.assertIs(type(left_entry), type(right_entry))
+                if isinstance(left_entry, ArraysCache):
+                    for left_state, right_state in zip(
+                        left_entry.cache,
+                        right_entry.cache,
+                        strict=True,
+                    ):
+                        self.assertTrue(
+                            mx.allclose(
+                                left_state,
+                                right_state,
+                                rtol=1e-3,
+                                atol=1e-3,
+                            )
+                        )
+                else:
+                    self.assertEqual(left_entry.offset, right_entry.offset)
+                    for left_state, right_state in zip(
+                        left_entry.state,
+                        right_entry.state,
+                        strict=True,
+                    ):
+                        self.assertTrue(
+                            mx.allclose(
+                                left_state,
+                                right_state,
+                                rtol=1e-3,
+                                atol=1e-3,
+                            )
+                        )
+
+        for width, consumed in ((2, 1), (8, 8)):
+            with self.subTest(width=width, consumed=consumed):
+                wide_cache = populated_cache()
+                sequential_cache = populated_cache()
+                tokens = (
+                    mx.arange(width, dtype=mx.uint32)[None]
+                    + mx.array([[3]], dtype=mx.uint32)
+                )
+
+                transaction = model.begin_speculative_cache(wide_cache, width)
+                wide_logits = model(tokens, cache=wide_cache)
+                mx.eval(wide_logits)
+                model.resolve_speculative_cache(transaction, consumed)
+
+                sequential_logits = []
+                for position in range(consumed):
+                    logits = model(
+                        tokens[:, position : position + 1],
+                        cache=sequential_cache,
+                    )
+                    mx.eval(logits, [entry.state for entry in sequential_cache])
+                    sequential_logits.append(logits)
+                sequential_logits = mx.concatenate(sequential_logits, axis=1)
+
+                logits_max_abs = mx.max(
+                    mx.abs(wide_logits[:, :consumed] - sequential_logits)
+                ).item()
+                self.assertTrue(
+                    mx.allclose(
+                        wide_logits[:, :consumed],
+                        sequential_logits,
+                        rtol=2e-2,
+                        atol=2e-2,
+                    ),
+                    f"speculative logits max abs diff: {logits_max_abs}",
+                )
+                assert_cache_close(wide_cache, sequential_cache)
+
+                next_token = mx.array([[17]], dtype=mx.uint32)
+                wide_next = model(next_token, cache=wide_cache)
+                sequential_next = model(next_token, cache=sequential_cache)
+                mx.eval(
+                    wide_next,
+                    sequential_next,
+                    [entry.state for entry in wide_cache],
+                    [entry.state for entry in sequential_cache],
+                )
+                self.assertTrue(
+                    mx.allclose(
+                        wide_next,
+                        sequential_next,
+                        rtol=1e-3,
+                        atol=1e-3,
+                    )
+                )
+                assert_cache_close(wide_cache, sequential_cache)
+
 
 if __name__ == "__main__":
     unittest.main()

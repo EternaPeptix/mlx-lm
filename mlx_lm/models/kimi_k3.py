@@ -403,9 +403,98 @@ _short_conv_kernel = (
     else None
 )
 
+_SHORT_CONV_HISTORY_SOURCE = """
+    auto c = thread_position_in_grid.x;
+    auto b = thread_position_in_grid.y;
+
+    const device T* initial_state = state + b * (KS - 1) * C;
+    float local_state[KS - 1];
+    for (int j = 0; j < KS - 1; ++j) {
+      local_state[j] = static_cast<float>(initial_state[j * C + c]);
+    }
+
+    for (int t = 0; t < L; ++t) {
+      auto input = static_cast<float>(x[(b * L + t) * C + c]);
+      float v = 0.0f;
+      for (int j = 0; j < KS - 1; ++j) {
+        v += static_cast<float>(w[c * KS + j]) * local_state[j];
+      }
+      v += static_cast<float>(w[c * KS + KS - 1]) * input;
+      y[(b * L + t) * C + c] =
+          static_cast<T>(v / (1.0f + metal::exp(-v)));
+
+      for (int j = 0; j < KS - 2; ++j) {
+        local_state[j] = local_state[j + 1];
+      }
+      local_state[KS - 2] = input;
+
+      device T* checkpoint =
+          state_history + ((b * L + t) * (KS - 1)) * C;
+      for (int j = 0; j < KS - 1; ++j) {
+        checkpoint[j * C + c] = static_cast<T>(local_state[j]);
+      }
+    }
+
+    device T* final_state = new_state + b * (KS - 1) * C;
+    for (int j = 0; j < KS - 1; ++j) {
+      final_state[j * C + c] = static_cast<T>(local_state[j]);
+    }
+"""
+
+_short_conv_history_kernel = (
+    mx.fast.metal_kernel(
+        name="k3_short_conv_history",
+        input_names=["x", "state", "w"],
+        output_names=["y", "new_state", "state_history"],
+        source=_SHORT_CONV_HISTORY_SOURCE,
+    )
+    if mx.metal.is_available()
+    else None
+)
+
 
 class KimiK3ShortConv(ShortConv1d):
-    def __call__(self, x, state, mask=None, lengths=None):
+    def __call__(
+        self,
+        x,
+        state,
+        mask=None,
+        lengths=None,
+        return_state_history=False,
+    ):
+        if return_state_history:
+            if (
+                _short_conv_history_kernel is None
+                or self.training
+                or x.shape[1] <= 1
+                or state is None
+                or mask is not None
+                or lengths is not None
+                or x.dtype != state.dtype
+                or x.dtype != self.conv.weight.dtype
+                or mx.default_device() != mx.gpu
+            ):
+                raise ValueError(
+                    "Kimi K3 speculative short-conv checkpoints are unsupported"
+                )
+            B, L, C = x.shape
+            return _short_conv_history_kernel(
+                inputs=[x, state, self.conv.weight],
+                template=[
+                    ("T", x.dtype),
+                    ("C", C),
+                    ("KS", self.kernel_size),
+                    ("L", L),
+                ],
+                grid=(C, B, 1),
+                threadgroup=(min(1024, C), 1, 1),
+                output_shapes=[
+                    x.shape,
+                    state.shape,
+                    (B, L, self.kernel_size - 1, C),
+                ],
+                output_dtypes=[x.dtype, x.dtype, x.dtype],
+            )
         if (
             _short_conv_kernel is None
             or self.training
@@ -527,6 +616,28 @@ class KimiK3DeltaAttention(nn.Module):
             ssm_state = None
             lengths = None
 
+        speculative_width = (
+            int(getattr(cache, "speculative_width", 0)) if cache is not None else 0
+        )
+        capture_speculative = speculative_width != 0
+        if capture_speculative and (
+            speculative_width != T
+            or B != 1
+            or T <= 1
+            or T > 8
+            or self.training
+            or mask is not None
+            or lengths is not None
+            or conv_state is None
+            or ssm_state is None
+            or not mx.metal.is_available()
+            or mx.default_device() != mx.gpu
+        ):
+            raise ValueError(
+                "Kimi K3 speculative checkpoints require a populated, unpadded "
+                "batch-one Metal decode with width in [2, 8]"
+            )
+
         if (
             T == 1
             and not self.training
@@ -553,7 +664,22 @@ class KimiK3DeltaAttention(nn.Module):
         if conv_state is None:
             conv_state = mx.zeros((B, self.conv_kernel - 1, 3 * P), dtype=dtype)
 
-        qkv, conv_state = self.qkv_conv(self.qkv_proj(x), conv_state, mask, lengths)
+        projected_qkv = self.qkv_proj(x)
+        if capture_speculative:
+            qkv, conv_state, conv_state_history = self.qkv_conv(
+                projected_qkv,
+                conv_state,
+                mask,
+                lengths,
+                return_state_history=True,
+            )
+        else:
+            qkv, conv_state = self.qkv_conv(
+                projected_qkv,
+                conv_state,
+                mask,
+                lengths,
+            )
 
         if cache is not None:
             cache[0] = conv_state
@@ -572,7 +698,7 @@ class KimiK3DeltaAttention(nn.Module):
         )
         b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
 
-        out, ssm_state = gated_delta_update(
+        gated_delta_result = gated_delta_update(
             q,
             k,
             v,
@@ -584,11 +710,23 @@ class KimiK3DeltaAttention(nn.Module):
             mask=mask,
             use_kernel=not self.training,
             lower_bound=self.lower_bound,
+            return_state_history=capture_speculative,
         )
+        if capture_speculative:
+            out, ssm_state, ssm_state_history = gated_delta_result
+        else:
+            out, ssm_state = gated_delta_result
 
         if cache is not None:
             cache[1] = ssm_state
             cache.advance(T)
+            if capture_speculative:
+                cache.capture_speculative(
+                    [
+                        conv_state_history.transpose(1, 0, 2, 3),
+                        ssm_state_history.transpose(2, 0, 1, 3, 4),
+                    ]
+                )
 
         if self.use_full_rank_gate:
             gate = self.g_proj(x)
@@ -1544,6 +1682,24 @@ class KimiK3TextModel(nn.Module):
         return self.norm(h)
 
 
+@dataclass
+class KimiK3SpeculativeCacheTransaction:
+    """Fail-closed rollback state for one Kimi K3 target verification."""
+
+    owner_id: int
+    cache: List[Any]
+    width: int
+    array_states: List[Tuple[int, ArraysCache, List[Any]]]
+    kv_states: List[Tuple[int, KVCache, Any, Any, int]]
+    active: bool = True
+
+    def release(self):
+        """Release rollback-only references after commit or cancellation."""
+
+        self.array_states = []
+        self.kv_states = []
+
+
 class LanguageModel(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -1576,6 +1732,187 @@ class LanguageModel(nn.Module):
             else:
                 caches.append(KVCache())
         return caches
+
+    def begin_speculative_cache(
+        self,
+        cache: List[Any],
+        width: int,
+    ) -> KimiK3SpeculativeCacheTransaction:
+        if self.model.pipeline_size != 1:
+            raise ValueError(
+                "Kimi K3 speculative cache requires pipeline_size == 1"
+            )
+        if any(isinstance(layer_cache, BatchKVCache) for layer_cache in cache):
+            raise ValueError(
+                "Kimi K3 speculative cache does not support BatchKVCache"
+            )
+        layers = list(self.layers)
+        if len(cache) != len(layers):
+            raise ValueError("Kimi K3 speculative cache does not match the model")
+        if width <= 1 or width > 8:
+            raise ValueError("Kimi K3 speculative width must be in [2, 8]")
+
+        array_states: List[Tuple[int, ArraysCache, List[Any]]] = []
+        kv_states: List[Tuple[int, KVCache, Any, Any, int]] = []
+        kv_offsets = set()
+        for index, (layer, layer_cache) in enumerate(
+            zip(layers, cache, strict=True)
+        ):
+            if layer.is_linear:
+                if not isinstance(layer_cache, ArraysCache):
+                    raise ValueError(
+                        f"Kimi K3 layer {index} requires an ArraysCache"
+                    )
+                layer_cache.validate_begin_speculative(width)
+                array_states.append((index, layer_cache, list(layer_cache.cache)))
+            else:
+                if not isinstance(layer_cache, KVCache):
+                    raise ValueError(f"Kimi K3 layer {index} requires a KVCache")
+                if layer_cache.keys is None or layer_cache.values is None:
+                    raise ValueError(
+                        "Kimi K3 speculative cache requires populated MLA state"
+                    )
+                kv_offsets.add(int(layer_cache.offset))
+                kv_states.append(
+                    (
+                        index,
+                        layer_cache,
+                        layer_cache.keys,
+                        layer_cache.values,
+                        int(layer_cache.offset),
+                    )
+                )
+        if not array_states:
+            raise ValueError("Kimi K3 speculative cache contains no KDA state")
+        if len(kv_offsets) > 1:
+            raise ValueError("Kimi K3 speculative MLA cache offsets disagree")
+
+        try:
+            for _, layer_cache, _ in array_states:
+                layer_cache.begin_speculative(width)
+        except BaseException:
+            for index, layer_cache, states in array_states:
+                cache[index] = layer_cache
+                layer_cache.restore_speculative(states)
+            raise
+
+        return KimiK3SpeculativeCacheTransaction(
+            owner_id=id(self),
+            cache=cache,
+            width=width,
+            array_states=array_states,
+            kv_states=kv_states,
+        )
+
+    def _validate_speculative_transaction(
+        self,
+        transaction: KimiK3SpeculativeCacheTransaction,
+    ):
+        if not isinstance(transaction, KimiK3SpeculativeCacheTransaction):
+            raise TypeError("invalid Kimi K3 speculative cache transaction")
+        if transaction.owner_id != id(self):
+            raise ValueError("Kimi K3 speculative transaction belongs to another model")
+        if not transaction.active:
+            raise ValueError("Kimi K3 speculative transaction is no longer active")
+        if len(transaction.cache) != len(self.layers):
+            raise ValueError("Kimi K3 speculative cache changed during the transaction")
+        for index, layer_cache, _ in transaction.array_states:
+            if transaction.cache[index] is not layer_cache:
+                raise ValueError(
+                    "Kimi K3 speculative KDA cache was replaced during the transaction"
+                )
+        for index, layer_cache, _, _, _ in transaction.kv_states:
+            if transaction.cache[index] is not layer_cache:
+                raise ValueError(
+                    "Kimi K3 speculative MLA cache was replaced during the transaction"
+                )
+
+    def resolve_speculative_cache(
+        self,
+        transaction: KimiK3SpeculativeCacheTransaction,
+        consumed: int,
+    ):
+        try:
+            self._validate_speculative_transaction(transaction)
+            width = transaction.width
+            if consumed < 1 or consumed > width:
+                raise ValueError("invalid Kimi K3 speculative cache resolution")
+
+            prepared = []
+            for _, layer_cache, _ in transaction.array_states:
+                if (
+                    layer_cache.speculative_width != width
+                    or not layer_cache.speculative_ready
+                ):
+                    raise ValueError(
+                        "Kimi K3 speculative KDA checkpoints are incomplete"
+                    )
+                prepared.append(
+                    (layer_cache, layer_cache.prepare_speculative(consumed))
+                )
+
+            for _, layer_cache, _, _, initial_offset in transaction.kv_states:
+                if layer_cache.offset != initial_offset + width:
+                    raise ValueError(
+                        "Kimi K3 speculative MLA cache did not advance by its width"
+                    )
+
+            # Evaluate every cache-side output before changing any logical state.
+            # This includes full acceptance and the MLA backing arrays, neither
+            # of which is guaranteed to detach when only logits are evaluated.
+            mx.eval(
+                [state for _, states in prepared for state in states],
+                [
+                    layer_cache.state
+                    for _, layer_cache, _, _, _ in transaction.kv_states
+                ],
+            )
+
+            for layer_cache, states in prepared:
+                layer_cache.validate_speculative_commit(states)
+            for layer_cache, states in prepared:
+                layer_cache.commit_speculative(states)
+            for _, layer_cache, _, _, initial_offset in transaction.kv_states:
+                layer_cache.offset = initial_offset + consumed
+        except BaseException:
+            if (
+                isinstance(transaction, KimiK3SpeculativeCacheTransaction)
+                and transaction.owner_id == id(self)
+                and transaction.active
+            ):
+                self.cancel_speculative_cache(transaction)
+            raise
+
+        transaction.active = False
+        transaction.release()
+
+    def cancel_speculative_cache(
+        self,
+        transaction: KimiK3SpeculativeCacheTransaction,
+    ):
+        if not isinstance(transaction, KimiK3SpeculativeCacheTransaction):
+            raise TypeError("invalid Kimi K3 speculative cache transaction")
+        if transaction.owner_id != id(self):
+            raise ValueError("Kimi K3 speculative transaction belongs to another model")
+        if not transaction.active:
+            return
+
+        for index, layer_cache, states in transaction.array_states:
+            transaction.cache[index] = layer_cache
+            layer_cache.restore_speculative(states)
+        for (
+            index,
+            layer_cache,
+            keys,
+            values,
+            initial_offset,
+        ) in transaction.kv_states:
+            transaction.cache[index] = layer_cache
+            layer_cache.keys = keys
+            layer_cache.values = values
+            layer_cache.offset = initial_offset
+        transaction.active = False
+        transaction.release()
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         args = self.args
@@ -1825,6 +2162,26 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def begin_speculative_cache(
+        self,
+        cache: List[Any],
+        width: int,
+    ) -> KimiK3SpeculativeCacheTransaction:
+        return self.language_model.begin_speculative_cache(cache, width)
+
+    def resolve_speculative_cache(
+        self,
+        transaction: KimiK3SpeculativeCacheTransaction,
+        consumed: int,
+    ):
+        return self.language_model.resolve_speculative_cache(transaction, consumed)
+
+    def cancel_speculative_cache(
+        self,
+        transaction: KimiK3SpeculativeCacheTransaction,
+    ):
+        return self.language_model.cancel_speculative_cache(transaction)
 
     def shard_vocab_head(
         self,

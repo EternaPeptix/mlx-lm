@@ -596,6 +596,12 @@ class ArraysCache(_BaseCache):
         instance = super().__new__(cls)
         instance.left_padding = None
         instance.lengths = None
+        # ``_BaseCache.from_state`` deliberately bypasses ``__init__``.  Keep
+        # speculative bookkeeping here so restored prompt caches are safe to
+        # inspect and can enter a transaction.
+        instance._speculative_width = 0
+        instance._speculative_state_history = None
+        instance._speculative_initial_state = None
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -620,6 +626,133 @@ class ArraysCache(_BaseCache):
 
     def __getitem__(self, idx):
         return self.cache[idx]
+
+    @property
+    def speculative_width(self):
+        return self._speculative_width
+
+    @property
+    def speculative_ready(self):
+        return self._speculative_state_history is not None
+
+    def validate_begin_speculative(self, width: int):
+        """Validate a speculative transaction without changing cache state."""
+
+        if width <= 1:
+            raise ValueError("speculative checkpoint width must be greater than one")
+        if (
+            self._speculative_width
+            or self._speculative_state_history is not None
+            or self._speculative_initial_state is not None
+        ):
+            raise ValueError("a speculative checkpoint forward is already active")
+        if self.lengths is not None or self.left_padding is not None:
+            raise ValueError("speculative checkpoints do not support padded caches")
+        if any(value is None for value in self.cache):
+            raise ValueError("speculative checkpoints require a populated cache")
+
+    def begin_speculative(self, width: int):
+        """Request per-token state checkpoints for one fail-closed forward."""
+
+        self.validate_begin_speculative(width)
+        # KDA kernels produce new arrays rather than mutating their inputs, so
+        # retaining these handles is a constant-time, zero-copy rollback point.
+        self._speculative_initial_state = list(self.cache)
+        self._speculative_width = width
+
+    def capture_speculative(self, state_history: List[mx.array]):
+        """Attach time-major state histories produced by the active forward."""
+
+        if self._speculative_width <= 1:
+            raise ValueError("speculative checkpoint capture was not requested")
+        if self._speculative_state_history is not None:
+            raise ValueError("speculative checkpoints were already captured")
+        if len(state_history) != len(self.cache):
+            raise ValueError(
+                "speculative checkpoint state count does not match the cache"
+            )
+        for history, current in zip(state_history, self.cache, strict=True):
+            if history.shape[0] != self._speculative_width:
+                raise ValueError(
+                    "speculative checkpoint history width does not match the request"
+                )
+            if history.shape[1:] != current.shape:
+                raise ValueError(
+                    "speculative checkpoint state shape does not match the cache"
+                )
+            if history.dtype != current.dtype:
+                raise ValueError(
+                    "speculative checkpoint state dtype does not match the cache"
+                )
+        self._speculative_state_history = list(state_history)
+
+    def prepare_speculative(self, consumed: int) -> List[mx.array]:
+        """Build detached candidate states without committing the transaction."""
+
+        width = self._speculative_width
+        history = self._speculative_state_history
+        if width <= 1 or history is None:
+            raise ValueError("no speculative checkpoints are available")
+        if consumed < 1 or consumed > width:
+            raise ValueError(f"consumed inputs must be in [1, {width}], got {consumed}")
+        # Always detach through the history, including full acceptance.  The
+        # final cache arrays and histories are sibling outputs of lazy Metal
+        # kernels; keeping the former without evaluating a detached state can
+        # retain the complete wide graph.
+        return [
+            values[consumed - 1] + mx.zeros_like(values[consumed - 1])
+            for values in history
+        ]
+
+    def validate_speculative_commit(self, states: List[mx.array]):
+        """Validate already-materialized states before the commit phase."""
+
+        if (
+            self._speculative_width <= 1
+            or self._speculative_state_history is None
+            or self._speculative_initial_state is None
+        ):
+            raise ValueError("no speculative checkpoints are available")
+        if len(states) != len(self.cache):
+            raise ValueError("speculative checkpoint state count does not match cache")
+        for state, current in zip(states, self.cache, strict=True):
+            if state.shape != current.shape or state.dtype != current.dtype:
+                raise ValueError("speculative checkpoint commit state is incompatible")
+
+    def commit_speculative(self, states: List[mx.array]):
+        """Commit evaluated states and release all rollback-only references."""
+
+        self.validate_speculative_commit(states)
+        self.cache = list(states)
+        self._speculative_width = 0
+        self._speculative_state_history = None
+        self._speculative_initial_state = None
+
+    def resolve_speculative(self, consumed: int) -> List[mx.array]:
+        """Evaluate and commit ``consumed`` inputs from the wide forward."""
+
+        try:
+            materialized = self.prepare_speculative(consumed)
+            mx.eval(*materialized)
+            self.commit_speculative(materialized)
+        except BaseException:
+            self.cancel_speculative()
+            raise
+        return materialized
+
+    def restore_speculative(self, states: Optional[List[mx.array]] = None):
+        """Restore a transaction's initial state and clear its checkpoints."""
+
+        if states is None:
+            states = self._speculative_initial_state
+        if states is not None:
+            self.cache = list(states)
+        self._speculative_width = 0
+        self._speculative_state_history = None
+        self._speculative_initial_state = None
+
+    def cancel_speculative(self):
+        self.restore_speculative()
 
     @property
     def state(self):
