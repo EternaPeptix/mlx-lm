@@ -35,6 +35,7 @@ COMPILED_DECODE_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE"
 # Segment 0 is the KDA prefix, 1..N-1 are MLA-to-MLA transitions, and
 # segment N is the final MLA/output tail. The production K3 topology has N=24.
 COMPILED_DECODE_SEGMENTS_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE_SEGMENTS"
+ASYNC_DECODE_BOUNDARIES_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES"
 
 
 def _parse_compiled_decode_segments(
@@ -82,6 +83,73 @@ def _parse_compiled_decode_segments(
         segments.update(range(start, end + 1))
 
     return frozenset(segments)
+
+
+def _parse_async_decode_boundaries(
+    selector: str,
+    layer_count: int,
+) -> FrozenSet[int]:
+    """Parse eager-decode layer boundaries that should be submitted early."""
+
+    if layer_count < 0:
+        raise ValueError("Kimi K3 layer count cannot be negative")
+
+    selector = selector.strip().lower()
+    if selector == "none":
+        return frozenset()
+    if selector == "laguna8":
+        # Reproduce the exact scheduling ladder that proved useful for Laguna:
+        # one early submission followed by eight-layer stages.
+        return frozenset(
+            boundary
+            for boundary in (1, *range(7, layer_count - 1, 8))
+            if boundary < layer_count - 1
+        )
+    if selector == "block8":
+        return frozenset(range(7, layer_count - 1, 8))
+    if selector == "all":
+        return frozenset(range(max(layer_count - 1, 0)))
+    if not selector:
+        raise ValueError(
+            f"{ASYNC_DECODE_BOUNDARIES_ENV} must be 'none', 'laguna8', "
+            "'block8', 'all', or a comma-separated list of layer indices "
+            "and inclusive ranges"
+        )
+
+    boundaries = set()
+    for item in selector.split(","):
+        item = item.strip()
+        if not item:
+            raise ValueError(
+                f"Invalid empty item in "
+                f"{ASYNC_DECODE_BOUNDARIES_ENV}={selector!r}"
+            )
+
+        bounds = [part.strip() for part in item.split("-")]
+        if len(bounds) == 1 and bounds[0].isdigit():
+            start = end = int(bounds[0])
+        elif len(bounds) == 2 and bounds[0].isdigit() and bounds[1].isdigit():
+            start, end = (int(bound) for bound in bounds)
+            if start > end:
+                raise ValueError(
+                    f"Reversed range {item!r} in "
+                    f"{ASYNC_DECODE_BOUNDARIES_ENV}"
+                )
+        else:
+            raise ValueError(
+                f"Invalid item {item!r} in {ASYNC_DECODE_BOUNDARIES_ENV}"
+            )
+
+        # The final layer is already submitted by the generation boundary and
+        # therefore cannot be an early scheduling boundary.
+        if start < 0 or end >= layer_count - 1:
+            valid = f"0-{layer_count - 2}" if layer_count > 1 else "none"
+            raise ValueError(
+                f"Layer boundary {item!r} is outside the valid range {valid}"
+            )
+        boundaries.update(range(start, end + 1))
+
+    return frozenset(boundaries)
 
 
 @mx.compile
@@ -1204,6 +1272,15 @@ class KimiK3TextModel(nn.Module):
             else frozenset(range(segment_count))
         )
         self._compiled_decode_schedule = None
+        self._async_decode_boundaries = _parse_async_decode_boundaries(
+            os.environ.get(ASYNC_DECODE_BOUNDARIES_ENV, "none"),
+            len(self.layers),
+        )
+        if self._compiled_decode_enabled and self._async_decode_boundaries:
+            raise ValueError(
+                f"{ASYNC_DECODE_BOUNDARIES_ENV} cannot be combined with "
+                f"{COMPILED_DECODE_ENV}"
+            )
 
     def _set_cache_indices(self, layers=None):
         if layers is None:
@@ -1221,6 +1298,58 @@ class KimiK3TextModel(nn.Module):
 
     def _invalidate_compiled_decode(self):
         self._compiled_decode_schedule = None
+
+    def _async_decode_boundary_eligible(
+        self,
+        h: mx.array,
+        cache: List[Any],
+        ssm_mask: Optional[mx.array],
+        active_layers: List[KimiK3DecoderLayer],
+    ) -> bool:
+        if (
+            not self._async_decode_boundaries
+            or self._compiled_decode_enabled
+            or self.training
+            or not mx.metal.is_available()
+            or mx.default_device() != mx.gpu
+            or h.ndim != 3
+            or h.shape[0] != 1
+            or h.shape[1] != 1
+            or ssm_mask is not None
+            or self.pipeline_size != 1
+            or self.start_idx != 0
+            or self.end_idx != len(self.layers)
+            or len(active_layers) != self.args.num_hidden_layers
+            or len(cache) != len(active_layers)
+        ):
+            return False
+
+        for layer, layer_cache in zip(active_layers, cache, strict=True):
+            if layer_cache is None:
+                return False
+            if layer.is_linear:
+                if (
+                    getattr(layer_cache, "lengths", None) is not None
+                    or layer_cache[0] is None
+                    or layer_cache[1] is None
+                ):
+                    return False
+            elif (
+                getattr(layer_cache, "keys", None) is None
+                or getattr(layer_cache, "values", None) is None
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _submit_async_decode_boundary(
+        h: mx.array,
+        blocks: Optional[ResidualBlocks],
+    ) -> None:
+        if blocks is None or blocks.raw is None:
+            mx.async_eval(h)
+        else:
+            mx.async_eval(h, blocks.raw, blocks.inv_rms)
 
     def _compiled_decode_eligible(
         self,
@@ -1653,9 +1782,23 @@ class KimiK3TextModel(nn.Module):
             else:
                 h = mx.distributed.recv_like(h, src)
 
-        for layer, layer_cache in zip(active_layers, cache, strict=True):
+        submit_async_boundaries = self._async_decode_boundary_eligible(
+            h,
+            cache,
+            ssm_mask,
+            active_layers,
+        )
+        for layer_idx, (layer, layer_cache) in enumerate(
+            zip(active_layers, cache, strict=True),
+            start=self.start_idx,
+        ):
             mask = ssm_mask if layer.is_linear else attn_mask
             h, blocks = layer(h, mask=mask, cache=layer_cache, blocks=blocks)
+            if (
+                submit_async_boundaries
+                and layer_idx in self._async_decode_boundaries
+            ):
+                self._submit_async_decode_boundary(h, blocks)
 
         if pipeline_rank != 0:
             dst = pipeline_rank - 1

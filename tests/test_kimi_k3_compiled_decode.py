@@ -166,6 +166,36 @@ class TestKimiK3CompiledDecodeSelector(unittest.TestCase):
             parse("0", 0)
 
 
+class TestKimiK3AsyncDecodeBoundarySelector(unittest.TestCase):
+    def test_selector_accepts_named_ladders_and_explicit_ranges(self):
+        parse = kimi_k3._parse_async_decode_boundaries
+
+        self.assertEqual(parse("none", 93), frozenset())
+        self.assertEqual(
+            parse("laguna8", 93),
+            frozenset((1, 7, 15, 23, 31, 39, 47, 55, 63, 71, 79, 87)),
+        )
+        self.assertEqual(
+            parse("block8", 93),
+            frozenset((7, 15, 23, 31, 39, 47, 55, 63, 71, 79, 87)),
+        )
+        self.assertEqual(parse("all", 4), frozenset((0, 1, 2)))
+        self.assertEqual(parse("0, 3-5, 7", 9), frozenset((0, 3, 4, 5, 7)))
+
+    def test_selector_rejects_empty_ambiguous_and_final_boundaries(self):
+        parse = kimi_k3._parse_async_decode_boundaries
+
+        for selector in ("", " ", "0,,1", "-1", "1-", "3-2", "8", "*"):
+            with self.subTest(selector=selector):
+                with self.assertRaises(ValueError):
+                    parse(selector, 9)
+
+        with self.assertRaises(ValueError):
+            parse("none", -1)
+        with self.assertRaises(ValueError):
+            parse("0", 1)
+
+
 @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
 class TestKimiK3CompiledDecode(unittest.TestCase):
     def setUp(self):
@@ -607,6 +637,112 @@ class TestKimiK3CompiledDecode(unittest.TestCase):
                             compiled_layer_cache.keys.shape[2],
                             expected_capacity,
                         )
+
+
+@unittest.skipUnless(mx.metal.is_available(), "requires Metal")
+class TestKimiK3AsyncDecodeBoundaries(unittest.TestCase):
+    def setUp(self):
+        self._env = mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.COMPILED_DECODE_ENV: "0",
+                kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "none",
+                "MLX_LM_KIMI_K3_FUSED_EXPERTS": "0",
+            },
+            clear=False,
+        )
+        self._env.start()
+        kimi_k3.fused_k3_experts_enabled.cache_clear()
+
+    def tearDown(self):
+        kimi_k3.fused_k3_experts_enabled.cache_clear()
+        self._env.stop()
+
+    def test_boundaries_are_snapshotted_and_conflicts_fail_closed(self):
+        with mock.patch.dict(
+            os.environ,
+            {kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "1,5"},
+            clear=False,
+        ):
+            model = _make_model()
+        self.assertEqual(
+            model.model._async_decode_boundaries,
+            frozenset((1, 5)),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.COMPILED_DECODE_ENV: "1",
+                kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "1",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(ValueError):
+                _make_model()
+
+    def test_guard_requires_populated_single_token_eager_decode(self):
+        model = _make_model()
+        text_model = model.model
+        text_model._async_decode_boundaries = frozenset((1, 5))
+        cache = _warm_cache(model)
+        h = text_model.embed_tokens(mx.array([[11]], dtype=mx.int32))
+        layers = text_model.layers
+
+        self.assertTrue(
+            text_model._async_decode_boundary_eligible(
+                h,
+                cache,
+                None,
+                layers,
+            )
+        )
+        self.assertFalse(
+            text_model._async_decode_boundary_eligible(
+                mx.broadcast_to(h, (1, 2, h.shape[-1])),
+                cache,
+                None,
+                layers,
+            )
+        )
+        self.assertFalse(
+            text_model._async_decode_boundary_eligible(
+                h,
+                model.make_cache(),
+                None,
+                layers,
+            )
+        )
+
+        text_model.train()
+        self.assertFalse(
+            text_model._async_decode_boundary_eligible(
+                h,
+                cache,
+                None,
+                layers,
+            )
+        )
+
+    def test_boundaries_preserve_exact_logits_and_cache(self):
+        model = _make_model()
+        base_cache = _warm_cache(model)
+        eager_cache = copy.deepcopy(base_cache)
+        boundary_cache = copy.deepcopy(base_cache)
+
+        for token in (17, 23, 29, 31):
+            inputs = mx.array([[token]], dtype=mx.int32)
+
+            model.model._async_decode_boundaries = frozenset()
+            eager = model(inputs, cache=eager_cache)
+            mx.eval(eager, [c.state for c in eager_cache])
+
+            model.model._async_decode_boundaries = frozenset((1, 5))
+            candidate = model(inputs, cache=boundary_cache)
+            mx.eval(candidate, [c.state for c in boundary_cache])
+
+            self.assertTrue(mx.array_equal(eager, candidate).item())
+            _assert_cache_equal(self, eager_cache, boundary_cache)
 
 
 if __name__ == "__main__":
