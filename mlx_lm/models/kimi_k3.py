@@ -25,6 +25,7 @@ from .kimi_k3_fused_expert import (
     maybe_fused_k3_switch_glu_reduce,
 )
 from .kimi_k3_fused_router import maybe_fused_k3_router
+from .kimi_k3_fused_routed_up_add import maybe_fused_k3_routed_up_add
 from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
 from .kimi_k3_packed_kda_projections import (
     invalidate_packed_k3_kda_skinny,
@@ -985,7 +986,13 @@ class KimiK3SparseMoE(nn.Module):
 
         self.sharding_group = None
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def _call_with_optional_residual(
+        self,
+        x: mx.array,
+        residual: Optional[mx.array],
+    ) -> Tuple[mx.array, bool]:
+        """Evaluate the MoE and optionally consume its decoder residual."""
+
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
@@ -1057,11 +1064,30 @@ class KimiK3SparseMoE(nn.Module):
                 y = mx.distributed.all_sum(y, group=self.sharding_group)
         if self.routed_expert_norm is not None:
             y = self.routed_expert_norm(y)
+        residual_consumed = False
         if self.latent_size is not None:
-            y = self.routed_expert_up_proj(y)
+            fused_up_add = (
+                maybe_fused_k3_routed_up_add(
+                    self,
+                    y,
+                    shared,
+                    residual,
+                )
+                if shared is not None and residual is not None
+                else None
+            )
+            if fused_up_add is None:
+                y = self.routed_expert_up_proj(y)
+            else:
+                y = fused_up_add
+                shared = None
+                residual_consumed = True
         if shared is not None:
             y = y + shared
-        return y
+        return y, residual_consumed
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self._call_with_optional_residual(x, None)[0]
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -1172,7 +1198,17 @@ class KimiK3DecoderLayer(nn.Module):
     ) -> Tuple[mx.array, Optional[ResidualBlocks]]:
         if not self.use_attn_res:
             h = partial_sum + y
-            return h + self.mlp(self.post_attention_layernorm(h)), blocks
+            mlp_input = self.post_attention_layernorm(h)
+            if isinstance(self.mlp, KimiK3SparseMoE):
+                mlp_output, residual_consumed = (
+                    self.mlp._call_with_optional_residual(mlp_input, h)
+                )
+            else:
+                mlp_output = self.mlp(mlp_input)
+                residual_consumed = False
+            return (
+                mlp_output if residual_consumed else h + mlp_output
+            ), blocks
 
         partial_sum = y if partial_sum is None else partial_sum + y
         mlp_input = self._mix_and_norm(
@@ -1181,7 +1217,18 @@ class KimiK3DecoderLayer(nn.Module):
             self._mlp_res_w_eff,
             self.post_attention_layernorm,
         )
-        partial_sum = partial_sum + self.mlp(mlp_input)
+        if isinstance(self.mlp, KimiK3SparseMoE):
+            mlp_output, residual_consumed = (
+                self.mlp._call_with_optional_residual(mlp_input, partial_sum)
+            )
+        else:
+            mlp_output = self.mlp(mlp_input)
+            residual_consumed = False
+        partial_sum = (
+            mlp_output
+            if residual_consumed
+            else partial_sum + mlp_output
+        )
         return partial_sum, blocks
 
     def __call__(
