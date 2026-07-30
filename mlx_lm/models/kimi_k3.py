@@ -28,7 +28,9 @@ from .kimi_k3_fused_router import maybe_fused_k3_router
 from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
 from .kimi_k3_packed_kda_projections import (
     invalidate_packed_k3_kda_skinny,
+    invalidate_packed_k3_kda_wide,
     maybe_authoritative_packed_k3_kda_skinny,
+    maybe_authoritative_packed_k3_kda_wide,
 )
 from .kimi_k3_packed_moe_front import (
     invalidate_packed_k3_moe_front,
@@ -639,7 +641,18 @@ class KimiK3DeltaAttention(nn.Module):
     def _decode_core(self, x, conv_state, ssm_state):
         B = x.shape[0]
         P = self.projection_dim
-        qkv, conv_state = self.qkv_conv(self.qkv_proj(x), conv_state, None, None)
+        packed_wide = maybe_authoritative_packed_k3_kda_wide(self, x)
+        if packed_wide is None:
+            projected_qkv = self.qkv_proj(x)
+            gate = None
+        else:
+            projected_qkv, gate = packed_wide
+        qkv, conv_state = self.qkv_conv(
+            projected_qkv,
+            conv_state,
+            None,
+            None,
+        )
 
         q = qkv[..., :P].reshape(B, 1, self.num_heads, self.head_dim)
         k = qkv[..., P : 2 * P].reshape(B, 1, self.num_heads, self.head_dim)
@@ -680,7 +693,8 @@ class KimiK3DeltaAttention(nn.Module):
         )
 
         if self.use_full_rank_gate:
-            gate = self.g_proj(x)
+            if gate is None:
+                gate = self.g_proj(x)
         else:
             if g_a is None:
                 g_a = self.g_a_proj(x)
@@ -2463,6 +2477,7 @@ class Model(nn.Module):
             attn = layer.self_attn
 
             if layer.is_linear:
+                invalidate_packed_k3_kda_wide(attn)
                 invalidate_packed_k3_kda_skinny(attn)
                 D = attn.head_dim
                 P = attn.projection_dim
