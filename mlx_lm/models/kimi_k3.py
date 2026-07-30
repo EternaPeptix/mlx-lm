@@ -17,6 +17,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+from .kimi_k3_fused_expert import maybe_fused_k3_switch_glu
 from .kimi_linear import ShortConv1d
 from .mla import MultiLinear
 from .switch_layers import SwitchGLU
@@ -695,7 +696,8 @@ class KimiK3SparseMoE(nn.Module):
             self.args.moe_renormalize,
         )
         y = self.routed_expert_down_proj(x) if self.latent_size is not None else x
-        y = self.switch_mlp(y, inds)
+        fused_y = maybe_fused_k3_switch_glu(self.switch_mlp, y, inds)
+        y = self.switch_mlp(y, inds) if fused_y is None else fused_y
         y = (y * weights[..., None]).sum(axis=-2)
         shared = self.shared_experts(x) if self.shared_experts is not None else None
         if self.sharding_group is not None:
