@@ -21,6 +21,7 @@ from .gated_delta import gated_delta_update
 from .kimi_k3_fused_expert import (
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
+    maybe_fused_k3_switch_glu_reduce,
 )
 from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
 from .kimi_k3_packed_moe_front import (
@@ -974,9 +975,18 @@ class KimiK3SparseMoE(nn.Module):
             self.args.routed_scaling_factor,
             self.args.moe_renormalize,
         )
-        fused_y = maybe_fused_k3_switch_glu(self.switch_mlp, y, inds)
-        y = self.switch_mlp(y, inds) if fused_y is None else fused_y
-        y = (y * weights[..., None]).sum(axis=-2)
+        fused_reduced_y = maybe_fused_k3_switch_glu_reduce(
+            self.switch_mlp,
+            y,
+            inds,
+            weights,
+        )
+        if fused_reduced_y is None:
+            fused_y = maybe_fused_k3_switch_glu(self.switch_mlp, y, inds)
+            y = self.switch_mlp(y, inds) if fused_y is None else fused_y
+            y = (y * weights[..., None]).sum(axis=-2)
+        else:
+            y = fused_reduced_y
         if self.shared_experts is None:
             shared = None
         elif optimized_front is None:

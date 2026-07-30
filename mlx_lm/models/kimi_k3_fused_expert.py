@@ -8,6 +8,11 @@ from typing import Any
 
 import mlx.core as mx
 
+from .kimi_k3_fused_down_reduce import (
+    fused_down_reduce_decode,
+    supports_fused_down_reduce,
+    supports_fused_down_reduce_projection,
+)
 from .kimi_k3_fused_switch_glu import (
     fused_switch_situ_decode,
     supports_fused_switch_situ,
@@ -18,6 +23,7 @@ from .kimi_k3_tuned_gather_qmv import (
 )
 
 FUSED_EXPERT_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERTS"
+FUSED_DOWN_REDUCE_ENV = "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE"
 
 
 @partial(mx.compile, shapeless=False)
@@ -64,9 +70,35 @@ def _compiled_tuned_gather_qmv(
     )
 
 
+@partial(mx.compile, shapeless=False)
+def _compiled_fused_down_reduce(
+    x: mx.array,
+    indices: mx.array,
+    router_weights: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+) -> mx.array:
+    """Run K3's fused down-QMV and route reduction with dynamic weights."""
+
+    return fused_down_reduce_decode(
+        x,
+        indices,
+        router_weights,
+        (weight, scales, biases),
+        results_per_threadgroup=4,
+        simdgroups_per_threadgroup=16,
+    )
+
+
 @lru_cache(maxsize=1)
 def fused_k3_experts_enabled() -> bool:
     return os.environ.get(FUSED_EXPERT_ENV, "0") == "1"
+
+
+@lru_cache(maxsize=1)
+def fused_k3_down_reduce_enabled() -> bool:
+    return os.environ.get(FUSED_DOWN_REDUCE_ENV, "0") == "1"
 
 
 def _quantized_projection(module: Any):
@@ -107,6 +139,8 @@ def maybe_fused_k3_switch_glu(
     down = _quantized_projection(switch_mlp.down_proj)
     if up is None or gate is None or down is None:
         return None
+    if down[0].shape[0] != up[0].shape[0]:
+        return None
     if not supports_fused_switch_situ(x, indices, up, gate):
         return None
 
@@ -122,3 +156,59 @@ def maybe_fused_k3_switch_glu(
         return None
     output = _compiled_tuned_gather_qmv(activated, indices, *down)
     return output.squeeze(-2)
+
+
+def maybe_fused_k3_switch_glu_reduce(
+    switch_mlp: Any,
+    x: mx.array,
+    indices: mx.array,
+    router_weights: mx.array,
+) -> mx.array | None:
+    """Return the fully reduced exact decode result, or use the stock path."""
+
+    if (
+        not fused_k3_experts_enabled()
+        or not fused_k3_down_reduce_enabled()
+        or getattr(switch_mlp, "training", True)
+    ):
+        return None
+    activation = getattr(switch_mlp, "activation", None)
+    if (
+        getattr(activation, "beta", None) != 4.0
+        or getattr(activation, "linear_beta", None) != 25.0
+    ):
+        return None
+    up = _quantized_projection(switch_mlp.up_proj)
+    gate = _quantized_projection(switch_mlp.gate_proj)
+    down = _quantized_projection(switch_mlp.down_proj)
+    if up is None or gate is None or down is None:
+        return None
+    if down[0].shape[0] != up[0].shape[0]:
+        return None
+    if not supports_fused_switch_situ(x, indices, up, gate):
+        return None
+    if not supports_fused_down_reduce_projection(
+        indices,
+        router_weights,
+        down,
+        results_per_threadgroup=4,
+        simdgroups_per_threadgroup=16,
+    ):
+        return None
+
+    activated = _compiled_fused_switch_situ_decode(x, indices, *up, *gate)
+    if not supports_fused_down_reduce(
+        activated,
+        indices,
+        router_weights,
+        down,
+        results_per_threadgroup=4,
+        simdgroups_per_threadgroup=16,
+    ):
+        return None
+    return _compiled_fused_down_reduce(
+        activated,
+        indices,
+        router_weights,
+        *down,
+    )

@@ -6,9 +6,12 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.models.kimi_k3_fused_expert import (
+    FUSED_DOWN_REDUCE_ENV,
     FUSED_EXPERT_ENV,
+    fused_k3_down_reduce_enabled,
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
+    maybe_fused_k3_switch_glu_reduce,
 )
 from mlx_lm.models.kimi_k3_fused_switch_glu import _metal_available
 
@@ -123,11 +126,15 @@ class _Switch:
 class IntegrationTest(unittest.TestCase):
     def setUp(self):
         os.environ[FUSED_EXPERT_ENV] = "1"
+        os.environ[FUSED_DOWN_REDUCE_ENV] = "1"
         fused_k3_experts_enabled.cache_clear()
+        fused_k3_down_reduce_enabled.cache_clear()
 
     def tearDown(self):
         os.environ.pop(FUSED_EXPERT_ENV, None)
+        os.environ.pop(FUSED_DOWN_REDUCE_ENV, None)
         fused_k3_experts_enabled.cache_clear()
+        fused_k3_down_reduce_enabled.cache_clear()
 
     def test_fused_switch_is_bit_exact_on_cached_second_call(self):
         mx.random.seed(19)
@@ -170,6 +177,82 @@ class IntegrationTest(unittest.TestCase):
         mx.eval(reference, candidate)
         self.assertEqual(candidate.shape, (1, 1, 16, 3584))
         self.assertTrue(bool(mx.all(reference == candidate).item()))
+
+    def test_bounded_tp2_down_route_reduce_is_bit_exact(self):
+        switch = _Switch.bounded_tp2_geometry()
+        x = mx.random.normal((1, 1, 3584), dtype=mx.bfloat16)
+        indices = mx.arange(16, dtype=mx.uint32).reshape(1, 1, 16)
+        router_weights = mx.random.uniform(
+            shape=(1, 1, 16),
+            dtype=mx.bfloat16,
+        )
+        reference = (
+            switch.stock(x, indices) * router_weights[..., None]
+        ).sum(axis=-2)
+        candidate = maybe_fused_k3_switch_glu_reduce(
+            switch,
+            x,
+            indices,
+            router_weights,
+        )
+        self.assertIsNotNone(candidate)
+        mx.eval(reference, candidate)
+        self.assertEqual(candidate.shape, (1, 1, 3584))
+        self.assertTrue(bool(mx.all(reference == candidate).item()))
+
+    def test_down_route_reduce_has_an_independent_default_off_flag(self):
+        os.environ.pop(FUSED_DOWN_REDUCE_ENV)
+        fused_k3_down_reduce_enabled.cache_clear()
+        switch = _Switch.bounded_tp2_geometry()
+        x = mx.zeros((1, 1, 3584), dtype=mx.bfloat16)
+        indices = mx.arange(16, dtype=mx.uint32).reshape(1, 1, 16)
+        router_weights = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
+        self.assertIsNone(
+            maybe_fused_k3_switch_glu_reduce(
+                switch,
+                x,
+                indices,
+                router_weights,
+            )
+        )
+        self.assertIsNotNone(maybe_fused_k3_switch_glu(switch, x, indices))
+
+    def test_down_route_reduce_rejects_non_k3_routes_before_dispatch(self):
+        switch = _Switch.bounded_tp2_geometry()
+        x = mx.zeros((1, 1, 3584), dtype=mx.bfloat16)
+        indices = mx.arange(16, dtype=mx.uint32).reshape(1, 1, 16)
+        bad_routes = (
+            (indices[..., :-1], mx.zeros((1, 1, 15), dtype=mx.bfloat16)),
+            (indices, mx.zeros((1, 1, 16), dtype=mx.float32)),
+        )
+        for routed_indices, router_weights in bad_routes:
+            with self.subTest(
+                top_k=routed_indices.shape[-1],
+                router_dtype=router_weights.dtype,
+            ):
+                self.assertIsNone(
+                    maybe_fused_k3_switch_glu_reduce(
+                        switch,
+                        x,
+                        routed_indices,
+                        router_weights,
+                    )
+                )
+
+        switch.down_proj = _Projection.packed(
+            experts=17,
+            input_width=1536,
+            output_width=3584,
+            packed_value=0x24681357,
+        )
+        self.assertIsNone(
+            maybe_fused_k3_switch_glu_reduce(
+                switch,
+                x,
+                indices,
+                mx.zeros((1, 1, 16), dtype=mx.bfloat16),
+            )
+        )
 
     def test_non_decode_shapes_and_dtypes_fall_back(self):
         switch = _Switch()
