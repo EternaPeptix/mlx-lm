@@ -18,6 +18,7 @@ from .base import (
 )
 from .cache import ArraysCache, BatchKVCache, KVCache
 from .gated_delta import gated_delta_update
+from .kimi_k3_attnres_rms import maybe_fused_attnres_rms
 from .kimi_k3_fused_expert import (
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
@@ -1065,6 +1066,38 @@ class KimiK3DecoderLayer(nn.Module):
                 mx.float32
             ) * self.mlp_res_proj.weight.reshape(-1)
 
+    def _mix_and_norm(
+        self,
+        blocks: ResidualBlocks,
+        partial_sum: mx.array,
+        w_eff: mx.array,
+        norm: nn.RMSNorm,
+    ) -> mx.array:
+        if (
+            not self.training
+            and blocks.raw is not None
+            and blocks.inv_rms is not None
+        ):
+            fused = maybe_fused_attnres_rms(
+                blocks.raw,
+                blocks.inv_rms,
+                partial_sum,
+                w_eff,
+                norm.weight,
+                self.eps,
+            )
+            if fused is not None:
+                return fused
+        return norm(
+            _attn_res_mix(
+                blocks,
+                partial_sum,
+                w_eff,
+                self.eps,
+                not self.training,
+            )
+        )
+
     def _prepare_attention(
         self,
         x: mx.array,
@@ -1075,13 +1108,16 @@ class KimiK3DecoderLayer(nn.Module):
 
         self._ensure_attn_res_weights()
         partial_sum = x
-        h = _attn_res_mix(
-            blocks, partial_sum, self._attn_res_w_eff, self.eps, not self.training
+        attention_input = self._mix_and_norm(
+            blocks,
+            partial_sum,
+            self._attn_res_w_eff,
+            self.input_layernorm,
         )
         if self.is_block_start:
             blocks.append(partial_sum)
             partial_sum = None
-        return self.input_layernorm(h), partial_sum, blocks
+        return attention_input, partial_sum, blocks
 
     def _finish_attention(
         self,
@@ -1094,10 +1130,13 @@ class KimiK3DecoderLayer(nn.Module):
             return h + self.mlp(self.post_attention_layernorm(h)), blocks
 
         partial_sum = y if partial_sum is None else partial_sum + y
-        h = _attn_res_mix(
-            blocks, partial_sum, self._mlp_res_w_eff, self.eps, not self.training
+        mlp_input = self._mix_and_norm(
+            blocks,
+            partial_sum,
+            self._mlp_res_w_eff,
+            self.post_attention_layernorm,
         )
-        partial_sum = partial_sum + self.mlp(self.post_attention_layernorm(h))
+        partial_sum = partial_sum + self.mlp(mlp_input)
         return partial_sum, blocks
 
     def __call__(
