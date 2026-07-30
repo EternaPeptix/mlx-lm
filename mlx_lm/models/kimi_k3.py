@@ -1,9 +1,10 @@
 # Copyright © 2026 Apple Inc.
 
+import os
 import re
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,12 +16,18 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import ArraysCache, KVCache
+from .cache import ArraysCache, BatchKVCache, KVCache
 from .gated_delta import gated_delta_update
-from .kimi_k3_fused_expert import maybe_fused_k3_switch_glu
+from .kimi_k3_fused_expert import (
+    fused_k3_experts_enabled,
+    maybe_fused_k3_switch_glu,
+)
 from .kimi_linear import ShortConv1d
 from .mla import MultiLinear
 from .switch_layers import SwitchGLU
+
+
+COMPILED_DECODE_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE"
 
 
 @mx.compile
@@ -756,17 +763,7 @@ class KimiK3DecoderLayer(nn.Module):
             self._attn_res_w_eff = None
             self._mlp_res_w_eff = None
 
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        blocks: Optional[ResidualBlocks] = None,
-    ) -> Tuple[mx.array, Optional[ResidualBlocks]]:
-        if not self.use_attn_res:
-            h = x + self.self_attn(self.input_layernorm(x), mask, cache)
-            return h + self.mlp(self.post_attention_layernorm(h)), blocks
-
+    def _ensure_attn_res_weights(self):
         if self.training or self._attn_res_w_eff is None:
             self._attn_res_w_eff = self.self_attention_res_norm.weight.astype(
                 mx.float32
@@ -775,6 +772,15 @@ class KimiK3DecoderLayer(nn.Module):
                 mx.float32
             ) * self.mlp_res_proj.weight.reshape(-1)
 
+    def _prepare_attention(
+        self,
+        x: mx.array,
+        blocks: Optional[ResidualBlocks],
+    ) -> Tuple[mx.array, Optional[mx.array], Optional[ResidualBlocks]]:
+        if not self.use_attn_res:
+            return self.input_layernorm(x), x, blocks
+
+        self._ensure_attn_res_weights()
         partial_sum = x
         h = _attn_res_mix(
             blocks, partial_sum, self._attn_res_w_eff, self.eps, not self.training
@@ -782,15 +788,171 @@ class KimiK3DecoderLayer(nn.Module):
         if self.is_block_start:
             blocks.append(partial_sum)
             partial_sum = None
+        return self.input_layernorm(h), partial_sum, blocks
 
-        y = self.self_attn(self.input_layernorm(h), mask, cache)
+    def _finish_attention(
+        self,
+        partial_sum: Optional[mx.array],
+        y: mx.array,
+        blocks: Optional[ResidualBlocks],
+    ) -> Tuple[mx.array, Optional[ResidualBlocks]]:
+        if not self.use_attn_res:
+            h = partial_sum + y
+            return h + self.mlp(self.post_attention_layernorm(h)), blocks
+
         partial_sum = y if partial_sum is None else partial_sum + y
-
         h = _attn_res_mix(
             blocks, partial_sum, self._mlp_res_w_eff, self.eps, not self.training
         )
         partial_sum = partial_sum + self.mlp(self.post_attention_layernorm(h))
         return partial_sum, blocks
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+        blocks: Optional[ResidualBlocks] = None,
+    ) -> Tuple[mx.array, Optional[ResidualBlocks]]:
+        attention_input, partial_sum, blocks = self._prepare_attention(x, blocks)
+        y = self.self_attn(attention_input, mask, cache)
+        return self._finish_attention(partial_sum, y, blocks)
+
+
+@dataclass(frozen=True)
+class _CompiledDecodeTransition:
+    step: Callable[..., Any]
+    kda_indices: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _CompiledDecodeSchedule:
+    prefix: Callable[..., Any]
+    prefix_kda_indices: Tuple[int, ...]
+    mla_indices: Tuple[int, ...]
+    transitions: Tuple[_CompiledDecodeTransition, ...]
+    tail: Callable[..., mx.array]
+
+
+def _decode_kda_group(
+    h: mx.array,
+    blocks: ResidualBlocks,
+    layers: Tuple[KimiK3DecoderLayer, ...],
+    states: Tuple[mx.array, ...],
+) -> Tuple[mx.array, ResidualBlocks, Tuple[mx.array, ...]]:
+    if len(states) != 2 * len(layers):
+        raise ValueError("Each KDA layer requires convolution and recurrent state")
+
+    updated_states = []
+    for i, layer in enumerate(layers):
+        attention_input, partial_sum, blocks = layer._prepare_attention(h, blocks)
+        y, conv_state, ssm_state = layer.self_attn._decode_core(
+            attention_input,
+            states[2 * i],
+            states[2 * i + 1],
+        )
+        h, blocks = layer._finish_attention(partial_sum, y, blocks)
+        updated_states.extend((conv_state, ssm_state))
+    return h, blocks, tuple(updated_states)
+
+
+def _compile_decode_prefix(
+    kda_layers: Tuple[KimiK3DecoderLayer, ...],
+    next_mla_layer: KimiK3DecoderLayer,
+    eps: float,
+):
+    def prefix(h, states):
+        blocks = ResidualBlocks(eps)
+        h, blocks, updated_states = _decode_kda_group(
+            h, blocks, kda_layers, states
+        )
+        attention_input, partial_sum, blocks = next_mla_layer._prepare_attention(
+            h, blocks
+        )
+        assert partial_sum is not None
+        assert blocks.raw is not None and blocks.inv_rms is not None
+        return (
+            attention_input,
+            partial_sum,
+            blocks.raw,
+            blocks.inv_rms,
+            updated_states,
+        )
+
+    return mx.compile(prefix, shapeless=False)
+
+
+def _compile_decode_transition(
+    current_mla_layer: KimiK3DecoderLayer,
+    kda_layers: Tuple[KimiK3DecoderLayer, ...],
+    next_mla_layer: KimiK3DecoderLayer,
+    eps: float,
+):
+    if not kda_layers:
+
+        def adjacent_transition(mla_output, partial_sum, raw, inv_rms):
+            blocks = ResidualBlocks(eps)
+            blocks.raw = raw
+            blocks.inv_rms = inv_rms
+            h, blocks = current_mla_layer._finish_attention(
+                partial_sum, mla_output, blocks
+            )
+            attention_input, partial_sum, blocks = (
+                next_mla_layer._prepare_attention(h, blocks)
+            )
+            assert partial_sum is not None
+            return attention_input, partial_sum, blocks.raw, blocks.inv_rms
+
+        return mx.compile(adjacent_transition, shapeless=False)
+
+    def transition(mla_output, partial_sum, raw, inv_rms, states):
+        blocks = ResidualBlocks(eps)
+        blocks.raw = raw
+        blocks.inv_rms = inv_rms
+        h, blocks = current_mla_layer._finish_attention(
+            partial_sum, mla_output, blocks
+        )
+        h, blocks, updated_states = _decode_kda_group(
+            h, blocks, kda_layers, states
+        )
+        attention_input, partial_sum, blocks = next_mla_layer._prepare_attention(
+            h, blocks
+        )
+        assert partial_sum is not None
+        return (
+            attention_input,
+            partial_sum,
+            blocks.raw,
+            blocks.inv_rms,
+            updated_states,
+        )
+
+    return mx.compile(transition, shapeless=False)
+
+
+def _compile_decode_tail(
+    final_mla_layer: KimiK3DecoderLayer,
+    output_res_w_eff: mx.array,
+    norm: nn.RMSNorm,
+    eps: float,
+):
+    def tail(mla_output, partial_sum, raw, inv_rms):
+        blocks = ResidualBlocks(eps)
+        blocks.raw = raw
+        blocks.inv_rms = inv_rms
+        h, blocks = final_mla_layer._finish_attention(
+            partial_sum, mla_output, blocks
+        )
+        h = _attn_res_mix(
+            blocks,
+            h,
+            output_res_w_eff,
+            eps,
+            True,
+        )
+        return norm(h)
+
+    return mx.compile(tail, shapeless=False)
 
 
 class KimiK3TextModel(nn.Module):
@@ -817,6 +979,10 @@ class KimiK3TextModel(nn.Module):
         self.num_layers = len(self.layers)
         self.in_blocks = 0
         self._set_cache_indices()
+        self._compiled_decode_enabled = (
+            os.environ.get(COMPILED_DECODE_ENV, "0") == "1"
+        )
+        self._compiled_decode_schedule = None
 
     def _set_cache_indices(self, layers=None):
         if layers is None:
@@ -832,7 +998,251 @@ class KimiK3TextModel(nn.Module):
             if self.ssm_idx is not None and self.attn_idx is not None:
                 break
 
+    def _invalidate_compiled_decode(self):
+        self._compiled_decode_schedule = None
+
+    def _compiled_decode_eligible(
+        self,
+        h: mx.array,
+        cache: List[Any],
+        ssm_mask: Optional[mx.array],
+        active_layers: List[KimiK3DecoderLayer],
+    ) -> bool:
+        if (
+            not self._compiled_decode_enabled
+            or self.training
+            or fused_k3_experts_enabled()
+            or not mx.metal.is_available()
+            or mx.default_device() != mx.gpu
+            or h.ndim != 3
+            or h.shape[0] != 1
+            or h.shape[1] != 1
+            or ssm_mask is not None
+            or self.pipeline_size != 1
+            or self.start_idx != 0
+            or self.end_idx != len(self.layers)
+            or len(active_layers) != self.args.num_hidden_layers
+            or len(cache) != len(active_layers)
+            or not self.use_attn_res
+            or self._output_res_w_eff is None
+            or self.args.rms_norm_eps not in _attn_res_eps_cache
+        ):
+            return False
+
+        if (
+            not active_layers
+            or not active_layers[0].is_linear
+            or not active_layers[0].is_block_start
+            or active_layers[-1].is_linear
+        ):
+            return False
+
+        for layer, layer_cache in zip(active_layers, cache, strict=True):
+            if (
+                layer.training
+                or not layer.use_attn_res
+                or layer._attn_res_w_eff is None
+                or layer._mlp_res_w_eff is None
+            ):
+                return False
+
+            if layer.is_linear:
+                attn = layer.self_attn
+                if (
+                    type(attn) is not KimiK3DeltaAttention
+                    or type(layer_cache) is not ArraysCache
+                    or len(layer_cache.cache) != 2
+                    or layer_cache.lengths is not None
+                    or layer_cache.left_padding is not None
+                ):
+                    return False
+                conv_state, recurrent_state = layer_cache
+                if (
+                    conv_state is None
+                    or recurrent_state is None
+                    or conv_state.shape
+                    != (1, attn.conv_kernel - 1, 3 * attn.projection_dim)
+                    or recurrent_state.shape
+                    != (1, attn.num_heads, attn.head_dim, attn.head_dim)
+                    or conv_state.dtype != h.dtype
+                    or recurrent_state.dtype != mx.float32
+                ):
+                    return False
+            else:
+                attn = layer.self_attn
+                if (
+                    type(attn) is not KimiK3MLAAttention
+                    or layer.is_block_start
+                    or type(layer_cache) not in (KVCache, BatchKVCache)
+                    or layer_cache.keys is None
+                    or layer_cache.values is None
+                    or layer_cache.keys.ndim != 4
+                    or layer_cache.values.ndim != 4
+                    or layer_cache.keys.shape[0] != 1
+                    or layer_cache.values.shape[0] != 1
+                    or layer_cache.keys.shape[1] != 1
+                    or layer_cache.values.shape[1] != 1
+                    or layer_cache.keys.shape[2] != layer_cache.values.shape[2]
+                    or layer_cache.keys.shape[3] != attn.kv_lora_rank
+                    or layer_cache.values.shape[3] != attn.qk_rope_head_dim
+                    or layer_cache.keys.dtype != h.dtype
+                    or layer_cache.values.dtype != h.dtype
+                ):
+                    return False
+                if type(layer_cache) is KVCache:
+                    if (
+                        layer_cache.offset <= 0
+                        or layer_cache.offset > layer_cache.keys.shape[2]
+                    ):
+                        return False
+                elif (
+                    layer_cache._idx <= 0
+                    or layer_cache._idx > layer_cache.keys.shape[2]
+                    or layer_cache.offset.shape != (1,)
+                    or layer_cache.left_padding.shape != (1,)
+                    or layer_cache._right_padding is not None
+                ):
+                    return False
+
+        return True
+
+    def _build_compiled_decode_schedule(
+        self,
+        active_layers: List[KimiK3DecoderLayer],
+    ) -> _CompiledDecodeSchedule:
+        mla_indices = tuple(
+            i for i, layer in enumerate(active_layers) if not layer.is_linear
+        )
+        first_mla = mla_indices[0]
+        prefix_indices = tuple(range(first_mla))
+        prefix = _compile_decode_prefix(
+            tuple(active_layers[i] for i in prefix_indices),
+            active_layers[first_mla],
+            self.args.rms_norm_eps,
+        )
+
+        transitions = []
+        for current_mla, next_mla in zip(mla_indices, mla_indices[1:]):
+            kda_indices = tuple(range(current_mla + 1, next_mla))
+            transitions.append(
+                _CompiledDecodeTransition(
+                    step=_compile_decode_transition(
+                        active_layers[current_mla],
+                        tuple(active_layers[i] for i in kda_indices),
+                        active_layers[next_mla],
+                        self.args.rms_norm_eps,
+                    ),
+                    kda_indices=kda_indices,
+                )
+            )
+
+        tail = _compile_decode_tail(
+            active_layers[mla_indices[-1]],
+            self._output_res_w_eff,
+            self.norm,
+            self.args.rms_norm_eps,
+        )
+        return _CompiledDecodeSchedule(
+            prefix=prefix,
+            prefix_kda_indices=prefix_indices,
+            mla_indices=mla_indices,
+            transitions=tuple(transitions),
+            tail=tail,
+        )
+
+    @staticmethod
+    def _read_kda_states(
+        cache: List[Any],
+        indices: Tuple[int, ...],
+    ) -> Tuple[mx.array, ...]:
+        states = []
+        for idx in indices:
+            states.extend((cache[idx][0], cache[idx][1]))
+        return tuple(states)
+
+    @staticmethod
+    def _write_kda_states(
+        cache: List[Any],
+        indices: Tuple[int, ...],
+        states: Tuple[mx.array, ...],
+    ):
+        if len(states) != 2 * len(indices):
+            raise ValueError("Compiled KDA state output does not match its layer group")
+        for i, idx in enumerate(indices):
+            layer_cache = cache[idx]
+            layer_cache[0] = states[2 * i]
+            layer_cache[1] = states[2 * i + 1]
+            layer_cache.advance(1)
+
+    def _run_compiled_decode(
+        self,
+        h: mx.array,
+        cache: List[Any],
+        attn_mask: Optional[mx.array],
+        active_layers: List[KimiK3DecoderLayer],
+    ) -> mx.array:
+        schedule = self._compiled_decode_schedule
+        if schedule is None:
+            schedule = self._build_compiled_decode_schedule(active_layers)
+            self._compiled_decode_schedule = schedule
+
+        (
+            attention_input,
+            partial_sum,
+            raw,
+            inv_rms,
+            updated_states,
+        ) = schedule.prefix(
+            h,
+            self._read_kda_states(cache, schedule.prefix_kda_indices),
+        )
+        self._write_kda_states(
+            cache,
+            schedule.prefix_kda_indices,
+            updated_states,
+        )
+
+        for i, mla_idx in enumerate(schedule.mla_indices):
+            mla_output = active_layers[mla_idx].self_attn(
+                attention_input,
+                mask=attn_mask,
+                cache=cache[mla_idx],
+            )
+            if i == len(schedule.transitions):
+                return schedule.tail(mla_output, partial_sum, raw, inv_rms)
+
+            transition = schedule.transitions[i]
+            if transition.kda_indices:
+                (
+                    attention_input,
+                    partial_sum,
+                    raw,
+                    inv_rms,
+                    updated_states,
+                ) = transition.step(
+                    mla_output,
+                    partial_sum,
+                    raw,
+                    inv_rms,
+                    self._read_kda_states(cache, transition.kda_indices),
+                )
+                self._write_kda_states(
+                    cache,
+                    transition.kda_indices,
+                    updated_states,
+                )
+            else:
+                attention_input, partial_sum, raw, inv_rms = transition.step(
+                    mla_output,
+                    partial_sum,
+                    raw,
+                    inv_rms,
+                )
+
+        raise RuntimeError("Compiled Kimi K3 decode schedule has no MLA tail")
+
     def pipeline(self, group):
+        self._invalidate_compiled_decode()
         self.pipeline_rank = group.rank()
         self.pipeline_size = group.size()
         base, extra = divmod(len(self.layers), self.pipeline_size)
@@ -875,6 +1285,9 @@ class KimiK3TextModel(nn.Module):
         pipeline_size = self.pipeline_size
 
         blocks = ResidualBlocks(self.args.rms_norm_eps) if self.use_attn_res else None
+
+        if self._compiled_decode_eligible(h, cache, ssm_mask, active_layers):
+            return self._run_compiled_decode(h, cache, attn_mask, active_layers)
 
         if pipeline_rank < pipeline_size - 1:
             src = pipeline_rank + 1
@@ -1230,6 +1643,7 @@ class Model(nn.Module):
         N = group.size()
         if N == 1:
             return
+        self.model._invalidate_compiled_decode()
         rank = group.rank()
 
         for layer in self.layers:
