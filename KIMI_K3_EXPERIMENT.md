@@ -2,9 +2,9 @@
 
 This branch is one part of a coordinated public experiment:
 
-- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-exo-mlx-stack)
-- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-exo-mlx-stack)
-- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-exo-mlx-stack)
+- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-distributed-optimizations)
+- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-distributed-optimizations)
+- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-distributed-optimizations)
 
 It contains the Kimi K3 support and TP2 changes used to run
 `kernelpool/Kimi-K3-2bit-UVMAX` across two 512 GB M3 Ultra systems, including:
@@ -23,6 +23,15 @@ decode. `MLX_LM_KIMI_K3_PACKED_MOE_FRONT=1` enables an exact, decode-only
 packed QMV for four same-input MoE-front projections. All three default to off
 and fail closed outside their supported Kimi K3 decode shapes.
 
+`MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES` enables eager, decode-only
+asynchronous evaluation boundaries. It accepts `none`, `laguna8`, `block8`,
+`all`, individual layer indices, or inclusive ranges. The companion
+`MLX_LM_KIMI_K3_ASYNC_DECODE_STATE` selects `hidden` or `residual` state
+submission. The path defaults to off and fails closed unless generation is
+single-batch, single-token, eager Metal execution with a populated cache and a
+full non-pipeline model. Compiled decode and asynchronous boundaries cannot be
+enabled together.
+
 When compiled decode is enabled,
 `MLX_LM_KIMI_K3_COMPILED_DECODE_SEGMENTS` can select `all`, `none`, individual
 segment indices, or inclusive ranges such as `0-11,24`. Production Kimi K3
@@ -33,22 +42,26 @@ particular compiled subset is safe.
 
 ## Current result
 
-The exact-path reference produced a median `12.1544` decode tok/s in the
-canonical short TP2 benchmark. Segmented compiled decode produced `12.6206`
-tok/s, a `3.8%` improvement, with flat measured peak memory.
+On a matched three-repetition canonical TP2 screening run, the feature-off
+reference produced a median `12.0465` decode tok/s. The `laguna8` hidden-state
+asynchronous schedule produced `12.9399` tok/s, a `7.4%` improvement, while
+retaining the canonical completion digest and essentially unchanged prefill
+throughput. Peak memory remained approximately `414 GB` per rank.
+
+An earlier exact-path reference produced a median `12.1544` decode tok/s.
+Segmented compiled decode produced `12.6206` tok/s, a `3.8%` improvement, with
+flat measured peak memory.
 
 The compiled candidate did **not** preserve the deterministic completion
 digest (`c84d…` reference versus `8f60…` candidate), so it is not a
 production recommendation. It is retained here as reproducible experimental
 work while segment-level bisection and speculative-cache work continue.
 
-The packed MoE-front path is numerically exact in the focused Metal tests. A
-real-weight single-layer measurement projected roughly `12.10` to `12.93`
-tok/s if the isolated saving scales across all 92 MoE layers, at an additional
-approximately `7.44 GB` per rank. That projection is not an end-to-end
-throughput claim; a full TP2 completion-hash and memory A/B remains required.
-The hidden packed copy is invalidated before sharding and rebuilt whenever any
-authoritative projection array changes.
+The packed MoE-front path is numerically exact in the focused Metal tests, but
+the full TP2 A/B produced `11.9632` tok/s and added approximately `7.45 GB` per
+rank. It therefore remains disabled and is not part of the recommended
+configuration. The hidden packed copy is invalidated before sharding and
+rebuilt whenever any authoritative projection array changes.
 
 The branch also exposes fail-closed prompt-lookup speculative verification
 without an external draft model:
