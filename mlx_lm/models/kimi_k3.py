@@ -36,6 +36,7 @@ COMPILED_DECODE_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE"
 # segment N is the final MLA/output tail. The production K3 topology has N=24.
 COMPILED_DECODE_SEGMENTS_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE_SEGMENTS"
 ASYNC_DECODE_BOUNDARIES_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES"
+ASYNC_DECODE_STATE_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE"
 
 
 def _parse_compiled_decode_segments(
@@ -1276,6 +1277,17 @@ class KimiK3TextModel(nn.Module):
             os.environ.get(ASYNC_DECODE_BOUNDARIES_ENV, "none"),
             len(self.layers),
         )
+        async_decode_state = os.environ.get(ASYNC_DECODE_STATE_ENV)
+        if not self._async_decode_boundaries and async_decode_state is not None:
+            raise ValueError(
+                f"{ASYNC_DECODE_STATE_ENV} requires "
+                f"{ASYNC_DECODE_BOUNDARIES_ENV}"
+            )
+        self._async_decode_state = async_decode_state or "residual"
+        if self._async_decode_state not in {"hidden", "residual"}:
+            raise ValueError(
+                f"{ASYNC_DECODE_STATE_ENV} must be 'hidden' or 'residual'"
+            )
         if self._compiled_decode_enabled and self._async_decode_boundaries:
             raise ValueError(
                 f"{ASYNC_DECODE_BOUNDARIES_ENV} cannot be combined with "
@@ -1341,12 +1353,16 @@ class KimiK3TextModel(nn.Module):
                 return False
         return True
 
-    @staticmethod
     def _submit_async_decode_boundary(
+        self,
         h: mx.array,
         blocks: Optional[ResidualBlocks],
     ) -> None:
-        if blocks is None or blocks.raw is None:
+        if (
+            self._async_decode_state == "hidden"
+            or blocks is None
+            or blocks.raw is None
+        ):
             mx.async_eval(h)
         else:
             mx.async_eval(h, blocks.raw, blocks.inv_rms)

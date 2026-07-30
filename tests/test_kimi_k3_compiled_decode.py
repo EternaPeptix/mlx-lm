@@ -661,7 +661,10 @@ class TestKimiK3AsyncDecodeBoundaries(unittest.TestCase):
     def test_boundaries_are_snapshotted_and_conflicts_fail_closed(self):
         with mock.patch.dict(
             os.environ,
-            {kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "1,5"},
+            {
+                kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "1,5",
+                kimi_k3.ASYNC_DECODE_STATE_ENV: "hidden",
+            },
             clear=False,
         ):
             model = _make_model()
@@ -669,12 +672,35 @@ class TestKimiK3AsyncDecodeBoundaries(unittest.TestCase):
             model.model._async_decode_boundaries,
             frozenset((1, 5)),
         )
+        self.assertEqual(model.model._async_decode_state, "hidden")
 
         with mock.patch.dict(
             os.environ,
             {
                 kimi_k3.COMPILED_DECODE_ENV: "1",
                 kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "1",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(ValueError):
+                _make_model()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "none",
+                kimi_k3.ASYNC_DECODE_STATE_ENV: "hidden",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(ValueError):
+                _make_model()
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "1",
+                kimi_k3.ASYNC_DECODE_STATE_ENV: "invalid",
             },
             clear=False,
         ):
@@ -727,22 +753,25 @@ class TestKimiK3AsyncDecodeBoundaries(unittest.TestCase):
     def test_boundaries_preserve_exact_logits_and_cache(self):
         model = _make_model()
         base_cache = _warm_cache(model)
-        eager_cache = copy.deepcopy(base_cache)
-        boundary_cache = copy.deepcopy(base_cache)
+        for state in ("hidden", "residual"):
+            with self.subTest(state=state):
+                eager_cache = copy.deepcopy(base_cache)
+                boundary_cache = copy.deepcopy(base_cache)
 
-        for token in (17, 23, 29, 31):
-            inputs = mx.array([[token]], dtype=mx.int32)
+                for token in (17, 23, 29, 31):
+                    inputs = mx.array([[token]], dtype=mx.int32)
 
-            model.model._async_decode_boundaries = frozenset()
-            eager = model(inputs, cache=eager_cache)
-            mx.eval(eager, [c.state for c in eager_cache])
+                    model.model._async_decode_boundaries = frozenset()
+                    eager = model(inputs, cache=eager_cache)
+                    mx.eval(eager, [c.state for c in eager_cache])
 
-            model.model._async_decode_boundaries = frozenset((1, 5))
-            candidate = model(inputs, cache=boundary_cache)
-            mx.eval(candidate, [c.state for c in boundary_cache])
+                    model.model._async_decode_boundaries = frozenset((1, 5))
+                    model.model._async_decode_state = state
+                    candidate = model(inputs, cache=boundary_cache)
+                    mx.eval(candidate, [c.state for c in boundary_cache])
 
-            self.assertTrue(mx.array_equal(eager, candidate).item())
-            _assert_cache_equal(self, eager_cache, boundary_cache)
+                    self.assertTrue(mx.array_equal(eager, candidate).item())
+                    _assert_cache_equal(self, eager_cache, boundary_cache)
 
 
 if __name__ == "__main__":
