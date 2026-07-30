@@ -1,22 +1,22 @@
-"""Exact decode-only packing for Kimi K3's skinny KDA projections.
+"""Exact decode-only packing for Kimi K3's same-input KDA projections.
 
 The released Kimi K3 checkpoint uses a full-rank output gate.  Its KDA decode
-therefore evaluates two small affine-quantized projections from the same
+evaluates two useful groups of affine-quantized projections from the same
 hidden-state vector:
 
-* ``f_a_proj`` (replicated, ``head_dim`` rows); and
-* ``b_proj`` (head-sharded under tensor parallelism).
+* skinny ``f_a_proj`` plus head-sharded ``b_proj``; and
+* rank-local ``qkv_proj`` plus the full-rank output ``g_proj``.
 
-Packing their already-quantized rows replaces two single-token QMV launches
-with one.  Older low-rank-gate KDA configurations additionally have
-``g_a_proj``; that same-input projection can join the pack without changing
-the accumulation order of any output.
+Each default-off pack concatenates already-quantized rows and replaces two
+single-token QMV launches with one.  Older low-rank-gate KDA configurations
+can use only the skinny pack, where ``g_a_proj`` joins ``f_a_proj`` and
+``b_proj``.
 
-The packed arrays are authoritative: the original modules are repointed to
-row views of the packed allocation after it has evaluated successfully.  This
+Both packed allocations are authoritative: their original modules are
+repointed to row views after concatenation has evaluated successfully.  This
 keeps the original parameter names and multi-token behavior without retaining
-a duplicate copy of the weights.  The optimization is opt-in and fails closed
-for any unverified shape or quantization layout.
+duplicate weights.  Both optimizations fail closed for unverified shapes or
+quantization layouts.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ import mlx.nn as nn
 
 
 PACKED_KDA_SKINNY_ENV = "MLX_LM_KIMI_K3_PACKED_KDA_SKINNY"
+PACKED_KDA_WIDE_ENV = "MLX_LM_KIMI_K3_PACKED_KDA_WIDE"
 _ARRAY_NAMES = ("weight", "scales", "biases", "bias")
 _UNSUPPORTED = object()
 
@@ -39,9 +40,18 @@ class PackedKDASkinnyUnsupported(ValueError):
     """Raised when KDA projections cannot be packed exactly."""
 
 
+class PackedKDAWideUnsupported(PackedKDASkinnyUnsupported):
+    """Raised when KDA's wide QKV/gate projections cannot be packed exactly."""
+
+
 @lru_cache(maxsize=1)
 def packed_kda_skinny_enabled() -> bool:
     return os.environ.get(PACKED_KDA_SKINNY_ENV, "0") == "1"
+
+
+@lru_cache(maxsize=1)
+def packed_kda_wide_enabled() -> bool:
+    return os.environ.get(PACKED_KDA_WIDE_ENV, "0") == "1"
 
 
 def _array_parameter(module: Any, name: str) -> mx.array | None:
@@ -118,7 +128,7 @@ class AuthoritativePackedK3KDASkinny(nn.Module):
             biases = _array_parameter(module, "biases")
             if weight is None or scales is None or biases is None:
                 raise PackedKDASkinnyUnsupported(
-                    "every KDA skinny projection must be affine quantized"
+                    "every packed KDA projection must be affine quantized"
                 )
             if weight.ndim != 2 or scales.ndim != 2 or biases.ndim != 2:
                 raise PackedKDASkinnyUnsupported(
@@ -148,16 +158,16 @@ class AuthoritativePackedK3KDASkinny(nn.Module):
 
         if len(set(configs)) != 1:
             raise PackedKDASkinnyUnsupported(
-                "all KDA skinny projections must share one quantization layout"
+                "all packed KDA projections must share one quantization layout"
             )
         group_size, bits, mode = configs[0]
         if (group_size, bits, mode) != (64, 6, "affine"):
             raise PackedKDASkinnyUnsupported(
-                "K3 skinny packing requires affine 6-bit/group-64 weights"
+                "K3 KDA packing requires affine 6-bit/group-64 weights"
             )
         if len(set(input_dims)) != 1:
             raise PackedKDASkinnyUnsupported(
-                "all KDA skinny projections must consume the same hidden width"
+                "all packed KDA projections must consume the same hidden width"
             )
 
         scales = _all_or_none(modules, "scales")
@@ -269,6 +279,32 @@ class AuthoritativePackedK3KDASkinny(nn.Module):
         return tuple(mx.split(output, self._split_indices, axis=-1))
 
 
+class AuthoritativePackedK3KDAWide(AuthoritativePackedK3KDASkinny):
+    """One exact QMV for K3's rank-local QKV and full-rank gate rows."""
+
+    def __init__(self, modules: Sequence[Any]):
+        modules = tuple(modules)
+        if len(modules) != 2:
+            raise PackedKDAWideUnsupported(
+                f"expected QKV and gate projections, got {len(modules)}"
+            )
+        qkv_weight = _array_parameter(modules[0], "weight")
+        gate_weight = _array_parameter(modules[1], "weight")
+        if qkv_weight is None or gate_weight is None:
+            raise PackedKDAWideUnsupported(
+                "QKV and gate projections must expose array weights"
+            )
+        if qkv_weight.ndim != 2 or gate_weight.ndim != 2:
+            raise PackedKDAWideUnsupported(
+                "QKV and gate packed weights must be two-dimensional"
+            )
+        if int(qkv_weight.shape[0]) != 3 * int(gate_weight.shape[0]):
+            raise PackedKDAWideUnsupported(
+                "rank-local QKV rows must be exactly three times gate rows"
+            )
+        super().__init__(modules)
+
+
 def _skinny_modules(attention: Any) -> tuple[Any, ...]:
     required = ["f_a_proj"]
     if not bool(getattr(attention, "use_full_rank_gate", False)):
@@ -277,6 +313,20 @@ def _skinny_modules(attention: Any) -> tuple[Any, ...]:
     missing = [name for name in required if not hasattr(attention, name)]
     if missing:
         raise PackedKDASkinnyUnsupported(
+            f"KDA attention is missing projections: {missing}"
+        )
+    return tuple(getattr(attention, name) for name in required)
+
+
+def _wide_modules(attention: Any) -> tuple[Any, Any]:
+    if not bool(getattr(attention, "use_full_rank_gate", False)):
+        raise PackedKDAWideUnsupported(
+            "wide KDA packing requires Kimi K3's full-rank gate"
+        )
+    required = ("qkv_proj", "g_proj")
+    missing = [name for name in required if not hasattr(attention, name)]
+    if missing:
+        raise PackedKDAWideUnsupported(
             f"KDA attention is missing projections: {missing}"
         )
     return tuple(getattr(attention, name) for name in required)
@@ -299,6 +349,25 @@ def invalidate_packed_k3_kda_skinny(attention: Any) -> None:
     if isinstance(packed, AuthoritativePackedK3KDASkinny):
         packed.detach_source_views()
     _drop_packed_kda_skinny(attention)
+
+
+def _drop_packed_kda_wide(attention: Any) -> None:
+    for name in (
+        "_authoritative_packed_kda_wide",
+        "_authoritative_packed_kda_wide_reason",
+        "_authoritative_packed_kda_wide_source_signature",
+    ):
+        if hasattr(attention, name):
+            object.__delattr__(attention, name)
+
+
+def invalidate_packed_k3_kda_wide(attention: Any) -> None:
+    """Drop the authoritative wide pack before sharding or weight mutation."""
+
+    packed = getattr(attention, "_authoritative_packed_kda_wide", None)
+    if isinstance(packed, AuthoritativePackedK3KDAWide):
+        packed.detach_source_views()
+    _drop_packed_kda_wide(attention)
 
 
 def maybe_authoritative_packed_k3_kda_skinny(
@@ -381,5 +450,90 @@ def maybe_authoritative_packed_k3_kda_skinny(
 
     try:
         return packed(x)
+    except PackedKDASkinnyUnsupported:
+        return None
+
+
+def maybe_authoritative_packed_k3_kda_wide(
+    attention: Any,
+    x: mx.array,
+) -> tuple[mx.array, mx.array] | None:
+    """Return exact packed QKV/gate projections, or the stock fallback."""
+
+    if (
+        not packed_kda_wide_enabled()
+        or getattr(attention, "training", True)
+        or x.ndim != 3
+        or x.shape[0] * x.shape[1] != 1
+    ):
+        return None
+
+    try:
+        modules = _wide_modules(attention)
+    except (AttributeError, PackedKDAWideUnsupported):
+        return None
+
+    packed = getattr(attention, "_authoritative_packed_kda_wide", None)
+    stale_packed = None
+    current_signature = _source_signature(modules)
+    if packed is _UNSUPPORTED:
+        unsupported_signature = getattr(
+            attention,
+            "_authoritative_packed_kda_wide_source_signature",
+            (),
+        )
+        if _same_source_signature(unsupported_signature, current_signature):
+            return None
+        _drop_packed_kda_wide(attention)
+        packed = None
+    elif packed is not None:
+        try:
+            if not packed.matches_sources(modules):
+                stale_packed = packed
+                _drop_packed_kda_wide(attention)
+                packed = None
+        except (AttributeError, TypeError, ValueError):
+            if isinstance(packed, AuthoritativePackedK3KDAWide):
+                stale_packed = packed
+            _drop_packed_kda_wide(attention)
+            packed = None
+
+    if packed is None:
+        try:
+            packed = AuthoritativePackedK3KDAWide(modules)
+        except (
+            AttributeError,
+            PackedKDASkinnyUnsupported,
+            TypeError,
+            ValueError,
+        ) as exc:
+            if isinstance(stale_packed, AuthoritativePackedK3KDAWide):
+                stale_packed.detach_source_views()
+                current_signature = _source_signature(modules)
+            object.__setattr__(
+                attention,
+                "_authoritative_packed_kda_wide_reason",
+                str(exc),
+            )
+            object.__setattr__(
+                attention,
+                "_authoritative_packed_kda_wide",
+                _UNSUPPORTED,
+            )
+            object.__setattr__(
+                attention,
+                "_authoritative_packed_kda_wide_source_signature",
+                current_signature,
+            )
+            return None
+        object.__setattr__(
+            attention,
+            "_authoritative_packed_kda_wide",
+            packed,
+        )
+
+    try:
+        qkv, gate = packed(x)
+        return qkv, gate
     except PackedKDASkinnyUnsupported:
         return None
