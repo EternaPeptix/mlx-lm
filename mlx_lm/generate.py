@@ -300,6 +300,7 @@ def generate_step(
     model: nn.Module,
     *,
     max_tokens: int = 256,
+    async_lookahead: bool = True,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     max_kv_size: Optional[int] = None,
@@ -319,6 +320,9 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
+        async_lookahead (bool): Start computing the next token before yielding the
+          current token. Disable this for pipeline-parallel models so an early
+          consumer stop cannot abandon an in-flight inter-rank send.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
         logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
@@ -445,20 +449,26 @@ def generate_step(
 
     mx.async_eval(y, logprobs)
     n = 0
-    while True:
-        if n != max_tokens:
+    while n != max_tokens:
+        if async_lookahead and (max_tokens < 0 or n + 1 < max_tokens):
             next_y, next_logprobs = _step(y)
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
-        if n == max_tokens:
-            break
         yield y.item(), logprobs
         if n % 256 == 0:
             mx.clear_cache()
-        y, logprobs = next_y, next_logprobs
         n += 1
+        if n == max_tokens:
+            break
+        if async_lookahead:
+            y, logprobs = next_y, next_logprobs
+        else:
+            # Do not cross the yield boundary with pipeline communication in
+            # flight. stream_generate may stop on EOS or a user stop sequence.
+            y, logprobs = _step(y)
+            mx.async_eval(y, logprobs)
 
 
 def speculative_generate_step(
