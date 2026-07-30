@@ -440,6 +440,22 @@ def load_model(
 
         model.update_modules(leaves)
 
+    # The CUDA packed sorted-QMM kernel consumes a physical weight layout that
+    # is intentionally incompatible with ordinary MLX QMM. Keep it behind the
+    # same explicit process-level opt-in and transform only SwitchLinear
+    # tensors after model sanitization/quantization has established their final
+    # names and shapes.
+    from .models.switch_layers import (
+        pack_mxfp4_switch_weights,
+        validate_sorted_qmm_packed_config,
+    )
+
+    weights = pack_mxfp4_switch_weights(
+        model,
+        weights,
+        prepacked=validate_sorted_qmm_packed_config(config),
+    )
+
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
 

@@ -1,7 +1,9 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import os
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -872,6 +874,151 @@ class TestModels(unittest.TestCase):
             8,
         )
         self.assertEqual(config["quantization"]["bits"], 4)
+
+    def test_mxfp4_sorted_qmm_weight_pack(self):
+        from mlx_lm.models.switch_layers import (
+            _pack_mxfp4_scales_for_sorted_qmm,
+            _pack_mxfp4_weight_for_sorted_qmm,
+        )
+
+        weight = mx.arange(256 * 8, dtype=mx.uint32).reshape(1, 256, 8)
+        packed = _pack_mxfp4_weight_for_sorted_qmm(weight)
+        physical = packed.reshape(1, 1, 1, 32, 8, 8)
+
+        # k-word 3 XORs packed row 5 back to logical row 6.
+        self.assertEqual(physical[0, 0, 0, 0, 3, 5].item(), 6 * 8 + 3)
+
+        xor_rows = mx.array(
+            [[k_word ^ row for row in range(8)] for k_word in range(8)],
+            dtype=mx.int32,
+        ).reshape(1, 1, 1, 1, 8, 8)
+        unxored = mx.take_along_axis(
+            physical,
+            mx.broadcast_to(xor_rows, physical.shape),
+            axis=-1,
+        )
+        unpacked = mx.transpose(unxored, (0, 1, 3, 5, 2, 4)).reshape(
+            weight.shape
+        )
+        self.assertTrue(mx.array_equal(unpacked, weight))
+
+        scales = mx.arange(256 * 4, dtype=mx.uint8).reshape(1, 256, 4)
+        packed_scales = _pack_mxfp4_scales_for_sorted_qmm(scales)
+        physical_scales = packed_scales.reshape(1, 1, 2, 256, 2)
+        self.assertEqual(
+            physical_scales[0, 0, 1, 7, 0].item(),
+            scales[0, 7, 2].item(),
+        )
+        unpacked_scales = mx.transpose(
+            physical_scales, (0, 1, 3, 2, 4)
+        ).reshape(scales.shape)
+        self.assertTrue(mx.array_equal(unpacked_scales, scales))
+
+    def test_mxfp4_sorted_qmm_pack_skips_ineligible_layers(self):
+        from mlx_lm.models.switch_layers import (
+            QuantizedSwitchLinear,
+            pack_mxfp4_switch_weights,
+        )
+
+        model = nn.Module()
+        model.affine = QuantizedSwitchLinear(
+            64,
+            256,
+            1,
+            bias=False,
+            group_size=32,
+            bits=4,
+            mode="affine",
+        )
+        affine_weights = {
+            "affine.weight": model.affine.weight,
+            "affine.scales": model.affine.scales,
+        }
+        original_affine_weight = affine_weights["affine.weight"]
+
+        with patch.dict(os.environ, {"MLX_CUDA_SORTED_QMM_PACKED": "1"}):
+            packed = pack_mxfp4_switch_weights(model, affine_weights)
+
+        self.assertIs(packed["affine.weight"], original_affine_weight)
+        self.assertFalse(model.affine._requires_sorted_qmm)
+
+        # An otherwise eligible MXFP4 layer with an unsupported output shape
+        # must also stay in the ordinary sorted-QMM layout.
+        model.affine.mode = "mxfp4"
+        unsupported_weight = mx.zeros((1, 128, 8), dtype=mx.uint32)
+        unsupported_scales = mx.zeros((1, 128, 2), dtype=mx.uint8)
+        unsupported_weights = {
+            "affine.weight": unsupported_weight,
+            "affine.scales": unsupported_scales,
+        }
+        with patch.dict(os.environ, {"MLX_CUDA_SORTED_QMM_PACKED": "1"}):
+            packed = pack_mxfp4_switch_weights(model, unsupported_weights)
+
+        self.assertIs(packed["affine.weight"], unsupported_weight)
+        self.assertIs(packed["affine.scales"], unsupported_scales)
+        self.assertFalse(model.affine._requires_sorted_qmm)
+
+    def test_mxfp4_sorted_qmm_prepacked_checkpoint_guard(self):
+        from mlx_lm.models.switch_layers import (
+            QuantizedSwitchLinear,
+            pack_mxfp4_switch_weights,
+        )
+
+        model = nn.Module()
+        model.expert = QuantizedSwitchLinear(
+            64,
+            256,
+            1,
+            bias=False,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+        weights = {
+            "expert.weight": mx.zeros((1, 256, 8), dtype=mx.uint32),
+            "expert.scales": mx.zeros((1, 256, 2), dtype=mx.uint8),
+        }
+        original_weight = weights["expert.weight"]
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(
+                ValueError, "MLX_CUDA_SORTED_QMM_PACKED=1"
+            ):
+                pack_mxfp4_switch_weights(model, weights, prepacked=True)
+
+        with patch.dict(
+            os.environ, {"MLX_CUDA_SORTED_QMM_PACKED": "1"}, clear=True
+        ):
+            packed = pack_mxfp4_switch_weights(
+                model, weights, prepacked=True
+            )
+
+        self.assertIs(packed["expert.weight"], original_weight)
+        self.assertTrue(model.expert._requires_sorted_qmm)
+
+    def test_packed_sorted_qmm_forces_decode_route_sort(self):
+        from mlx_lm.models.switch_layers import (
+            QuantizedSwitchLinear,
+            _should_sort_switch,
+        )
+
+        projection = QuantizedSwitchLinear(
+            64,
+            256,
+            1,
+            bias=False,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+        decode_indices = mx.zeros((1, 4), dtype=mx.int32)
+        prefill_indices = mx.zeros((16, 4), dtype=mx.int32)
+
+        self.assertFalse(_should_sort_switch(decode_indices, projection))
+        self.assertTrue(_should_sort_switch(prefill_indices, projection))
+
+        projection._requires_sorted_qmm = True
+        self.assertTrue(_should_sort_switch(decode_indices, projection))
 
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
