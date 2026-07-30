@@ -449,26 +449,33 @@ def generate_step(
 
     mx.async_eval(y, logprobs)
     n = 0
-    while n != max_tokens:
-        if async_lookahead and (max_tokens < 0 or n + 1 < max_tokens):
-            next_y, next_logprobs = _step(y)
-            mx.async_eval(next_y, next_logprobs)
+    while True:
         if n == 0:
             mx.eval(y)
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+        if n == max_tokens:
+            break
+        if async_lookahead:
+            next_y, next_logprobs = _step(y)
+            mx.async_eval(next_y, next_logprobs)
         yield y.item(), logprobs
         if n % 256 == 0:
             mx.clear_cache()
         n += 1
-        if n == max_tokens:
-            break
         if async_lookahead:
             y, logprobs = next_y, next_logprobs
         else:
             # Do not cross the yield boundary with pipeline communication in
             # flight. stream_generate may stop on EOS or a user stop sequence.
             y, logprobs = _step(y)
-            mx.async_eval(y, logprobs)
+            if n == max_tokens:
+                # Preserve the historical bounded-generation cache contract:
+                # every emitted token is processed into the cache. This runs
+                # only after the consumer resumes from the final yield, and is
+                # synchronous so no pipeline communication is abandoned.
+                mx.eval(y, logprobs)
+            else:
+                mx.async_eval(y, logprobs)
 
 
 def speculative_generate_step(

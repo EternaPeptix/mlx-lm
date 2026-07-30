@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from typing import Callable
 
 import mlx.core as mx
 
@@ -27,13 +28,38 @@ class _CountingModel:
         return mx.broadcast_to(row, (*inputs.shape, self.vocab_size))
 
 
-def _steps(model: _CountingModel, *, max_tokens: int, async_lookahead: bool):
+class _OffsetCache:
+    def __init__(self) -> None:
+        self.offset = 0
+
+
+class _CacheCountingModel(_CountingModel):
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: list[_OffsetCache] | None = None,
+    ) -> mx.array:
+        if cache is not None:
+            for entry in cache:
+                entry.offset += inputs.shape[-1]
+        return super().__call__(inputs, cache=None)
+
+
+def _steps(
+    model: _CountingModel,
+    *,
+    max_tokens: int,
+    async_lookahead: bool,
+    prompt_cache: list[object] | None = None,
+    prompt_progress_callback: Callable[[int, int], None] | None = None,
+):
     return generate_step(
         prompt=mx.array([1], dtype=mx.uint32),
         model=model,
         max_tokens=max_tokens,
         async_lookahead=async_lookahead,
-        prompt_cache=[],
+        prompt_cache=[] if prompt_cache is None else prompt_cache,
+        prompt_progress_callback=prompt_progress_callback,
     )
 
 
@@ -74,7 +100,7 @@ class AsyncLookaheadLifecycleTest(unittest.TestCase):
             [token for token, _ in outputs],
             [model.forced_token] * 3,
         )
-        self.assertEqual(model.calls, 3)
+        self.assertEqual(model.calls, 4)
 
     def test_default_path_still_looks_ahead_before_yield(self) -> None:
         model = _CountingModel()
@@ -83,3 +109,34 @@ class AsyncLookaheadLifecycleTest(unittest.TestCase):
         next(steps)
         self.assertEqual(model.calls, 2)
         steps.close()
+
+    def test_bounded_generation_preserves_cache_offsets_and_progress(self) -> None:
+        for async_lookahead in (False, True):
+            for max_tokens in (0, 1, 3):
+                with self.subTest(
+                    async_lookahead=async_lookahead,
+                    max_tokens=max_tokens,
+                ):
+                    model = _CacheCountingModel()
+                    prompt_cache = [_OffsetCache()]
+                    progress = []
+
+                    def progress_callback(processed: int, total: int) -> None:
+                        progress.append((processed, total))
+
+                    outputs = list(
+                        _steps(
+                            model,
+                            max_tokens=max_tokens,
+                            async_lookahead=async_lookahead,
+                            prompt_cache=prompt_cache,
+                            prompt_progress_callback=progress_callback,
+                        )
+                    )
+
+                    self.assertEqual(len(outputs), max_tokens)
+                    self.assertEqual(prompt_cache[0].offset, 1 + max_tokens)
+                    self.assertEqual(model.calls, 1 + max_tokens)
+                    self.assertEqual(progress[-1], (1, 1))
+                    if max_tokens == 0:
+                        self.assertEqual(progress, [(0, 1), (1, 1)])
