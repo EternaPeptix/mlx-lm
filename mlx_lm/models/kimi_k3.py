@@ -22,6 +22,7 @@ from .kimi_k3_fused_expert import (
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
 )
+from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
 from .kimi_k3_packed_moe_front import (
     invalidate_packed_k3_moe_front,
     maybe_packed_k3_moe_front,
@@ -953,12 +954,14 @@ class KimiK3SparseMoE(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        packed_front = maybe_packed_k3_moe_front(self, x)
-        if packed_front is None:
+        optimized_front = maybe_multibank_k3_moe_front(self, x)
+        if optimized_front is None:
+            optimized_front = maybe_packed_k3_moe_front(self, x)
+        if optimized_front is None:
             scores = self.gate(x)
             y = self.routed_expert_down_proj(x) if self.latent_size is not None else x
         else:
-            shared_gate, shared_up, scores, y = packed_front
+            shared_gate, shared_up, scores, y = optimized_front
         inds, weights = _group_expert_select(
             scores,
             self.e_score_correction_bias,
@@ -973,7 +976,7 @@ class KimiK3SparseMoE(nn.Module):
         y = (y * weights[..., None]).sum(axis=-2)
         if self.shared_experts is None:
             shared = None
-        elif packed_front is None:
+        elif optimized_front is None:
             shared = self.shared_experts(x)
         else:
             shared = self.shared_experts.down_proj(
