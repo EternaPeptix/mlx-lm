@@ -51,23 +51,38 @@ particular compiled subset is safe.
 ## Current result
 
 The latest exact TP2 candidate combines the `laguna8` hidden-state
-asynchronous decode schedule with the authoritative packed MoE front. On the
-canonical 575-token prompt and 128-token decode, five matched repetitions
-produced a median `12.9576` decode tok/s versus `12.8921` for the asynchronous
-control (`+0.51%`) while retaining completion digest
+asynchronous decode schedule, authoritative packed MoE front, row-4 KDA
+prefill, and exact fused experts. On the canonical 575-token prompt and
+128-token decode, five candidate repetitions produced a median `13.2985`
+decode tok/s versus `12.9824` for the matched fused-expert-off control
+(`+2.44%`). Every repetition retained completion digest
 `c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`.
-A separate code-prompt screen produced `12.9288` versus `12.8793` tok/s
-(`+0.39%`) with its exact reference digest. The authoritative representation
-also removes approximately `7.44 GB` decimal (`6.93 GiB`) of persistent
-duplicate projection storage per TP2 rank.
+A separate 1,067-token coding-prompt screen produced `13.2637` versus
+`12.9288` tok/s (`+2.59%`) and retained digest
+`9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959`.
+Peak memory remained approximately `414 GB` per rank for the canonical case.
+
+The authoritative representation removes approximately `7.44 GB` decimal
+(`6.93 GiB`) of persistent duplicate projection storage per TP2 rank. The
+fused-expert and row-4 paths remain opt-in narrow specializations even though
+the supported two-rank UVMAX configuration now has a successful exact
+full-model A/B.
 
 The row-tiled KDA prefill path is bit-exact in the focused Metal tests and uses
 no scratch allocation. On an M3 Max KDA-only microbenchmark it improved the
 recurrence from `0.920` to `0.644 ms` at 128 tokens (`1.43x`), from `3.255` to
 `1.912 ms` at 512 tokens (`1.70x`), from `15.997` to `7.515 ms` at 2K
 (`2.13x`), and from `115.852` to `36.046 ms` at 8K (`3.21x`). These are
-kernel-level measurements; a matched full-model TP2 prefill result is not yet
-claimed.
+kernel-level measurements.
+
+The matched full-model TP2 prefill A/B reached `147.4168` prompt tok/s versus
+`146.3746` at 2K target context (`+0.71%`) and `154.9942` versus a
+`153.2673` warmed control at 8K (`+1.13%`). All observations retained digest
+`e929f1fd6e350d723ee540dee6e7641916c622c9deb56912b1e8fddb252b52c6`,
+and peak memory was unchanged within measurement noise.
+
+The sanitized per-repetition record is published with the coordinated
+[EXO branch](https://github.com/EternaPeptix/exo/blob/experiment/kimi-k3-uvmax-optimization-stack/docs/kimi_k3_tp2_benchmark_20260730.json).
 
 On a matched three-repetition canonical TP2 screening run, the feature-off
 reference produced a median `12.0465` decode tok/s. The `laguna8` hidden-state

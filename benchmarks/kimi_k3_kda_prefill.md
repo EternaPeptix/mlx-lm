@@ -106,6 +106,30 @@ python benchmarks/kimi_k3_kda_prefill.py \
   --heads 96 --rows 2 4 8 --warmup 4 --repeats 15
 ```
 
+## Full-model TP2 A/B
+
+The live A/B used two 512 GB M3 Ultra Mac Studios, rank-local TP2,
+four-rail JACCL, no prefix cache, and eight generated tokens. The
+authoritative packed MoE-front and exact asynchronous decode schedule were
+enabled in both arms; only `MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL` changed.
+
+| Target / actual prompt | Warm control tok/s | Row-4 tok/s | Gain | Row-4 peak memory |
+| ---: | ---: | ---: | ---: | ---: |
+| 2,048 / 2,000 | 146.3746 | 147.4168 | 0.71% | 419.74 GB |
+| 8,192 / 7,705 | 153.2673 | 154.9942 | 1.13% | 426.92 GB |
+
+The 2K figures are two-repetition medians. The 8K control combines two
+separately warmed observations, and the row-4 figure is the median of two
+repetitions. Every observation produced the same completion digest,
+`e929f1fd6e350d723ee540dee6e7641916c622c9deb56912b1e8fddb252b52c6`.
+Peak memory was unchanged within measurement noise.
+
+The small full-model gain is consistent with KDA occupying only a fraction of
+Kimi K3 prefill time even though the isolated recurrence is substantially
+faster. The gain increased from 2K to 8K, so the implementation is not merely
+a short-prompt specialization; contexts beyond 8K still require direct
+measurement.
+
 ## Workspace scaling
 
 All figures below exclude the required output tensor and model inputs.
@@ -125,14 +149,12 @@ nothing on top of those required tensors.
 
 ## Integration surface
 
-The next isolated A/B surface is a Kimi K3 prefill run from this branch with
-the environment flag enabled on both Mac ranks. Record per-layer KDA timing,
-whole-model prompt tokens/s, peak memory, and logits against the flag-off
-control at 2K, 8K, and at least one larger prompt. The end-to-end gain will
-depend on the fraction of prefill time spent in KDA; this microbenchmark alone
-does not establish model-level speedup.
+The two-rank 2K/8K A/B is now complete. The next measurement surface is a
+larger-context sweep with per-layer KDA timing, whole-model prompt tokens/s,
+peak memory, and logits against a warmed flag-off control. The end-to-end gain
+continues to depend on the fraction of prefill time spent in KDA.
 
 Do not replace the recurrent decode kernel with this path. If the live A/B is
-positive, the next code step is a Kimi-specific named configuration switch
-and a performance regression test, not making the experimental environment
-flag the global default.
+positive, the next code step is a Kimi-specific named configuration switch and
+a performance regression test, not making the experimental environment flag
+the global default.
