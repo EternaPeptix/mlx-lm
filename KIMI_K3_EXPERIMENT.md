@@ -18,7 +18,7 @@ It contains the Kimi K3 support and TP2 changes used to run
 - an opt-in exact row-tiled KDA prefill kernel;
 - opt-in exact fused expert-down/reduction and router-selection kernels;
 - an opt-in exact AttnRes-to-RMSNorm decode fusion;
-- an opt-in zero-copy pack for KDA's same-input skinny projections; and
+- opt-in zero-copy packs for KDA's same-input skinny and wide projections; and
 - focused Metal and distributed tests for those paths.
 
 ## Feature flags
@@ -42,8 +42,9 @@ boundaries in each decoder layer while retaining the stock BF16
 materialization and reduction order.
 `MLX_LM_KIMI_K3_PACKED_KDA_SKINNY=1` concatenates KDA's compatible
 rank-local `f_a` and `b` projection rows into one authoritative quantized
-backing and one decode QMV. All of these features default to off and fail
-closed outside their supported shapes.
+backing and one decode QMV. `MLX_LM_KIMI_K3_PACKED_KDA_WIDE=1` independently
+does the same for the rank-local `qkv` and full-rank gate projections. All of
+these features default to off and fail closed outside their supported shapes.
 
 `MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES` enables eager, decode-only
 asynchronous evaluation boundaries. It accepts `none`, `laguna8`, `block8`,
@@ -67,16 +68,17 @@ particular compiled subset is safe.
 The latest exact TP2 candidate combines the `laguna8` hidden-state
 asynchronous decode schedule, authoritative packed MoE front, row-4 KDA
 prefill, exact fused experts, fused down/route reduction, AttnRes/RMSNorm
-fusion, exact fused routing, and zero-copy KDA skinny-projection packing.
+fusion, exact fused routing, and zero-copy KDA skinny/wide projection packing.
 On the canonical 575-token prompt and 128-token decode, five repetitions
-produced a median `14.0268` decode tok/s. This is `+1.53%` over the otherwise
-matched exact-router stack (`13.8160`), `+3.26%` over fused down/reduction
-alone (`13.5835`), and saves `1.088 ms/token` versus the exact-router stack.
+produced a median `14.1097` decode tok/s. The wide pack adds `+0.59%` over the
+skinny-only stack (`14.0268`), and the complete stack is `+3.87%` over fused
+down/reduction alone (`13.5835`). The wide pack saves another
+`0.419 ms/token`.
 Every repetition retained completion digest
 `c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`.
 A separate 1,067-token coding-prompt screen produced a three-run median
-`13.9971` tok/s, `+1.57%` over the exact-router stack (`13.7809`) and
-`+3.60%` over fused down/reduction alone (`13.5102`), while retaining digest
+`14.0764` tok/s, `+0.57%` over the skinny-only stack (`13.9971`) and
+`+4.19%` over fused down/reduction alone (`13.5102`), while retaining digest
 `9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959`.
 Peak memory remained approximately `414 GB` per rank for the canonical case.
 
