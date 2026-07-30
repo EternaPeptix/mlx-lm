@@ -2,9 +2,9 @@
 
 This branch is one part of a coordinated public experiment:
 
-- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack-v3)
-- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v3)
-- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v3)
+- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack-v4)
+- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v4)
+- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v4)
 
 It contains the Kimi K3 support and TP2 changes used to run
 `kernelpool/Kimi-K3-2bit-UVMAX` across two 512 GB M3 Ultra systems, including:
@@ -18,7 +18,8 @@ It contains the Kimi K3 support and TP2 changes used to run
 - an opt-in exact row-tiled KDA prefill kernel;
 - opt-in exact fused expert-down/reduction and router-selection kernels;
 - an opt-in exact AttnRes-to-RMSNorm decode fusion;
-- opt-in zero-copy packs for KDA's same-input skinny and wide projections; and
+- opt-in zero-copy packs for KDA's same-input skinny and wide projections;
+- an opt-in exact routed-up/shared/residual output fusion for TP2 decode; and
 - focused Metal and distributed tests for those paths.
 
 ## Feature flags
@@ -43,8 +44,12 @@ materialization and reduction order.
 `MLX_LM_KIMI_K3_PACKED_KDA_SKINNY=1` concatenates KDA's compatible
 rank-local `f_a` and `b` projection rows into one authoritative quantized
 backing and one decode QMV. `MLX_LM_KIMI_K3_PACKED_KDA_WIDE=1` independently
-does the same for the rank-local `qkv` and full-rank gate projections. All of
-these features default to off and fail closed outside their supported shapes.
+does the same for the rank-local `qkv` and full-rank gate projections.
+`MLX_LM_KIMI_K3_FUSED_ROUTED_UP_ADD=1` fuses the routed affine-8 up
+projection's FP32-to-BF16 boundary with the BF16 shared-branch and decoder
+residual additions. It is restricted to the exact two-rank, single-token
+decode contract. All of these features default to off and fail closed outside
+their supported shapes.
 
 `MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES` enables eager, decode-only
 asynchronous evaluation boundaries. It accepts `none`, `laguna8`, `block8`,
@@ -68,19 +73,24 @@ particular compiled subset is safe.
 The latest exact TP2 candidate combines the `laguna8` hidden-state
 asynchronous decode schedule, authoritative packed MoE front, row-4 KDA
 prefill, exact fused experts, fused down/route reduction, AttnRes/RMSNorm
-fusion, exact fused routing, and zero-copy KDA skinny/wide projection packing.
+fusion, exact fused routing, zero-copy KDA skinny/wide projection packing, and
+the exact routed-up/shared/residual output fusion.
 On the canonical 575-token prompt and 128-token decode, five repetitions
-produced a median `14.1097` decode tok/s. The wide pack adds `+0.59%` over the
-skinny-only stack (`14.0268`), and the complete stack is `+3.87%` over fused
-down/reduction alone (`13.5835`). The wide pack saves another
-`0.419 ms/token`.
+produced a median `14.2375` decode tok/s. The routed-up/add fusion adds
+`+0.91%` over the wide-KDA stack (`14.1097`) and saves `0.636 ms/token`; the
+complete stack is `+4.81%` over fused down/reduction alone (`13.5835`).
 Every repetition retained completion digest
 `c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`.
 A separate 1,067-token coding-prompt screen produced a three-run median
-`14.0764` tok/s, `+0.57%` over the skinny-only stack (`13.9971`) and
-`+4.19%` over fused down/reduction alone (`13.5102`), while retaining digest
+`14.2155` tok/s, `+0.99%` over the wide-KDA stack (`14.0764`) and
+`+5.22%` over fused down/reduction alone (`13.5102`), while retaining digest
 `9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959`.
 Peak memory remained approximately `414 GB` per rank for the canonical case.
+
+The routed-up/add kernel won 29 of 31 paired M3 Max microbenchmark trials. Its
+paired median saving was `0.008308 ms/layer`, or a mechanical
+`0.742 ms/token` across the 92 sparse layers. The live TP2 saving landed at
+`0.636 ms/token`, within the predicted range.
 
 The first fused-router prototype used a SIMD reduction for the sixteen raw
 scores. It reached `13.7189` median decode tok/s, but all five live
@@ -110,7 +120,7 @@ The matched full-model TP2 prefill A/B reached `147.4168` prompt tok/s versus
 and peak memory was unchanged within measurement noise.
 
 The sanitized per-repetition record is published with the coordinated
-[EXO branch](https://github.com/EternaPeptix/exo/blob/experiment/kimi-k3-uvmax-optimization-stack-v3/docs/kimi_k3_tp2_benchmark_20260730.json).
+[EXO branch](https://github.com/EternaPeptix/exo/blob/experiment/kimi-k3-uvmax-optimization-stack-v4/docs/kimi_k3_tp2_benchmark_20260730.json).
 
 On a matched three-repetition canonical TP2 screening run, the feature-off
 reference produced a median `12.0465` decode tok/s. The `laguna8` hidden-state

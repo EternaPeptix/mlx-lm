@@ -51,11 +51,27 @@ alternating-order trials of 800 synchronized iterations.
 | Exact output |  | yes |
 
 The independent-median delta is `0.008067 ms/layer`, mechanically projecting
-to `0.742 ms/token` over K3's 92 sparse layers.  Applying that entire isolated
-delta to the current exact-stack result of `72.380 ms/token` would yield about
-`71.638 ms/token`, or `13.96 tok/s`.  The live asynchronous TP2 schedule may
-hide some of the removed dispatch latency, so a responsible live expectation
-is roughly `0.3-0.75 ms/token`, not the full isolated number as a guarantee.
+to `0.742 ms/token` over K3's 92 sparse layers. The live asynchronous TP2
+schedule may hide some of the removed dispatch latency, so the pre-deployment
+expectation was `0.3-0.75 ms/token`, not the full isolated number as a
+guarantee.
+
+## Exact full-model TP2 result
+
+The candidate was deployed over the accepted wide-KDA stack on two 512 GB M3
+Ultra systems with four-rail JACCL and direct-mesh decode collectives.
+
+| Prompt | Wide-KDA control | Routed-up/add | Gain |
+| --- | ---: | ---: | ---: |
+| Canonical, 575 prompt / 128 decode, 5 runs | 14.1097 tok/s | **14.2375 tok/s** | **+0.91%** |
+| Code-shaped, 1,067 prompt / 128 decode, 3 runs | 14.0764 tok/s | **14.2155 tok/s** | **+0.99%** |
+
+The canonical latency fell from `70.873` to `70.237 ms/token`, a measured
+`0.636 ms/token` saving. Every canonical completion retained SHA-256
+`c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`;
+every code-shaped completion retained SHA-256
+`9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959`.
+Peak memory remained approximately `414 GB` per rank.
 
 ## Rejected adjacent fusion
 
