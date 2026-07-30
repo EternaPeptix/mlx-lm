@@ -24,6 +24,7 @@ from .kimi_k3_fused_expert import (
     maybe_fused_k3_switch_glu,
     maybe_fused_k3_switch_glu_reduce,
 )
+from .kimi_k3_fused_rms_sigmoid_gate import maybe_fused_rms_sigmoid_gate
 from .kimi_k3_fused_router import maybe_fused_k3_router
 from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
 from .kimi_k3_packed_kda_projections import (
@@ -686,10 +687,19 @@ class KimiK3DeltaAttention(nn.Module):
                 g_a = self.g_a_proj(x)
             gate = self.g_b_proj(g_a)
         gate = gate.reshape(B, 1, self.num_heads, self.head_dim)
-        out = (
-            self.o_norm(out.reshape(B, 1, self.num_heads, self.head_dim))
-            * mx.sigmoid(gate)
-        ).reshape(B, 1, -1)
+        out = out.reshape(B, 1, self.num_heads, self.head_dim)
+        fused_out = maybe_fused_rms_sigmoid_gate(
+            out,
+            gate,
+            self.o_norm.weight,
+            self.o_norm.eps,
+            training=self.training,
+        )
+        if fused_out is None:
+            out = self.o_norm(out) * mx.sigmoid(gate)
+        else:
+            out = fused_out
+        out = out.reshape(B, 1, -1)
         return self.o_proj(out), conv_state, ssm_state
 
     def __call__(
