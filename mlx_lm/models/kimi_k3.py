@@ -98,6 +98,8 @@ def exact_wide_short_conv_enabled() -> bool:
     if value not in {"0", "1"}:
         raise ValueError(f"{EXACT_WIDE_SHORT_CONV_ENV} must be exactly '0' or '1'")
     return value == "1"
+
+
 FACTORIZED_SDPA_PREFILL_ENV = "MLX_LM_KIMI_K3_FACTORIZED_SDPA_PREFILL"
 
 
@@ -275,8 +277,7 @@ def _parse_async_decode_boundaries(
         item = item.strip()
         if not item:
             raise ValueError(
-                f"Invalid empty item in "
-                f"{ASYNC_DECODE_BOUNDARIES_ENV}={selector!r}"
+                f"Invalid empty item in " f"{ASYNC_DECODE_BOUNDARIES_ENV}={selector!r}"
             )
 
         bounds = [part.strip() for part in item.split("-")]
@@ -286,13 +287,10 @@ def _parse_async_decode_boundaries(
             start, end = (int(bound) for bound in bounds)
             if start > end:
                 raise ValueError(
-                    f"Reversed range {item!r} in "
-                    f"{ASYNC_DECODE_BOUNDARIES_ENV}"
+                    f"Reversed range {item!r} in " f"{ASYNC_DECODE_BOUNDARIES_ENV}"
                 )
         else:
-            raise ValueError(
-                f"Invalid item {item!r} in {ASYNC_DECODE_BOUNDARIES_ENV}"
-            )
+            raise ValueError(f"Invalid item {item!r} in {ASYNC_DECODE_BOUNDARIES_ENV}")
 
         # The final layer is already submitted by the generation boundary and
         # therefore cannot be an early scheduling boundary.
@@ -888,9 +886,7 @@ class KimiK3DeltaAttention(nn.Module):
         else:
             f_a, g_a, b_logits = packed_skinny
 
-        a_logits = self.f_b_proj(f_a).reshape(
-            B, 1, self.num_heads, self.head_dim
-        )
+        a_logits = self.f_b_proj(f_a).reshape(B, 1, self.num_heads, self.head_dim)
         b_logits = b_logits.reshape(B, 1, self.num_heads)
 
         out, ssm_state = gated_delta_update(
@@ -1043,9 +1039,7 @@ class KimiK3DeltaAttention(nn.Module):
             cache[0] = conv_state
 
         q = qkv[..., :P].reshape(B, T, self.num_heads, self.head_dim)
-        raw_k = qkv[..., P : 2 * P].reshape(
-            B, T, self.num_heads, self.head_dim
-        )
+        raw_k = qkv[..., P : 2 * P].reshape(B, T, self.num_heads, self.head_dim)
         v = qkv[..., 2 * P :].reshape(B, T, self.num_heads, self.head_dim)
 
         inv_scale = self.scale
@@ -1467,11 +1461,7 @@ class KimiK3DecoderLayer(nn.Module):
         w_eff: mx.array,
         norm: nn.RMSNorm,
     ) -> mx.array:
-        if (
-            not self.training
-            and blocks.raw is not None
-            and blocks.inv_rms is not None
-        ):
+        if not self.training and blocks.raw is not None and blocks.inv_rms is not None:
             fused = maybe_fused_attnres_rms(
                 blocks.raw,
                 blocks.inv_rms,
@@ -1523,15 +1513,13 @@ class KimiK3DecoderLayer(nn.Module):
             h = partial_sum + y
             mlp_input = self.post_attention_layernorm(h)
             if isinstance(self.mlp, KimiK3SparseMoE):
-                mlp_output, residual_consumed = (
-                    self.mlp._call_with_optional_residual(mlp_input, h)
+                mlp_output, residual_consumed = self.mlp._call_with_optional_residual(
+                    mlp_input, h
                 )
             else:
                 mlp_output = self.mlp(mlp_input)
                 residual_consumed = False
-            return (
-                mlp_output if residual_consumed else h + mlp_output
-            ), blocks
+            return (mlp_output if residual_consumed else h + mlp_output), blocks
 
         partial_sum = y if partial_sum is None else partial_sum + y
         mlp_input = self._mix_and_norm(
@@ -1541,17 +1529,13 @@ class KimiK3DecoderLayer(nn.Module):
             self.post_attention_layernorm,
         )
         if isinstance(self.mlp, KimiK3SparseMoE):
-            mlp_output, residual_consumed = (
-                self.mlp._call_with_optional_residual(mlp_input, partial_sum)
+            mlp_output, residual_consumed = self.mlp._call_with_optional_residual(
+                mlp_input, partial_sum
             )
         else:
             mlp_output = self.mlp(mlp_input)
             residual_consumed = False
-        partial_sum = (
-            mlp_output
-            if residual_consumed
-            else partial_sum + mlp_output
-        )
+        partial_sum = mlp_output if residual_consumed else partial_sum + mlp_output
         return partial_sum, blocks
 
     def __call__(
@@ -1610,9 +1594,7 @@ def _compile_decode_prefix(
 ):
     def prefix(h, states):
         blocks = ResidualBlocks(eps)
-        h, blocks, updated_states = _decode_kda_group(
-            h, blocks, kda_layers, states
-        )
+        h, blocks, updated_states = _decode_kda_group(h, blocks, kda_layers, states)
         attention_input, partial_sum, blocks = next_mla_layer._prepare_attention(
             h, blocks
         )
@@ -1644,8 +1626,8 @@ def _compile_decode_transition(
             h, blocks = current_mla_layer._finish_attention(
                 partial_sum, mla_output, blocks
             )
-            attention_input, partial_sum, blocks = (
-                next_mla_layer._prepare_attention(h, blocks)
+            attention_input, partial_sum, blocks = next_mla_layer._prepare_attention(
+                h, blocks
             )
             assert partial_sum is not None
             return attention_input, partial_sum, blocks.raw, blocks.inv_rms
@@ -1656,12 +1638,8 @@ def _compile_decode_transition(
         blocks = ResidualBlocks(eps)
         blocks.raw = raw
         blocks.inv_rms = inv_rms
-        h, blocks = current_mla_layer._finish_attention(
-            partial_sum, mla_output, blocks
-        )
-        h, blocks, updated_states = _decode_kda_group(
-            h, blocks, kda_layers, states
-        )
+        h, blocks = current_mla_layer._finish_attention(partial_sum, mla_output, blocks)
+        h, blocks, updated_states = _decode_kda_group(h, blocks, kda_layers, states)
         attention_input, partial_sum, blocks = next_mla_layer._prepare_attention(
             h, blocks
         )
@@ -1687,9 +1665,7 @@ def _compile_decode_tail(
         blocks = ResidualBlocks(eps)
         blocks.raw = raw
         blocks.inv_rms = inv_rms
-        h, blocks = final_mla_layer._finish_attention(
-            partial_sum, mla_output, blocks
-        )
+        h, blocks = final_mla_layer._finish_attention(partial_sum, mla_output, blocks)
         h = _attn_res_mix(
             blocks,
             h,
@@ -1726,9 +1702,7 @@ class KimiK3TextModel(nn.Module):
         self.num_layers = len(self.layers)
         self.in_blocks = 0
         self._set_cache_indices()
-        self._compiled_decode_enabled = (
-            os.environ.get(COMPILED_DECODE_ENV, "0") == "1"
-        )
+        self._compiled_decode_enabled = os.environ.get(COMPILED_DECODE_ENV, "0") == "1"
         segment_count = (
             sum(not layer.is_linear for layer in self.layers) + 1
             if any(not layer.is_linear for layer in self.layers)
@@ -1750,14 +1724,11 @@ class KimiK3TextModel(nn.Module):
         async_decode_state = os.environ.get(ASYNC_DECODE_STATE_ENV)
         if not self._async_decode_boundaries and async_decode_state is not None:
             raise ValueError(
-                f"{ASYNC_DECODE_STATE_ENV} requires "
-                f"{ASYNC_DECODE_BOUNDARIES_ENV}"
+                f"{ASYNC_DECODE_STATE_ENV} requires " f"{ASYNC_DECODE_BOUNDARIES_ENV}"
             )
         self._async_decode_state = async_decode_state or "residual"
         if self._async_decode_state not in {"hidden", "residual"}:
-            raise ValueError(
-                f"{ASYNC_DECODE_STATE_ENV} must be 'hidden' or 'residual'"
-            )
+            raise ValueError(f"{ASYNC_DECODE_STATE_ENV} must be 'hidden' or 'residual'")
         if self._compiled_decode_enabled and self._async_decode_boundaries:
             raise ValueError(
                 f"{ASYNC_DECODE_BOUNDARIES_ENV} cannot be combined with "
@@ -1828,11 +1799,7 @@ class KimiK3TextModel(nn.Module):
         h: mx.array,
         blocks: Optional[ResidualBlocks],
     ) -> None:
-        if (
-            self._async_decode_state == "hidden"
-            or blocks is None
-            or blocks.raw is None
-        ):
+        if self._async_decode_state == "hidden" or blocks is None or blocks.raw is None:
             mx.async_eval(h)
         else:
             mx.async_eval(h, blocks.raw, blocks.inv_rms)
@@ -2297,10 +2264,7 @@ class KimiK3TextModel(nn.Module):
                 # DSpark/DFlash target ids use the Hugging Face convention:
                 # capture the residual stream after target layer ``layer_idx``.
                 aux_hidden_states.append(h)
-            if (
-                submit_async_boundaries
-                and layer_idx in self._async_decode_boundaries
-            ):
+            if submit_async_boundaries and layer_idx in self._async_decode_boundaries:
                 self._submit_async_decode_boundary(h, blocks)
 
         if pipeline_rank != 0:
@@ -2412,6 +2376,21 @@ class LanguageModel(nn.Module):
             aux_hidden_states=aux_hidden_states,
         )
 
+    def supports_vocab_parallel_greedy(self) -> bool:
+        return isinstance(self.lm_head, VocabParallelHead)
+
+    def vocab_parallel_greedy(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        """Run one decode forward and exchange only per-rank argmax candidates."""
+
+        if not isinstance(self.lm_head, VocabParallelHead):
+            raise RuntimeError("Kimi K3 vocabulary-parallel head is not active")
+        hidden = self.model(inputs, cache)
+        return self.lm_head.greedy_token(hidden[:, -1, :])
+
     @property
     def layers(self):
         return self.model.layers[self.model.start_idx : self.model.end_idx]
@@ -2431,13 +2410,9 @@ class LanguageModel(nn.Module):
         width: int,
     ) -> KimiK3SpeculativeCacheTransaction:
         if self.model.pipeline_size != 1:
-            raise ValueError(
-                "Kimi K3 speculative cache requires pipeline_size == 1"
-            )
+            raise ValueError("Kimi K3 speculative cache requires pipeline_size == 1")
         if any(isinstance(layer_cache, BatchKVCache) for layer_cache in cache):
-            raise ValueError(
-                "Kimi K3 speculative cache does not support BatchKVCache"
-            )
+            raise ValueError("Kimi K3 speculative cache does not support BatchKVCache")
         layers = list(self.layers)
         if len(cache) != len(layers):
             raise ValueError("Kimi K3 speculative cache does not match the model")
@@ -2447,14 +2422,10 @@ class LanguageModel(nn.Module):
         array_states: List[Tuple[int, ArraysCache, List[Any]]] = []
         kv_states: List[Tuple[int, KVCache, Any, Any, int]] = []
         kv_offsets = set()
-        for index, (layer, layer_cache) in enumerate(
-            zip(layers, cache, strict=True)
-        ):
+        for index, (layer, layer_cache) in enumerate(zip(layers, cache, strict=True)):
             if layer.is_linear:
                 if not isinstance(layer_cache, ArraysCache):
-                    raise ValueError(
-                        f"Kimi K3 layer {index} requires an ArraysCache"
-                    )
+                    raise ValueError(f"Kimi K3 layer {index} requires an ArraysCache")
                 layer_cache.validate_begin_speculative(width)
                 array_states.append((index, layer_cache, list(layer_cache.cache)))
             else:
@@ -2804,11 +2775,12 @@ class LanguageModel(nn.Module):
 
 
 class VocabParallelHead(nn.Module):
-    """Row-shard an untied LM head and reconstruct full-vocabulary logits.
+    """Row-shard an untied LM head.
 
-    This preserves the standard model contract for sampling and logprobs
-    while avoiding replicated projection work.  The vocabulary axis is moved
-    to the front because MLX ``all_gather`` concatenates its leading axis.
+    The ordinary call reconstructs full-vocabulary logits, preserving the
+    standard model contract for processors, sampling, and logprobs. The
+    explicitly requested greedy path instead exchanges one ``(score, global
+    token id)`` candidate per rank and returns the exact global argmax.
     """
 
     def __init__(self, lm_head: nn.Module, group: mx.distributed.Group):
@@ -2828,6 +2800,49 @@ class VocabParallelHead(nn.Module):
             group=self.group,
         )
         return mx.contiguous(mx.moveaxis(full_vocab_first, 0, -1))
+
+    def greedy_token(self, x: mx.array) -> mx.array:
+        """Return the full-vocabulary argmax with deterministic lowest-id ties."""
+
+        if x.ndim != 2:
+            raise ValueError("vocabulary-parallel greedy sampling requires [B, H]")
+
+        local_logits = self.local_head(x)
+        local_vocab_size = local_logits.shape[-1]
+        full_vocab_size = local_vocab_size * self.group.size()
+        if full_vocab_size > (1 << 24):
+            raise ValueError(
+                "vocabulary-parallel greedy sampling requires token ids "
+                "representable exactly as float32"
+            )
+
+        local_id = mx.argmax(local_logits, axis=-1)
+        local_score = mx.take_along_axis(
+            local_logits,
+            local_id[..., None],
+            axis=-1,
+        ).squeeze(-1)
+        global_id = local_id + self.group.rank() * local_vocab_size
+
+        # A leading singleton lets all_gather concatenate candidates in rank
+        # order. MLX argmax resolves equal scores to the first rank, while each
+        # local argmax resolves to its first local index; together these match
+        # full-vocabulary argmax's lowest-global-token-id tie break.
+        candidate = mx.stack(
+            [
+                local_score.astype(mx.float32),
+                global_id.astype(mx.float32),
+            ],
+            axis=-1,
+        )[None]
+        candidates = mx.distributed.all_gather(candidate, group=self.group)
+        winner_rank = mx.argmax(candidates[..., 0], axis=0)
+        winner_id = mx.take_along_axis(
+            candidates[..., 1],
+            winner_rank[None],
+            axis=0,
+        )[0]
+        return winner_id.astype(mx.uint32)
 
 
 class Model(nn.Module):
@@ -2855,6 +2870,16 @@ class Model(nn.Module):
             cache,
             layer_ids,
         )
+
+    def supports_vocab_parallel_greedy(self) -> bool:
+        return self.language_model.supports_vocab_parallel_greedy()
+
+    def vocab_parallel_greedy(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        return self.language_model.vocab_parallel_greedy(inputs, cache)
 
     @property
     def model(self):

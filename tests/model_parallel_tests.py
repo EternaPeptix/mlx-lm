@@ -177,17 +177,26 @@ class TestModelParallel(unittest.TestCase):
                 )
                 expected = model(x)
                 mx.eval(expected)
+                expected_tokens = mx.argmax(expected[:, -1, :], axis=-1)
 
                 model.shard_vocab_head(group)
                 actual = model(x)
-                mx.eval(actual)
+                actual_tokens = model.vocab_parallel_greedy(x)
+                mx.eval(actual, expected_tokens, actual_tokens)
 
                 self.assertEqual(actual.shape, expected.shape)
                 self.assertTrue(mx.allclose(expected, actual, rtol=1e-3, atol=1e-3))
+                self.assertTrue(mx.array_equal(expected_tokens, actual_tokens))
 
                 wrapped = model.language_model.lm_head
                 model.shard_vocab_head(group)
                 self.assertIs(model.language_model.lm_head, wrapped)
+
+                if not quantized:
+                    wrapped.local_head.weight = mx.zeros_like(wrapped.local_head.weight)
+                    tied = model.vocab_parallel_greedy(x)
+                    mx.eval(tied)
+                    self.assertEqual(tied.tolist(), [0, 0])
 
     def test_kimi_k3_speculative_cache_tp2_width_two_and_eight(self):
         group = mx.distributed.init()
@@ -250,9 +259,8 @@ class TestModelParallel(unittest.TestCase):
             with self.subTest(width=width, consumed=consumed):
                 wide_cache = populated_cache()
                 sequential_cache = populated_cache()
-                tokens = (
-                    mx.arange(width, dtype=mx.uint32)[None]
-                    + mx.array([[3]], dtype=mx.uint32)
+                tokens = mx.arange(width, dtype=mx.uint32)[None] + mx.array(
+                    [[3]], dtype=mx.uint32
                 )
 
                 transaction = model.begin_speculative_cache(wide_cache, width)

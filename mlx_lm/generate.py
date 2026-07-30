@@ -29,7 +29,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import is_greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -438,9 +438,7 @@ def _prompt_lookup_seed(
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
-    if any(
-        int(getattr(entry, "speculative_width", 0)) > 0 for entry in prompt_cache
-    ):
+    if any(int(getattr(entry, "speculative_width", 0)) > 0 for entry in prompt_cache):
         raise ValueError(
             "KV cache quantization cannot run during an active speculative "
             "cache transaction"
@@ -466,6 +464,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    greedy_vocab_parallel_no_logprobs: bool = False,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -497,6 +496,11 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        greedy_vocab_parallel_no_logprobs (bool): Request the compact
+          vocabulary-parallel argmax path. It is used only with a marked greedy
+          sampler, no logits processors, no input embeddings, and a compatible
+          sharded model. The yielded logprobs vector is empty when active.
+          Default: ``False``.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -533,7 +537,22 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    sampler = sampler or make_sampler(temp=0.0)
+    supports_compact_greedy = getattr(
+        model,
+        "supports_vocab_parallel_greedy",
+        None,
+    )
+    compact_greedy = getattr(model, "vocab_parallel_greedy", None)
+    use_compact_greedy = (
+        greedy_vocab_parallel_no_logprobs
+        and input_embeddings is None
+        and not logits_processors
+        and is_greedy_sampler(sampler)
+        and callable(supports_compact_greedy)
+        and bool(supports_compact_greedy())
+        and callable(compact_greedy)
+    )
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
@@ -547,6 +566,14 @@ def generate_step(
         nonlocal tokens
 
         with mx.stream(generation_stream):
+            if use_compact_greedy:
+                sampled = compact_greedy(
+                    input_tokens[None],
+                    cache=prompt_cache,
+                )
+                quantize_cache_fn(prompt_cache)
+                return sampled, mx.array([], dtype=mx.float32)
+
             logits = _model_call(
                 input_tokens=input_tokens[None],
                 input_embeddings=(
@@ -701,13 +728,9 @@ def speculative_generate_step(
 
     prompt_lookup = prompt_lookup_num_tokens is not None
     if draft_model is None and not prompt_lookup:
-        raise ValueError(
-            "Speculative decoding requires a draft model or prompt lookup"
-        )
+        raise ValueError("Speculative decoding requires a draft model or prompt lookup")
     if draft_model is not None and prompt_lookup:
-        raise ValueError(
-            "A draft model and prompt lookup cannot be enabled together"
-        )
+        raise ValueError("A draft model and prompt lookup cannot be enabled together")
     if prompt_lookup_history is not None and not prompt_lookup:
         raise ValueError(
             "prompt_lookup_history requires prompt-lookup speculative decoding"
@@ -719,9 +742,7 @@ def speculative_generate_step(
     if max_tokens < -1:
         raise ValueError("max_tokens must be -1 or non-negative")
 
-    draft_limit = (
-        int(prompt_lookup_num_tokens) if prompt_lookup else num_draft_tokens
-    )
+    draft_limit = int(prompt_lookup_num_tokens) if prompt_lookup else num_draft_tokens
     draft_source = "prompt_lookup" if prompt_lookup else "draft_model"
     y = prompt.astype(mx.uint32)
     lookup_seed = (
@@ -738,9 +759,7 @@ def speculative_generate_step(
     # Create the KV cache for generation
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(model)
-        draft_cache = (
-            None if prompt_lookup else cache.make_prompt_cache(draft_model)
-        )
+        draft_cache = None if prompt_lookup else cache.make_prompt_cache(draft_model)
     else:
         if prompt_lookup:
             model_cache = prompt_cache
@@ -840,9 +859,7 @@ def speculative_generate_step(
         if not transactional_target:
             cache.trim_prompt_cache(model_cache, num_draft - num_accept)
         if draft_cache is not None:
-            cache.trim_prompt_cache(
-                draft_cache, max(num_draft - num_accept - 1, 0)
-            )
+            cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -857,11 +874,7 @@ def speculative_generate_step(
         return mx.concatenate(ys)
 
     with mx.stream(generation_stream):
-        draft_y = (
-            None
-            if prompt_lookup
-            else _prefill(draft_model, draft_cache, y)
-        )
+        draft_y = None if prompt_lookup else _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
     if max_tokens == 0:
@@ -904,9 +917,7 @@ def speculative_generate_step(
             n = 0
             num_draft = 0
 
-            remaining = (
-                draft_limit if max_tokens == -1 else max_tokens - ntoks
-            )
+            remaining = draft_limit if max_tokens == -1 else max_tokens - ntoks
             draft_tokens = _draft_generate(
                 draft_y if draft_y is not None else y,
                 min(remaining, draft_limit),
@@ -1066,9 +1077,7 @@ def stream_generate(
     kwargs["max_tokens"] = max_tokens
 
     if draft_model is not None and prompt_lookup_num_tokens is not None:
-        raise ValueError(
-            "A draft model and prompt lookup cannot be enabled together"
-        )
+        raise ValueError("A draft model and prompt lookup cannot be enabled together")
     speculative = draft_model is not None or prompt_lookup_num_tokens is not None
     if prompt_lookup_history is not None and prompt_lookup_num_tokens is None:
         raise ValueError(
@@ -1077,9 +1086,7 @@ def stream_generate(
     if not speculative:
         kwargs.pop("num_draft_tokens", None)
         if speculative_round_callback is not None:
-            raise ValueError(
-                "speculative_round_callback requires speculative decoding"
-            )
+            raise ValueError("speculative_round_callback requires speculative decoding")
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -1088,6 +1095,10 @@ def stream_generate(
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        # Compact greedy produces no target logprobs and is only valid for the
+        # ordinary one-token path. Speculative verification needs full target
+        # distributions, so an opt-in request falls back here.
+        kwargs.pop("greedy_vocab_parallel_no_logprobs", None)
         # ``async_lookahead`` controls the ordinary one-token generator.
         # Speculative generation manages its own target-round submission and
         # transaction lifecycle, so forwarding this otherwise valid
@@ -2555,10 +2566,7 @@ def main():
     else:
         prompt = tokenizer.encode(prompt)
 
-    if (
-        args.draft_model is not None
-        and args.prompt_lookup_num_tokens is not None
-    ):
+    if args.draft_model is not None and args.prompt_lookup_num_tokens is not None:
         raise ValueError(
             "--draft-model and --prompt-lookup-num-tokens are mutually exclusive"
         )
@@ -2571,9 +2579,7 @@ def main():
     speculative_round_callback = None
     if args.speculative_round_stats:
         if draft_model is None and args.prompt_lookup_num_tokens is None:
-            raise ValueError(
-                "--speculative-round-stats requires speculative decoding"
-            )
+            raise ValueError("--speculative-round-stats requires speculative decoding")
 
         def speculative_round_callback(stats):
             print(

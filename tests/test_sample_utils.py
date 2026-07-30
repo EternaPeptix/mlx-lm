@@ -2,10 +2,25 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p, apply_xtc
+from mlx_lm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_p,
+    apply_xtc,
+    is_greedy_sampler,
+    make_sampler,
+)
 
 
 class TestSampleUtils(unittest.TestCase):
+    def test_greedy_sampler_marker_is_fail_closed(self):
+        greedy = make_sampler(temp=0.0)
+        non_greedy = make_sampler(temp=0.5)
+
+        self.assertTrue(is_greedy_sampler(greedy))
+        self.assertFalse(is_greedy_sampler(non_greedy))
+        self.assertFalse(is_greedy_sampler(lambda values: mx.argmax(values, axis=-1)))
+
     def test_apply_top_p(self):
         probs = mx.array([0.9, 0.0, 0.0, 0.1])[None]
         logits = mx.log(probs)
