@@ -22,7 +22,10 @@ from .kimi_k3_fused_expert import (
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
 )
-from .kimi_k3_packed_moe_front import maybe_packed_k3_moe_front
+from .kimi_k3_packed_moe_front import (
+    invalidate_packed_k3_moe_front,
+    maybe_packed_k3_moe_front,
+)
 from .kimi_linear import ShortConv1d
 from .mla import MultiLinear
 from .switch_layers import SwitchGLU
@@ -1192,9 +1195,13 @@ class KimiK3TextModel(nn.Module):
             if any(not layer.is_linear for layer in self.layers)
             else 0
         )
-        self._compiled_decode_segments = _parse_compiled_decode_segments(
-            os.environ.get(COMPILED_DECODE_SEGMENTS_ENV, "all"),
-            segment_count,
+        self._compiled_decode_segments = (
+            _parse_compiled_decode_segments(
+                os.environ.get(COMPILED_DECODE_SEGMENTS_ENV, "all"),
+                segment_count,
+            )
+            if self._compiled_decode_enabled
+            else frozenset(range(segment_count))
         )
         self._compiled_decode_schedule = None
 
@@ -2272,6 +2279,7 @@ class Model(nn.Module):
                 attn.unembed_out.apply(shard_heads)
 
             if isinstance(layer.mlp, KimiK3SparseMoE):
+                invalidate_packed_k3_moe_front(layer.mlp)
                 layer.mlp.sharding_group = group
                 shard_inplace(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group

@@ -58,6 +58,22 @@ def _all_or_none(
     return [value for value in values if value is not None]
 
 
+def _source_signature(modules: Sequence[Any]) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        (
+            module,
+            _array_parameter(module, "weight"),
+            _array_parameter(module, "scales"),
+            _array_parameter(module, "biases"),
+            _array_parameter(module, "bias"),
+            int(getattr(module, "group_size", 0)),
+            int(getattr(module, "bits", 0)),
+            str(getattr(module, "mode", "")),
+        )
+        for module in modules
+    )
+
+
 class PackedK3MoEFront(nn.Module):
     """One lossless quantized projection split into the four original rows."""
 
@@ -157,11 +173,28 @@ class PackedK3MoEFront(nn.Module):
                 else 0
             ),
         )
+        object.__setattr__(self, "_source_signature", _source_signature(modules))
         self.freeze()
 
     @property
     def packed_nbytes(self) -> int:
         return self._packed_nbytes
+
+    def matches_sources(self, modules: Sequence[Any]) -> bool:
+        """Return whether every authoritative projection array is unchanged."""
+
+        current = _source_signature(modules)
+        if len(current) != len(self._source_signature):
+            return False
+        for expected, actual in zip(self._source_signature, current, strict=True):
+            if any(
+                expected[index] is not actual[index]
+                for index in range(5)
+            ):
+                return False
+            if expected[5:] != actual[5:]:
+                return False
+        return True
 
     def __call__(self, x: mx.array) -> tuple[mx.array, ...]:
         if x.ndim != 3 or x.shape[0] * x.shape[1] != 1:
@@ -206,6 +239,14 @@ def _build_packed_front(sparse_moe: Any) -> PackedK3MoEFront:
     )
 
 
+def invalidate_packed_k3_moe_front(sparse_moe: Any) -> None:
+    """Drop hidden packed state before sharding or other weight mutation."""
+
+    for name in ("_packed_k3_moe_front", "_packed_k3_moe_front_reason"):
+        if hasattr(sparse_moe, name):
+            object.__delattr__(sparse_moe, name)
+
+
 def maybe_packed_k3_moe_front(
     sparse_moe: Any,
     x: mx.array,
@@ -222,7 +263,21 @@ def maybe_packed_k3_moe_front(
 
     packed = getattr(sparse_moe, "_packed_k3_moe_front", None)
     if packed is _UNSUPPORTED:
-        return None
+        packed = None
+    elif packed is not None:
+        try:
+            modules = (
+                sparse_moe.shared_experts.gate_proj,
+                sparse_moe.shared_experts.up_proj,
+                sparse_moe.gate,
+                sparse_moe.routed_expert_down_proj,
+            )
+            if not packed.matches_sources(modules):
+                invalidate_packed_k3_moe_front(sparse_moe)
+                packed = None
+        except (AttributeError, TypeError, ValueError):
+            invalidate_packed_k3_moe_front(sparse_moe)
+            packed = None
     if packed is None:
         try:
             packed = _build_packed_front(sparse_moe)

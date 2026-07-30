@@ -47,6 +47,34 @@ real-weight single-layer measurement projected roughly `12.10` to `12.93`
 tok/s if the isolated saving scales across all 92 MoE layers, at an additional
 approximately `7.44 GB` per rank. That projection is not an end-to-end
 throughput claim; a full TP2 completion-hash and memory A/B remains required.
+The hidden packed copy is invalidated before sharding and rebuilt whenever any
+authoritative projection array changes.
+
+The branch also exposes fail-closed prompt-lookup speculative verification
+without an external draft model:
+
+```python
+stream_generate(
+    model,
+    tokenizer,
+    prompt,
+    prompt_lookup_num_tokens=7,
+    prompt_lookup_max_ngram_size=4,
+    speculative_round_callback=callback,
+)
+```
+
+For transactional Kimi K3, the valid proposal range is 1–7 tokens because the
+verification forward also includes the current input token. The CLI
+equivalents are `--prompt-lookup-num-tokens`,
+`--prompt-lookup-max-ngram-size`, and `--speculative-round-stats`. Kimi K3
+cache updates are transactional across recurrent and attention layers, and
+pipeline-parallel or batched KV-cache configurations fail closed. Prompt
+lookup initializes from the explicit prompt token IDs and appends committed
+outputs. Cached callers may also pass `prompt_lookup_history` to seed the
+lookup index from the full logical token history without re-prefilling it; the
+history must end with the explicit prompt suffix. Cache-only prefixes remain
+invisible unless the caller supplies that history.
 
 The EXO repository contains the strict target-verification and divergence
 diagnostic tools. A sampled width-2 run kept the same top-1 continuation but
@@ -56,5 +84,8 @@ verification gate remains failed.
 The bisection selector passed 13 focused single-rank Metal tests (with one
 expected TP2 skip) and a local two-rank exact logits/cache comparison for full
 and mixed schedules. After integrating MoE-front packing, the combined branch
-also passed all 14 focused packed/fused expert tests and all 13 active compiled
-decode tests in the same Apple Metal runtime.
+completed 60 focused Metal/unit tests across packed/fused experts, compiled
+decode, speculative cache transactions, generation lifecycle, and prompt
+lookup (59 passed, one expected TP2 skip), plus all 22 prompt-cache
+regressions. Full-model strict-v3,
+long-memory, acceptance-rate, and live-cluster speed gates remain outstanding.

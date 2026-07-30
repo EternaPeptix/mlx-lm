@@ -120,12 +120,14 @@ def _lookup_generator(
     prompt=(1, 2, 3, 4, 1, 2),
     max_tokens=5,
     prompt_lookup_num_tokens=3,
+    prompt_lookup_history=None,
     stats=None,
 ):
     return speculative_generate_step(
         prompt=mx.array(prompt, dtype=mx.uint32),
         model=target,
         prompt_lookup_num_tokens=prompt_lookup_num_tokens,
+        prompt_lookup_history=prompt_lookup_history,
         max_tokens=max_tokens,
         prompt_cache=[target_cache],
         speculative_round_callback=None if stats is None else stats.append,
@@ -296,6 +298,62 @@ class PromptLookupGenerationTest(unittest.TestCase):
         self.assertTrue(stats)
         self.assertEqual(stats[0].source, "prompt_lookup")
         self.assertEqual(stats[0].drafted_tokens, 2)
+
+    def test_lookup_history_seeds_cached_prefix_without_refill(self):
+        target = _PatternModel()
+        target_cache = _FakeCache()
+        target_cache.offset = 4
+        stats = []
+
+        outputs = list(
+            _lookup_generator(
+                target,
+                target_cache,
+                prompt=(1, 2),
+                prompt_lookup_history=(1, 2, 3, 4, 1, 2),
+                max_tokens=2,
+                prompt_lookup_num_tokens=2,
+                stats=stats,
+            )
+        )
+
+        self.assertEqual([token for token, _, _ in outputs], [3, 4])
+        self.assertTrue(all(from_draft for _, _, from_draft in outputs))
+        self.assertEqual(stats[0].drafted_tokens, 2)
+        self.assertEqual(stats[0].accepted_tokens, 2)
+
+    def test_lookup_history_fails_closed_on_inconsistent_context(self):
+        with self.assertRaisesRegex(ValueError, "must end with"):
+            next(
+                _lookup_generator(
+                    _PatternModel(),
+                    _FakeCache(),
+                    prompt=(1, 2),
+                    prompt_lookup_history=(1, 2, 3, 4),
+                )
+            )
+
+        with self.assertRaisesRegex(ValueError, "precomputed prompt_cache"):
+            next(
+                speculative_generate_step(
+                    prompt=mx.array([1, 2], dtype=mx.uint32),
+                    model=_PatternModel(),
+                    prompt_lookup_num_tokens=2,
+                    prompt_lookup_history=(1, 2, 3, 4, 1, 2),
+                )
+            )
+
+        with self.assertRaisesRegex(ValueError, "requires prompt-lookup"):
+            next(
+                stream_generate(
+                    _PatternModel(),
+                    _tokenizer(),
+                    mx.array([1, 2], dtype=mx.uint32),
+                    max_tokens=1,
+                    prompt_lookup_history=(1, 2),
+                    prompt_cache=[_FakeCache()],
+                )
+            )
 
 
 if __name__ == "__main__":

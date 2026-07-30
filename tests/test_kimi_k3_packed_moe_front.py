@@ -157,6 +157,32 @@ class PackedK3MoEFrontTests(unittest.TestCase):
         self.assertTrue(bool(mx.array_equal(expected, actual).item()))
         self.assertFalse(hasattr(module, "_packed_k3_moe_front"))
 
+    def test_source_mutation_rebuilds_hidden_packed_copy(self):
+        module = _small_sparse_moe()
+        x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+
+        with patch.dict(os.environ, {PACKED_MOE_FRONT_ENV: "1"}):
+            packed_moe_front_enabled.cache_clear()
+            first_output = module(x)
+            mx.eval(first_output)
+            first_packed = module._packed_k3_moe_front
+
+        module.gate.biases = module.gate.biases + mx.ones_like(
+            module.gate.biases
+        )
+        with patch.dict(os.environ, {PACKED_MOE_FRONT_ENV: "0"}):
+            packed_moe_front_enabled.cache_clear()
+            expected = module(x)
+            mx.eval(expected)
+
+        with patch.dict(os.environ, {PACKED_MOE_FRONT_ENV: "1"}):
+            packed_moe_front_enabled.cache_clear()
+            actual = module(x)
+            mx.eval(actual)
+
+        self.assertIsNot(first_packed, module._packed_k3_moe_front)
+        self.assertTrue(bool(mx.array_equal(expected, actual).item()))
+
     def test_unsupported_quantization_fails_closed(self):
         mx.random.seed(23)
         module = _small_sparse_moe(bits=4)

@@ -235,6 +235,23 @@ class TestKimiK3CompiledDecode(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _make_model()
 
+    def test_disabled_feature_ignores_segment_selector(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.COMPILED_DECODE_ENV: "0",
+                kimi_k3.COMPILED_DECODE_SEGMENTS_ENV: "not-a-selector",
+            },
+            clear=False,
+        ):
+            model = _make_model()
+
+        self.assertFalse(model.model._compiled_decode_enabled)
+        self.assertEqual(
+            model.model._compiled_decode_segments,
+            frozenset(range(3)),
+        )
+
     def test_guard_accepts_only_supported_decode_state(self):
         model = _make_model()
         cache = _warm_cache(model)

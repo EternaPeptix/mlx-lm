@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import operator
 import sys
 import time
 from collections import deque
@@ -396,6 +397,45 @@ class PromptLookupDrafter:
         return list(best_continuation)
 
 
+def _prompt_lookup_seed(
+    prompt: mx.array,
+    history: Optional[Union[mx.array, Sequence[int]]],
+    *,
+    prompt_cache: Optional[Any],
+) -> List[int]:
+    """Validate lookup-only history without changing the target prefill input."""
+
+    prompt_tokens = [int(token) for token in prompt.tolist()]
+    if history is None:
+        return prompt_tokens
+    if isinstance(history, mx.array):
+        if history.ndim != 1:
+            raise ValueError("prompt_lookup_history must be a one-dimensional array")
+        history = history.tolist()
+    if isinstance(history, (str, bytes)):
+        raise ValueError("prompt_lookup_history must contain integer token ids")
+    try:
+        history_tokens = [operator.index(token) for token in history]
+    except (TypeError, ValueError):
+        raise ValueError(
+            "prompt_lookup_history must contain integer token ids"
+        ) from None
+    if not prompt_tokens:
+        raise ValueError("prompt lookup requires a non-empty explicit prompt")
+    if len(history_tokens) < len(prompt_tokens) or (
+        history_tokens[-len(prompt_tokens) :] != prompt_tokens
+    ):
+        raise ValueError(
+            "prompt_lookup_history must end with the explicit prompt tokens"
+        )
+    if len(history_tokens) > len(prompt_tokens) and prompt_cache is None:
+        raise ValueError(
+            "prompt_lookup_history longer than the explicit prompt requires "
+            "a precomputed prompt_cache"
+        )
+    return history_tokens
+
+
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
@@ -602,6 +642,7 @@ def speculative_generate_step(
     num_draft_tokens: int = 2,
     prompt_lookup_num_tokens: Optional[int] = None,
     prompt_lookup_max_ngram_size: int = 4,
+    prompt_lookup_history: Optional[Union[mx.array, Sequence[int]]] = None,
     speculative_round_callback: Optional[
         Callable[[SpeculativeRoundStats], None]
     ] = None,
@@ -630,6 +671,11 @@ def speculative_generate_step(
           a draft model. Default: ``None``.
         prompt_lookup_max_ngram_size (int): Maximum suffix n-gram size considered
           by prompt lookup. Default: ``4``.
+        prompt_lookup_history (array or sequence, optional): Full logical token
+          history used only to seed prompt lookup when ``prompt`` is a short
+          suffix whose earlier tokens are already represented by
+          ``prompt_cache``. It must end with the explicit ``prompt`` tokens and
+          does not cause the history to be prefetched again.
         speculative_round_callback (Callable, optional): Called after each
           verification round with :class:`SpeculativeRoundStats`.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
@@ -663,6 +709,10 @@ def speculative_generate_step(
         raise ValueError(
             "A draft model and prompt lookup cannot be enabled together"
         )
+    if prompt_lookup_history is not None and not prompt_lookup:
+        raise ValueError(
+            "prompt_lookup_history requires prompt-lookup speculative decoding"
+        )
     if prompt_lookup and prompt_lookup_num_tokens <= 0:
         raise ValueError("prompt_lookup_num_tokens must be greater than zero")
     if num_draft_tokens < 0:
@@ -675,6 +725,15 @@ def speculative_generate_step(
     )
     draft_source = "prompt_lookup" if prompt_lookup else "draft_model"
     y = prompt.astype(mx.uint32)
+    lookup_seed = (
+        _prompt_lookup_seed(
+            y,
+            prompt_lookup_history,
+            prompt_cache=prompt_cache,
+        )
+        if prompt_lookup
+        else None
+    )
     prev_tokens = None
 
     # Create the KV cache for generation
@@ -717,7 +776,7 @@ def speculative_generate_step(
 
     lookup_drafter = (
         PromptLookupDrafter(
-            y.tolist(),
+            lookup_seed,
             max_ngram_size=prompt_lookup_max_ngram_size,
         )
         if prompt_lookup
@@ -955,6 +1014,7 @@ def stream_generate(
     draft_model: Optional[nn.Module] = None,
     prompt_lookup_num_tokens: Optional[int] = None,
     prompt_lookup_max_ngram_size: int = 4,
+    prompt_lookup_history: Optional[Union[mx.array, Sequence[int]]] = None,
     speculative_round_callback: Optional[
         Callable[[SpeculativeRoundStats], None]
     ] = None,
@@ -978,6 +1038,9 @@ def stream_generate(
           with ``draft_model``. Default: ``None``.
         prompt_lookup_max_ngram_size (int): Maximum suffix n-gram size used for
           prompt lookup. Default: ``4``.
+        prompt_lookup_history (array or sequence, optional): Full logical token
+          history used only to seed prompt lookup when the explicit ``prompt``
+          is a suffix already backed by ``prompt_cache``.
         speculative_round_callback (Callable, optional): Called with per-round
           acceptance and commit statistics during speculative decoding.
         kwargs: The remaining options get passed to :func:`generate_step`.
@@ -1008,6 +1071,10 @@ def stream_generate(
             "A draft model and prompt lookup cannot be enabled together"
         )
     speculative = draft_model is not None or prompt_lookup_num_tokens is not None
+    if prompt_lookup_history is not None and prompt_lookup_num_tokens is None:
+        raise ValueError(
+            "prompt_lookup_history requires prompt-lookup speculative decoding"
+        )
     if not speculative:
         kwargs.pop("num_draft_tokens", None)
         if speculative_round_callback is not None:
@@ -1028,6 +1095,7 @@ def stream_generate(
             draft_model,
             prompt_lookup_num_tokens=prompt_lookup_num_tokens,
             prompt_lookup_max_ngram_size=prompt_lookup_max_ngram_size,
+            prompt_lookup_history=prompt_lookup_history,
             speculative_round_callback=speculative_round_callback,
             **kwargs,
         )
