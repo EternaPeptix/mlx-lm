@@ -2,9 +2,9 @@
 
 This branch is one part of a coordinated public experiment:
 
-- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-distributed-optimizations)
-- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-distributed-optimizations)
-- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-distributed-optimizations)
+- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack)
+- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack)
+- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack)
 
 It contains the Kimi K3 support and TP2 changes used to run
 `kernelpool/Kimi-K3-2bit-UVMAX` across two 512 GB M3 Ultra systems, including:
@@ -13,6 +13,9 @@ It contains the Kimi K3 support and TP2 changes used to run
 - an opt-in exact-weight fused expert path;
 - model-parallel output-head coverage used by EXO's vocabulary-parallel path;
 - an opt-in segmented compiled decode schedule; and
+- an opt-in authoritative packed MoE-front path that avoids persistent duplicate
+  projection storage;
+- an opt-in exact row-tiled KDA prefill kernel; and
 - focused Metal and distributed tests for those paths.
 
 ## Feature flags
@@ -20,8 +23,13 @@ It contains the Kimi K3 support and TP2 changes used to run
 `MLX_LM_KIMI_K3_FUSED_EXPERTS=1` enables the exact-weight fused expert
 prototype. `MLX_LM_KIMI_K3_COMPILED_DECODE=1` enables segmented compiled
 decode. `MLX_LM_KIMI_K3_PACKED_MOE_FRONT=1` enables an exact, decode-only
-packed QMV for four same-input MoE-front projections. All three default to off
-and fail closed outside their supported Kimi K3 decode shapes.
+packed QMV for four same-input MoE-front projections.
+`MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT=1` makes the packed
+representation authoritative so the unpacked projection copies are not kept
+for the model lifetime. `MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL=1` enables the
+exact row-tiled Metal KDA recurrence for supported prefill shapes of at least
+128 tokens. All of these features default to off and fail closed outside their
+supported shapes.
 
 `MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES` enables eager, decode-only
 asynchronous evaluation boundaries. It accepts `none`, `laguna8`, `block8`,
@@ -41,6 +49,25 @@ is diagnostic tooling for locating the output divergence, not a claim that a
 particular compiled subset is safe.
 
 ## Current result
+
+The latest exact TP2 candidate combines the `laguna8` hidden-state
+asynchronous decode schedule with the authoritative packed MoE front. On the
+canonical 575-token prompt and 128-token decode, five matched repetitions
+produced a median `12.9576` decode tok/s versus `12.8921` for the asynchronous
+control (`+0.51%`) while retaining completion digest
+`c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`.
+A separate code-prompt screen produced `12.9288` versus `12.8793` tok/s
+(`+0.39%`) with its exact reference digest. The authoritative representation
+also removes approximately `7.44 GB` decimal (`6.93 GiB`) of persistent
+duplicate projection storage per TP2 rank.
+
+The row-tiled KDA prefill path is bit-exact in the focused Metal tests and uses
+no scratch allocation. On an M3 Max KDA-only microbenchmark it improved the
+recurrence from `0.920` to `0.644 ms` at 128 tokens (`1.43x`), from `3.255` to
+`1.912 ms` at 512 tokens (`1.70x`), from `15.997` to `7.515 ms` at 2K
+(`2.13x`), and from `115.852` to `36.046 ms` at 8K (`3.21x`). These are
+kernel-level measurements; a matched full-model TP2 prefill result is not yet
+claimed.
 
 On a matched three-repetition canonical TP2 screening run, the feature-off
 reference produced a median `12.0465` decode tok/s. The `laguna8` hidden-state
