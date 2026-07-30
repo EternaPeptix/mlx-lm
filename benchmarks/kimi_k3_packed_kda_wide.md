@@ -82,5 +82,30 @@ timings still favored packing. Earlier real rank-local measurements of QKV
 plus gate alone saved `0.0226 ms/layer`, or `1.56 ms/token` mechanically.
 Taken together, a realistic pre-live expectation is roughly **0–1.5
 ms/token**, centered near **1.2 ms/token**, not a guaranteed throughput gain.
-A canonical two-rank completion-hash and throughput A/B remains the retention
-gate.
+
+## Live TP2 result
+
+The wide pack passed the real-weight, two-rank M3 Ultra TP2 gate on top of the
+accepted exact skinny-KDA stack. Five canonical
+575-prompt-token/128-generation-token repetitions retained completion digest
+`c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`
+and produced:
+
+```text
+14.1515, 13.9857, 14.1017, 14.1097, 14.1173 tok/s
+```
+
+The median was `14.1097` tok/s versus `14.0268` for the matched skinny-only
+stack (`+0.59%`). This saves `0.419 ms/token`; the asynchronous/JACCL schedule
+therefore hid most of the isolated microbenchmark projection.
+
+Three 1,067-token coding-prompt repetitions retained digest
+`9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959`
+and produced `14.0735`, `14.0764`, and `14.0853` tok/s. The median was
+`14.0764` tok/s versus `13.9971` for the matched skinny-only stack
+(`+0.57%`). Peak memory remained approximately `414 GB` per rank for the
+canonical case.
+
+The exact, zero-copy, repeatable gain passes the retention gate. The feature
+remains opt-in because its released-checkpoint geometry and quantization
+contract are intentionally narrow.
