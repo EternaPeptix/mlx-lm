@@ -24,6 +24,10 @@ from .kimi_k3_fused_expert import (
     maybe_fused_k3_switch_glu_reduce,
 )
 from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
+from .kimi_k3_packed_kda_projections import (
+    invalidate_packed_k3_kda_skinny,
+    maybe_authoritative_packed_k3_kda_skinny,
+)
 from .kimi_k3_packed_moe_front import (
     invalidate_packed_k3_moe_front,
     maybe_authoritative_packed_k3_moe_front,
@@ -643,10 +647,21 @@ class KimiK3DeltaAttention(nn.Module):
         q = (self.scale**2) * mx.fast.rms_norm(q, None, eps)
         k = self.scale * mx.fast.rms_norm(k, None, eps)
 
-        a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
+        packed_skinny = maybe_authoritative_packed_k3_kda_skinny(self, x)
+        if packed_skinny is None:
+            f_a = self.f_a_proj(x)
+            g_a = None
+            b_logits = self.b_proj(x)
+        elif self.use_full_rank_gate:
+            f_a, b_logits = packed_skinny
+            g_a = None
+        else:
+            f_a, g_a, b_logits = packed_skinny
+
+        a_logits = self.f_b_proj(f_a).reshape(
             B, 1, self.num_heads, self.head_dim
         )
-        b_logits = self.b_proj(x).reshape(B, 1, self.num_heads)
+        b_logits = b_logits.reshape(B, 1, self.num_heads)
 
         out, ssm_state = gated_delta_update(
             q,
@@ -665,7 +680,9 @@ class KimiK3DeltaAttention(nn.Module):
         if self.use_full_rank_gate:
             gate = self.g_proj(x)
         else:
-            gate = self.g_b_proj(self.g_a_proj(x))
+            if g_a is None:
+                g_a = self.g_a_proj(x)
+            gate = self.g_b_proj(g_a)
         gate = gate.reshape(B, 1, self.num_heads, self.head_dim)
         out = (
             self.o_norm(out.reshape(B, 1, self.num_heads, self.head_dim))
@@ -2393,6 +2410,7 @@ class Model(nn.Module):
             attn = layer.self_attn
 
             if layer.is_linear:
+                invalidate_packed_k3_kda_skinny(attn)
                 D = attn.head_dim
                 P = attn.projection_dim
                 num_heads = attn.num_heads // N
