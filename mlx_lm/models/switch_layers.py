@@ -18,6 +18,7 @@ _DISABLE_SORTED_QMM = os.environ.get("MLX_LM_DISABLE_SORTED_QMM", "").lower() in
 SORTED_QMM_PACKED_CONFIG_KEY = "mlx_cuda_sorted_qmm_packed"
 SORTED_QMM_PACKED_FORMAT_VERSION = 1
 SORTED_QMM_PACKED_LAYOUT = "mxfp4-n256-k64-xor-v1"
+_CUDA_SORTED_WEIGHTED_REDUCE = None
 
 
 def _packed_sorted_qmm_enabled() -> bool:
@@ -26,6 +27,145 @@ def _packed_sorted_qmm_enabled() -> bool:
         "true",
         "yes",
     }
+
+
+def _fused_moe_reduce_enabled() -> bool:
+    return os.environ.get("MLX_CUDA_FUSED_MOE_REDUCE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _fused_moe_reduce_min_assignments() -> int:
+    value = os.environ.get(
+        "MLX_CUDA_FUSED_MOE_REDUCE_MIN_ASSIGNMENTS",
+        "2048",
+    )
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return 2048
+
+
+def _cuda_vector_width(dtype) -> int:
+    if dtype == mx.float32:
+        return 4
+    if dtype in (mx.float16, mx.bfloat16):
+        return 8
+    return 0
+
+
+def _can_fuse_sorted_weighted_reduce(
+    sorted_rows: mx.array,
+    indices: mx.array,
+    scores: mx.array,
+    *,
+    training: bool,
+) -> bool:
+    """Check the inference-only contract for the CUDA MoE output kernel."""
+    vector_width = _cuda_vector_width(sorted_rows.dtype)
+    return (
+        _fused_moe_reduce_enabled()
+        and not training
+        and mx.cuda.is_available()
+        and vector_width > 0
+        and indices.size >= _fused_moe_reduce_min_assignments()
+        and indices.shape == scores.shape
+        and sorted_rows.ndim >= 2
+        and sorted_rows.size == indices.size * sorted_rows.shape[-1]
+        and sorted_rows.shape[-1] % vector_width == 0
+    )
+
+
+def _cuda_sorted_weighted_reduce(
+    sorted_rows: mx.array,
+    inverse: mx.array,
+    scores: mx.array,
+) -> mx.array:
+    """Unsort and reduce top-k expert outputs in one vectorized CUDA pass."""
+    global _CUDA_SORTED_WEIGHTED_REDUCE
+    if _CUDA_SORTED_WEIGHTED_REDUCE is None:
+        _CUDA_SORTED_WEIGHTED_REDUCE = mx.fast.cuda_kernel(
+            name="mlx_lm_sorted_moe_weighted_reduce_vec16",
+            input_names=["sorted_rows", "inverse", "scores"],
+            output_names=["out"],
+            source=r"""
+                struct alignas(16) Vector {
+                  T values[VEC];
+                };
+
+                auto vector_index =
+                    cooperative_groups::this_grid().thread_rank();
+                long long tokens = 1;
+                for (int dim = 0; dim < scores_ndim - 1; ++dim) {
+                  tokens *= static_cast<long long>(scores_shape[dim]);
+                }
+                long long output_vectors =
+                    tokens * VECTORS_PER_ROW;
+                if (vector_index >= output_vectors) {
+                  return;
+                }
+                int token = vector_index / VECTORS_PER_ROW;
+                int vector_column =
+                    vector_index - token * VECTORS_PER_ROW;
+                int column = vector_column * VEC;
+                float accumulators[VEC];
+                #pragma unroll
+                for (int lane = 0; lane < VEC; ++lane) {
+                  accumulators[lane] = 0.0f;
+                }
+                #pragma unroll
+                for (int slot = 0; slot < TOPK; ++slot) {
+                  int assignment = token * TOPK + slot;
+                  long long sorted_row =
+                      static_cast<long long>(inverse[assignment]);
+                  const T* source =
+                      sorted_rows + sorted_row * HIDDEN + column;
+                  Vector packed =
+                      *reinterpret_cast<const Vector*>(source);
+                  float score =
+                      static_cast<float>(scores[assignment]);
+                  #pragma unroll
+                  for (int lane = 0; lane < VEC; ++lane) {
+                    accumulators[lane] +=
+                        static_cast<float>(packed.values[lane])
+                        * score;
+                  }
+                }
+                Vector result;
+                #pragma unroll
+                for (int lane = 0; lane < VEC; ++lane) {
+                  result.values[lane] =
+                      static_cast<T>(accumulators[lane]);
+                }
+                *reinterpret_cast<Vector*>(
+                    out + token * HIDDEN + column) = result;
+            """,
+        )
+
+    hidden = sorted_rows.shape[-1]
+    topk = scores.shape[-1]
+    tokens = scores.size // topk
+    vector_width = _cuda_vector_width(sorted_rows.dtype)
+    output_shape = tuple(scores.shape[:-1]) + (hidden,)
+    vectors_per_row = hidden // vector_width
+    output_vectors = tokens * vectors_per_row
+    return _CUDA_SORTED_WEIGHTED_REDUCE(
+        inputs=[sorted_rows, inverse, scores],
+        output_shapes=[output_shape],
+        output_dtypes=[sorted_rows.dtype],
+        grid=(output_vectors, 1, 1),
+        threadgroup=(256, 1, 1),
+        template=[
+            ("T", sorted_rows.dtype),
+            ("VEC", vector_width),
+            ("HIDDEN", hidden),
+            ("TOPK", topk),
+            ("VECTORS_PER_ROW", vectors_per_row),
+        ],
+        stream=mx.gpu,
+    )[0]
 
 
 def validate_sorted_qmm_packed_config(config: dict) -> bool:
@@ -348,7 +488,7 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
-    def __call__(self, x, indices) -> mx.array:
+    def _forward_sorted(self, x, indices):
         x = mx.expand_dims(x, (-2, -3))
 
         # When we have many tokens, then sort them to make sure that the access
@@ -373,10 +513,30 @@ class SwitchGLU(nn.Module):
             sorted_indices=do_sort,
         )
 
+        return x, inv_order, do_sort
+
+    def __call__(self, x, indices) -> mx.array:
+        x, inv_order, do_sort = self._forward_sorted(x, indices)
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+    def weighted_call(self, x, indices, scores) -> mx.array:
+        """Run routed experts and combine their weighted outputs."""
+        x, inv_order, do_sort = self._forward_sorted(x, indices)
+        if do_sort and _can_fuse_sorted_weighted_reduce(
+            x,
+            indices,
+            scores,
+            training=self.training,
+        ):
+            return _cuda_sorted_weighted_reduce(x, inv_order, scores)
+
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        x = x.squeeze(-2)
+        return (x * scores[..., None]).sum(axis=-2).astype(x.dtype)
 
 
 class SwitchMLP(nn.Module):

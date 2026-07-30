@@ -1020,6 +1020,76 @@ class TestModels(unittest.TestCase):
         projection._requires_sorted_qmm = True
         self.assertTrue(_should_sort_switch(decode_indices, projection))
 
+    def test_switch_glu_weighted_call_fallback(self):
+        from mlx_lm.models.switch_layers import SwitchGLU
+
+        mx.random.seed(41)
+        switch = SwitchGLU(
+            input_dims=32,
+            hidden_dims=64,
+            num_experts=8,
+        )
+        x = mx.random.normal((2, 17, 32))
+        indices = mx.random.randint(0, 8, (2, 17, 4))
+        scores = mx.softmax(mx.random.normal((2, 17, 4)), axis=-1)
+
+        routed = switch(x, indices)
+        expected = (routed * scores[..., None]).sum(axis=-2).astype(
+            routed.dtype
+        )
+        with patch.dict(
+            os.environ,
+            {"MLX_CUDA_FUSED_MOE_REDUCE": "1"},
+            clear=False,
+        ):
+            actual = switch.weighted_call(x, indices, scores)
+
+        self.assertTrue(mx.allclose(actual, expected))
+
+    def test_fused_moe_reduce_invalid_threshold_uses_default(self):
+        from mlx_lm.models.switch_layers import (
+            _fused_moe_reduce_min_assignments,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"MLX_CUDA_FUSED_MOE_REDUCE_MIN_ASSIGNMENTS": "invalid"},
+            clear=False,
+        ):
+            self.assertEqual(_fused_moe_reduce_min_assignments(), 2048)
+
+    @unittest.skipUnless(
+        hasattr(mx, "cuda") and mx.cuda.is_available(),
+        "CUDA is required",
+    )
+    def test_cuda_sorted_weighted_reduce(self):
+        from mlx_lm.models.switch_layers import (
+            _cuda_sorted_weighted_reduce,
+        )
+
+        mx.random.seed(43)
+        tokens, topk, hidden = 33, 8, 128
+        rows = mx.random.normal((tokens * topk, 1, hidden)).astype(
+            mx.bfloat16
+        )
+        expert_ids = mx.random.randint(0, 64, (tokens * topk,))
+        inverse = mx.argsort(mx.argsort(expert_ids))
+        scores = mx.softmax(mx.random.normal((tokens, topk)), axis=-1)
+        original_rows = rows[inverse].reshape(tokens, topk, hidden)
+        expected = (
+            original_rows.astype(mx.float32) * scores[..., None]
+        ).sum(axis=-2).astype(rows.dtype)
+
+        actual = _cuda_sorted_weighted_reduce(rows, inverse, scores)
+        repeat = _cuda_sorted_weighted_reduce(rows, inverse, scores)
+        max_abs = mx.max(
+            mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))
+        )
+        mx.eval(actual, repeat, max_abs)
+
+        self.assertLessEqual(max_abs.item(), 4e-3)
+        self.assertTrue(mx.array_equal(actual, repeat))
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 
