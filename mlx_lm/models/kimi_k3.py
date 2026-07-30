@@ -818,10 +818,12 @@ class KimiK3TextModel(nn.Module):
         self.in_blocks = 0
         self._set_cache_indices()
 
-    def _set_cache_indices(self):
+    def _set_cache_indices(self, layers=None):
+        if layers is None:
+            layers = self.layers[self.start_idx : self.end_idx]
         self.ssm_idx = None
         self.attn_idx = None
-        for i, layer in enumerate(self.layers[self.start_idx : self.end_idx]):
+        for i, layer in enumerate(layers):
             if layer.is_linear:
                 if self.ssm_idx is None:
                     self.ssm_idx = i
@@ -852,8 +854,10 @@ class KimiK3TextModel(nn.Module):
     ) -> mx.array:
         h = self.embed_tokens(inputs)
         boundary_dtype = h.dtype
+        active_layers = self.layers[self.start_idx : self.end_idx]
+        self._set_cache_indices(active_layers)
         if cache is None:
-            cache = [None] * self.num_layers
+            cache = [None] * len(active_layers)
 
         ssm_mask = (
             create_ssm_mask(h, cache[self.ssm_idx])
@@ -887,10 +891,9 @@ class KimiK3TextModel(nn.Module):
             else:
                 h = mx.distributed.recv_like(h, src)
 
-        for i in range(self.num_layers):
-            layer = self.layers[self.start_idx + i]
+        for layer, layer_cache in zip(active_layers, cache, strict=True):
             mask = ssm_mask if layer.is_linear else attn_mask
-            h, blocks = layer(h, mask=mask, cache=cache[i], blocks=blocks)
+            h, blocks = layer(h, mask=mask, cache=layer_cache, blocks=blocks)
 
         if pipeline_rank != 0:
             dst = pipeline_rank - 1
