@@ -57,7 +57,34 @@ A bounded local M3 Max benchmark at the deployed TP2 geometry
   transient installation peak.
 
 The timing samples remain variable and this ceiling is far below the remaining
-gap to 17 tok/s, so a canonical full-model live A/B should be strict.
+gap to 17 tok/s, so the canonical full-model live A/B was kept strict.
+
+## Live TP2 result
+
+The zero-copy skinny pack passed the real-weight, two-rank M3 Ultra TP2 gate
+on top of the exact fused-down, AttnRes/RMSNorm, and corrected-router stack.
+Five canonical 575-prompt-token/128-generation-token repetitions retained
+completion digest
+`c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`
+and produced:
+
+```text
+14.0846, 13.9339, 14.0258, 14.0268, 14.0272 tok/s
+```
+
+The median was `14.0268` tok/s versus `13.8160` for the matched exact-router
+stack (`+1.53%`). This saves `1.088 ms/token`.
+
+Three 1,067-token coding-prompt repetitions retained digest
+`9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959`
+and produced `13.9964`, `13.9971`, and `14.0106` tok/s. The median was
+`13.9971` tok/s versus `13.7809` for the matched exact-router stack
+(`+1.57%`). Peak memory remained approximately `414 GB` per rank for the
+canonical case.
+
+This accepted path removes one skinny-projection QMV launch in each of the 69
+KDA layers. It remains opt-in because its supported quantization and decode
+geometry are deliberately narrow.
 
 ## Exactness and generalization gates
 
