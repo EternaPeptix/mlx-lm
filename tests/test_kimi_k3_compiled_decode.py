@@ -132,6 +132,40 @@ def _assert_cache_equal(test, left, right):
             test.fail(f"Unsupported cache type in equality helper: {type(lhs)}")
 
 
+class TestKimiK3CompiledDecodeSelector(unittest.TestCase):
+    def test_selector_accepts_all_none_indices_and_inclusive_ranges(self):
+        parse = kimi_k3._parse_compiled_decode_segments
+
+        self.assertEqual(parse("all", 25), frozenset(range(25)))
+        self.assertEqual(parse("none", 25), frozenset())
+        self.assertEqual(parse("0, 3-5, 24", 25), frozenset((0, 3, 4, 5, 24)))
+        self.assertEqual(parse("2-2,2", 25), frozenset((2,)))
+
+    def test_selector_rejects_ambiguous_or_out_of_range_values(self):
+        parse = kimi_k3._parse_compiled_decode_segments
+
+        for selector in (
+            "",
+            " ",
+            "0,,1",
+            "-1",
+            "1-",
+            "1-2-3",
+            "3-2",
+            "25",
+            "all,1",
+            "*",
+        ):
+            with self.subTest(selector=selector):
+                with self.assertRaises(ValueError):
+                    parse(selector, 25)
+
+        with self.assertRaises(ValueError):
+            parse("none", -1)
+        with self.assertRaises(ValueError):
+            parse("0", 0)
+
+
 @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
 class TestKimiK3CompiledDecode(unittest.TestCase):
     def setUp(self):
@@ -139,6 +173,7 @@ class TestKimiK3CompiledDecode(unittest.TestCase):
             os.environ,
             {
                 kimi_k3.COMPILED_DECODE_ENV: "0",
+                kimi_k3.COMPILED_DECODE_SEGMENTS_ENV: "all",
                 "MLX_LM_KIMI_K3_FUSED_EXPERTS": "0",
             },
             clear=False,
@@ -166,6 +201,39 @@ class TestKimiK3CompiledDecode(unittest.TestCase):
 
         self.assertTrue(enabled.model._compiled_decode_enabled)
         self.assertFalse(disabled.model._compiled_decode_enabled)
+
+    def test_segment_selector_is_snapshotted_per_model(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.COMPILED_DECODE_ENV: "1",
+                kimi_k3.COMPILED_DECODE_SEGMENTS_ENV: "0,2",
+            },
+            clear=False,
+        ):
+            model = _make_model()
+
+        with mock.patch.dict(
+            os.environ,
+            {kimi_k3.COMPILED_DECODE_SEGMENTS_ENV: "all"},
+            clear=False,
+        ):
+            self.assertEqual(
+                model.model._compiled_decode_segments,
+                frozenset((0, 2)),
+            )
+
+    def test_invalid_segment_selector_fails_before_serving(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.COMPILED_DECODE_ENV: "1",
+                kimi_k3.COMPILED_DECODE_SEGMENTS_ENV: "0-99",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(ValueError):
+                _make_model()
 
     def test_guard_accepts_only_supported_decode_state(self):
         model = _make_model()
@@ -268,6 +336,111 @@ class TestKimiK3CompiledDecode(unittest.TestCase):
         self.assertEqual(len(schedule.transitions), 1)
         self.assertEqual(schedule.transitions[0].kda_indices, (4, 5, 6))
 
+    def test_mixed_compiled_and_eager_segment_schedules_match_eager(self):
+        selectors = ("0", "1", "2", "0,2", "0-1", "1-2")
+        for selector in selectors:
+            with self.subTest(selector=selector):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        kimi_k3.COMPILED_DECODE_ENV: "1",
+                        kimi_k3.COMPILED_DECODE_SEGMENTS_ENV: selector,
+                    },
+                    clear=False,
+                ):
+                    model = _make_model()
+
+                base_cache = _warm_cache(model)
+                eager_cache = copy.deepcopy(base_cache)
+                mixed_cache = copy.deepcopy(base_cache)
+                eager_outputs = []
+                mixed_outputs = []
+                for token in (67, 71, 73):
+                    inputs = mx.array([[token]], dtype=mx.int32)
+                    model.model._compiled_decode_enabled = False
+                    eager_outputs.append(model(inputs, cache=eager_cache))
+                    model.model._compiled_decode_enabled = True
+                    mixed_outputs.append(model(inputs, cache=mixed_cache))
+
+                mx.eval(
+                    eager_outputs,
+                    mixed_outputs,
+                    [c.state for c in eager_cache],
+                    [c.state for c in mixed_cache],
+                )
+                for eager, mixed in zip(
+                    eager_outputs,
+                    mixed_outputs,
+                    strict=True,
+                ):
+                    self.assertTrue(mx.array_equal(eager, mixed).item())
+                _assert_cache_equal(self, eager_cache, mixed_cache)
+
+                selected = kimi_k3._parse_compiled_decode_segments(selector, 3)
+                schedule = model.model._compiled_decode_schedule
+                self.assertIsNotNone(schedule)
+                self.assertEqual(schedule.prefix is not None, 0 in selected)
+                self.assertEqual(
+                    schedule.transitions[0].step is not None,
+                    1 in selected,
+                )
+                self.assertEqual(schedule.tail is not None, 2 in selected)
+
+    def test_none_selector_preserves_the_original_eager_path(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.COMPILED_DECODE_ENV: "1",
+                kimi_k3.COMPILED_DECODE_SEGMENTS_ENV: "none",
+            },
+            clear=False,
+        ):
+            model = _make_model()
+
+        cache = _warm_cache(model)
+        logits = model(mx.array([[79]], dtype=mx.int32), cache=cache)
+        mx.eval(logits, [c.state for c in cache])
+
+        self.assertEqual(model.model._compiled_decode_segments, frozenset())
+        self.assertIsNone(model.model._compiled_decode_schedule)
+
+    def test_unselected_kda_groups_use_the_layer_eager_path(self):
+        cases = {
+            "1": (0, 1, 2),
+            "0,2": (4, 5, 6),
+        }
+        for selector, expected_layers in cases.items():
+            with self.subTest(selector=selector):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        kimi_k3.COMPILED_DECODE_ENV: "1",
+                        kimi_k3.COMPILED_DECODE_SEGMENTS_ENV: selector,
+                    },
+                    clear=False,
+                ):
+                    model = _make_model()
+                cache = _warm_cache(model)
+                original_call = kimi_k3.KimiK3DeltaAttention.__call__
+                eager_layer_calls = []
+
+                def counted_call(attention, *args, **kwargs):
+                    eager_layer_calls.append(attention.layer_idx)
+                    return original_call(attention, *args, **kwargs)
+
+                with mock.patch.object(
+                    kimi_k3.KimiK3DeltaAttention,
+                    "__call__",
+                    new=counted_call,
+                ):
+                    logits = model(
+                        mx.array([[83]], dtype=mx.int32),
+                        cache=cache,
+                    )
+                    mx.eval(logits, [c.state for c in cache])
+
+                self.assertEqual(tuple(eager_layer_calls), expected_layers)
+
     def test_final_adjacent_mla_boundary_matches_eager(self):
         config = _config(
             num_layers=5,
@@ -322,27 +495,37 @@ class TestKimiK3CompiledDecode(unittest.TestCase):
         for idx in mla_indices:
             self.assertEqual(cache[idx].offset, starting_offsets[idx] + 3)
 
-    def test_tp2_compiled_collectives_match_eager(self):
+    def test_tp2_full_and_mixed_compiled_collectives_match_eager(self):
         group = mx.distributed.init()
         if group.size() != 2:
             self.skipTest("requires mlx.launch with exactly two ranks")
 
-        model = _make_model()
-        model.shard(group)
-        base_cache = _warm_cache(model)
-        eager_cache = copy.deepcopy(base_cache)
-        compiled_cache = copy.deepcopy(base_cache)
-        inputs = mx.array([[61]], dtype=mx.int32)
+        for selector in ("all", "0,2"):
+            with self.subTest(selector=selector):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        kimi_k3.COMPILED_DECODE_ENV: "1",
+                        kimi_k3.COMPILED_DECODE_SEGMENTS_ENV: selector,
+                    },
+                    clear=False,
+                ):
+                    model = _make_model()
+                model.shard(group)
+                base_cache = _warm_cache(model)
+                eager_cache = copy.deepcopy(base_cache)
+                compiled_cache = copy.deepcopy(base_cache)
+                inputs = mx.array([[61]], dtype=mx.int32)
 
-        model.model._compiled_decode_enabled = False
-        eager = model(inputs, cache=eager_cache)
-        mx.eval(eager, [c.state for c in eager_cache])
-        model.model._compiled_decode_enabled = True
-        compiled = model(inputs, cache=compiled_cache)
-        mx.eval(compiled, [c.state for c in compiled_cache])
+                model.model._compiled_decode_enabled = False
+                eager = model(inputs, cache=eager_cache)
+                mx.eval(eager, [c.state for c in eager_cache])
+                model.model._compiled_decode_enabled = True
+                compiled = model(inputs, cache=compiled_cache)
+                mx.eval(compiled, [c.state for c in compiled_cache])
 
-        self.assertTrue(mx.array_equal(eager, compiled).item())
-        _assert_cache_equal(self, eager_cache, compiled_cache)
+                self.assertTrue(mx.array_equal(eager, compiled).item())
+                _assert_cache_equal(self, eager_cache, compiled_cache)
 
     def test_kv_growth_boundary_matches_eager(self):
         with (

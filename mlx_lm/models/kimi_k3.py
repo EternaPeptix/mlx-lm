@@ -4,7 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -28,6 +28,56 @@ from .switch_layers import SwitchGLU
 
 
 COMPILED_DECODE_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE"
+# Segment 0 is the KDA prefix, 1..N-1 are MLA-to-MLA transitions, and
+# segment N is the final MLA/output tail. The production K3 topology has N=24.
+COMPILED_DECODE_SEGMENTS_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE_SEGMENTS"
+
+
+def _parse_compiled_decode_segments(
+    selector: str,
+    segment_count: int,
+) -> FrozenSet[int]:
+    """Parse an immutable, inclusive compiled-decode segment selector."""
+    if segment_count < 0:
+        raise ValueError("Compiled decode segment count cannot be negative")
+
+    selector = selector.strip().lower()
+    if selector == "all":
+        return frozenset(range(segment_count))
+    if selector == "none":
+        return frozenset()
+    if not selector:
+        raise ValueError(
+            f"{COMPILED_DECODE_SEGMENTS_ENV} must be 'all', 'none', "
+            "or a comma-separated list of indices and inclusive ranges"
+        )
+
+    segments = set()
+    for item in selector.split(","):
+        item = item.strip()
+        if not item:
+            raise ValueError(
+                f"Invalid empty item in {COMPILED_DECODE_SEGMENTS_ENV}={selector!r}"
+            )
+
+        bounds = [part.strip() for part in item.split("-")]
+        if len(bounds) == 1 and bounds[0].isdigit():
+            start = end = int(bounds[0])
+        elif len(bounds) == 2 and bounds[0].isdigit() and bounds[1].isdigit():
+            start, end = (int(bound) for bound in bounds)
+            if start > end:
+                raise ValueError(
+                    f"Reversed range {item!r} in {COMPILED_DECODE_SEGMENTS_ENV}"
+                )
+        else:
+            raise ValueError(f"Invalid item {item!r} in {COMPILED_DECODE_SEGMENTS_ENV}")
+
+        if start < 0 or end >= segment_count:
+            valid = f"0-{segment_count - 1}" if segment_count else "none"
+            raise ValueError(f"Segment {item!r} is outside the valid range {valid}")
+        segments.update(range(start, end + 1))
+
+    return frozenset(segments)
 
 
 @mx.compile
@@ -821,17 +871,17 @@ class KimiK3DecoderLayer(nn.Module):
 
 @dataclass(frozen=True)
 class _CompiledDecodeTransition:
-    step: Callable[..., Any]
+    step: Optional[Callable[..., Any]]
     kda_indices: Tuple[int, ...]
 
 
 @dataclass(frozen=True)
 class _CompiledDecodeSchedule:
-    prefix: Callable[..., Any]
+    prefix: Optional[Callable[..., Any]]
     prefix_kda_indices: Tuple[int, ...]
     mla_indices: Tuple[int, ...]
     transitions: Tuple[_CompiledDecodeTransition, ...]
-    tail: Callable[..., mx.array]
+    tail: Optional[Callable[..., mx.array]]
 
 
 def _decode_kda_group(
@@ -982,6 +1032,15 @@ class KimiK3TextModel(nn.Module):
         self._compiled_decode_enabled = (
             os.environ.get(COMPILED_DECODE_ENV, "0") == "1"
         )
+        segment_count = (
+            sum(not layer.is_linear for layer in self.layers) + 1
+            if any(not layer.is_linear for layer in self.layers)
+            else 0
+        )
+        self._compiled_decode_segments = _parse_compiled_decode_segments(
+            os.environ.get(COMPILED_DECODE_SEGMENTS_ENV, "all"),
+            segment_count,
+        )
         self._compiled_decode_schedule = None
 
     def _set_cache_indices(self, layers=None):
@@ -1010,6 +1069,7 @@ class KimiK3TextModel(nn.Module):
     ) -> bool:
         if (
             not self._compiled_decode_enabled
+            or not self._compiled_decode_segments
             or self.training
             or fused_k3_experts_enabled()
             or not mx.metal.is_available()
@@ -1115,32 +1175,48 @@ class KimiK3TextModel(nn.Module):
         )
         first_mla = mla_indices[0]
         prefix_indices = tuple(range(first_mla))
-        prefix = _compile_decode_prefix(
-            tuple(active_layers[i] for i in prefix_indices),
-            active_layers[first_mla],
-            self.args.rms_norm_eps,
+        prefix = (
+            _compile_decode_prefix(
+                tuple(active_layers[i] for i in prefix_indices),
+                active_layers[first_mla],
+                self.args.rms_norm_eps,
+            )
+            if 0 in self._compiled_decode_segments
+            else None
         )
 
         transitions = []
-        for current_mla, next_mla in zip(mla_indices, mla_indices[1:]):
+        for segment_idx, (current_mla, next_mla) in enumerate(
+            zip(mla_indices, mla_indices[1:]),
+            start=1,
+        ):
             kda_indices = tuple(range(current_mla + 1, next_mla))
             transitions.append(
                 _CompiledDecodeTransition(
-                    step=_compile_decode_transition(
-                        active_layers[current_mla],
-                        tuple(active_layers[i] for i in kda_indices),
-                        active_layers[next_mla],
-                        self.args.rms_norm_eps,
+                    step=(
+                        _compile_decode_transition(
+                            active_layers[current_mla],
+                            tuple(active_layers[i] for i in kda_indices),
+                            active_layers[next_mla],
+                            self.args.rms_norm_eps,
+                        )
+                        if segment_idx in self._compiled_decode_segments
+                        else None
                     ),
                     kda_indices=kda_indices,
                 )
             )
 
-        tail = _compile_decode_tail(
-            active_layers[mla_indices[-1]],
-            self._output_res_w_eff,
-            self.norm,
-            self.args.rms_norm_eps,
+        tail_segment_idx = len(mla_indices)
+        tail = (
+            _compile_decode_tail(
+                active_layers[mla_indices[-1]],
+                self._output_res_w_eff,
+                self.norm,
+                self.args.rms_norm_eps,
+            )
+            if tail_segment_idx in self._compiled_decode_segments
+            else None
         )
         return _CompiledDecodeSchedule(
             prefix=prefix,
@@ -1174,6 +1250,87 @@ class KimiK3TextModel(nn.Module):
             layer_cache[1] = states[2 * i + 1]
             layer_cache.advance(1)
 
+    def _run_eager_decode_prefix(
+        self,
+        h: mx.array,
+        cache: List[Any],
+        active_layers: List[KimiK3DecoderLayer],
+        schedule: _CompiledDecodeSchedule,
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
+        blocks = ResidualBlocks(self.args.rms_norm_eps)
+        for idx in schedule.prefix_kda_indices:
+            h, blocks = active_layers[idx](
+                h,
+                mask=None,
+                cache=cache[idx],
+                blocks=blocks,
+            )
+        attention_input, partial_sum, blocks = active_layers[
+            schedule.mla_indices[0]
+        ]._prepare_attention(h, blocks)
+        assert partial_sum is not None
+        assert blocks.raw is not None and blocks.inv_rms is not None
+        return attention_input, partial_sum, blocks.raw, blocks.inv_rms
+
+    def _run_eager_decode_transition(
+        self,
+        mla_output: mx.array,
+        partial_sum: mx.array,
+        raw: mx.array,
+        inv_rms: mx.array,
+        cache: List[Any],
+        active_layers: List[KimiK3DecoderLayer],
+        current_mla_idx: int,
+        next_mla_idx: int,
+        transition: _CompiledDecodeTransition,
+    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
+        blocks = ResidualBlocks(self.args.rms_norm_eps)
+        blocks.raw = raw
+        blocks.inv_rms = inv_rms
+        h, blocks = active_layers[current_mla_idx]._finish_attention(
+            partial_sum,
+            mla_output,
+            blocks,
+        )
+        for idx in transition.kda_indices:
+            h, blocks = active_layers[idx](
+                h,
+                mask=None,
+                cache=cache[idx],
+                blocks=blocks,
+            )
+        attention_input, partial_sum, blocks = active_layers[
+            next_mla_idx
+        ]._prepare_attention(h, blocks)
+        assert partial_sum is not None
+        assert blocks.raw is not None and blocks.inv_rms is not None
+        return attention_input, partial_sum, blocks.raw, blocks.inv_rms
+
+    def _run_eager_decode_tail(
+        self,
+        mla_output: mx.array,
+        partial_sum: mx.array,
+        raw: mx.array,
+        inv_rms: mx.array,
+        final_mla_layer: KimiK3DecoderLayer,
+    ) -> mx.array:
+        blocks = ResidualBlocks(self.args.rms_norm_eps)
+        blocks.raw = raw
+        blocks.inv_rms = inv_rms
+        h, blocks = final_mla_layer._finish_attention(
+            partial_sum,
+            mla_output,
+            blocks,
+        )
+        h = _attn_res_mix(
+            blocks,
+            h,
+            self._output_res_w_eff,
+            self.args.rms_norm_eps,
+            True,
+        )
+        return self.norm(h)
+
     def _run_compiled_decode(
         self,
         h: mx.array,
@@ -1186,21 +1343,29 @@ class KimiK3TextModel(nn.Module):
             schedule = self._build_compiled_decode_schedule(active_layers)
             self._compiled_decode_schedule = schedule
 
-        (
-            attention_input,
-            partial_sum,
-            raw,
-            inv_rms,
-            updated_states,
-        ) = schedule.prefix(
-            h,
-            self._read_kda_states(cache, schedule.prefix_kda_indices),
-        )
-        self._write_kda_states(
-            cache,
-            schedule.prefix_kda_indices,
-            updated_states,
-        )
+        if schedule.prefix is None:
+            attention_input, partial_sum, raw, inv_rms = self._run_eager_decode_prefix(
+                h,
+                cache,
+                active_layers,
+                schedule,
+            )
+        else:
+            (
+                attention_input,
+                partial_sum,
+                raw,
+                inv_rms,
+                updated_states,
+            ) = schedule.prefix(
+                h,
+                self._read_kda_states(cache, schedule.prefix_kda_indices),
+            )
+            self._write_kda_states(
+                cache,
+                schedule.prefix_kda_indices,
+                updated_states,
+            )
 
         for i, mla_idx in enumerate(schedule.mla_indices):
             mla_output = active_layers[mla_idx].self_attn(
@@ -1209,10 +1374,32 @@ class KimiK3TextModel(nn.Module):
                 cache=cache[mla_idx],
             )
             if i == len(schedule.transitions):
+                if schedule.tail is None:
+                    return self._run_eager_decode_tail(
+                        mla_output,
+                        partial_sum,
+                        raw,
+                        inv_rms,
+                        active_layers[mla_idx],
+                    )
                 return schedule.tail(mla_output, partial_sum, raw, inv_rms)
 
             transition = schedule.transitions[i]
-            if transition.kda_indices:
+            if transition.step is None:
+                attention_input, partial_sum, raw, inv_rms = (
+                    self._run_eager_decode_transition(
+                        mla_output,
+                        partial_sum,
+                        raw,
+                        inv_rms,
+                        cache,
+                        active_layers,
+                        mla_idx,
+                        schedule.mla_indices[i + 1],
+                        transition,
+                    )
+                )
+            elif transition.kda_indices:
                 (
                     attention_input,
                     partial_sum,
