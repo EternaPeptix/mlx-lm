@@ -1,6 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -14,6 +15,53 @@ from .cache import CacheList, KVCache
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
+
+def _cuda_fused_mla_qk_enabled(sequence_length: int) -> bool:
+    enabled = os.environ.get("MLX_CUDA_FUSED_MLA_QK", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    try:
+        min_tokens = max(
+            2,
+            int(os.environ.get("MLX_CUDA_FUSED_MLA_QK_MIN_TOKENS", "1024")),
+        )
+    except ValueError:
+        min_tokens = 1024
+    return (
+        enabled
+        and mx.cuda.is_available()
+        and sequence_length >= min_tokens
+    )
+
+
+def _fused_mla_prefill_attention(
+    q_nope: mx.array,
+    q_pe: mx.array,
+    k_nope: mx.array,
+    k_pe: mx.array,
+    values: mx.array,
+    *,
+    scale: float,
+    mask: Optional[mx.array],
+) -> mx.array:
+    """Combine MLA content and RoPE logits in one exact attention matmul."""
+    q = mx.concatenate((q_nope, q_pe), axis=-1)
+    k_pe = mx.broadcast_to(
+        k_pe,
+        k_nope.shape[:-1] + (k_pe.shape[-1],),
+    )
+    k = mx.concatenate((k_nope, k_pe), axis=-1)
+    return scaled_dot_product_attention(
+        q,
+        k,
+        values,
+        cache=[None, None],
+        scale=scale,
+        mask=mask,
+    )
 
 
 @dataclass
@@ -235,14 +283,6 @@ class DeepseekV32Attention(nn.Module):
         if cache is not None and cache[0] is not None:
             cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
-        if mask is not None:
-            pe_scores = mx.where(
-                mask,
-                pe_scores,
-                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
-            )
-
         if L == 1:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
@@ -250,9 +290,32 @@ class DeepseekV32Attention(nn.Module):
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
 
-        output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-        )
+        if L > 1 and _cuda_fused_mla_qk_enabled(L):
+            output = _fused_mla_prefill_attention(
+                q_nope,
+                q_pe,
+                k,
+                k_pe,
+                v,
+                scale=self.scale,
+                mask=mask,
+            )
+        else:
+            pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+            if mask is not None:
+                pe_scores = mx.where(
+                    mask,
+                    pe_scores,
+                    mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+                )
+            output = scaled_dot_product_attention(
+                q_nope,
+                k,
+                v,
+                cache=cache,
+                scale=self.scale,
+                mask=pe_scores,
+            )
         if L == 1:
             output = self.unembed_out(output)
 
