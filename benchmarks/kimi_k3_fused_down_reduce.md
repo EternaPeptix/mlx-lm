@@ -64,6 +64,13 @@ The memory result was stable in all three processes. Measured peak allocation
 above the resident synthetic inputs fell from `0.116 MiB` to `0.007 MiB`; the
 eliminated BF16 expert-row tensor itself is `0.109 MiB/layer`.
 
-This is M3 Max synthetic evidence, not an M3 Ultra or end-to-end result. A
-real-weight M3 Ultra microbenchmark and two-rank completion-hash/throughput
-A/B remain required before enabling the path by default.
+This path subsequently passed a real-weight, two-rank M3 Ultra TP2 gate. Five
+canonical 575-prompt-token/128-generation-token repetitions retained
+completion digest
+`c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`
+and improved median decode from `13.2985` to `13.5835` tok/s (`+2.14%`).
+Three 1,067-token coding-prompt repetitions retained digest
+`9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959`
+and improved median decode from `13.2637` to `13.5102` tok/s (`+1.86%`).
+The feature remains opt-in because its supported geometry is deliberately
+narrow.

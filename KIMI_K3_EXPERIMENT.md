@@ -2,9 +2,9 @@
 
 This branch is one part of a coordinated public experiment:
 
-- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack)
-- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack)
-- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack)
+- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack-v2)
+- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v2)
+- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v2)
 
 It contains the Kimi K3 support and TP2 changes used to run
 `kernelpool/Kimi-K3-2bit-UVMAX` across two 512 GB M3 Ultra systems, including:
@@ -16,6 +16,7 @@ It contains the Kimi K3 support and TP2 changes used to run
 - an opt-in authoritative packed MoE-front path that avoids persistent duplicate
   projection storage;
 - an opt-in exact row-tiled KDA prefill kernel; and
+- an opt-in fused expert-down, router-weight, and top-16 reduction kernel; and
 - focused Metal and distributed tests for those paths.
 
 ## Feature flags
@@ -28,8 +29,11 @@ packed QMV for four same-input MoE-front projections.
 representation authoritative so the unpacked projection copies are not kept
 for the model lifetime. `MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL=1` enables the
 exact row-tiled Metal KDA recurrence for supported prefill shapes of at least
-128 tokens. All of these features default to off and fail closed outside their
-supported shapes.
+128 tokens. `MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE=1`, together with
+`MLX_LM_KIMI_K3_FUSED_EXPERTS=1`, fuses the selected experts' down
+projections, BF16 router multiplication, and MLX-compatible top-16 reduction
+without materializing the sixteen expert rows. All of these features default
+to off and fail closed outside their supported shapes.
 
 `MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES` enables eager, decode-only
 asynchronous evaluation boundaries. It accepts `none`, `laguna8`, `block8`,
@@ -52,15 +56,24 @@ particular compiled subset is safe.
 
 The latest exact TP2 candidate combines the `laguna8` hidden-state
 asynchronous decode schedule, authoritative packed MoE front, row-4 KDA
-prefill, and exact fused experts. On the canonical 575-token prompt and
-128-token decode, five candidate repetitions produced a median `13.2985`
-decode tok/s versus `12.9824` for the matched fused-expert-off control
-(`+2.44%`). Every repetition retained completion digest
+prefill, exact fused experts, and fused down/route reduction. On the canonical
+575-token prompt and 128-token decode, five repetitions produced a median
+`13.5835` decode tok/s versus `13.2985` for the otherwise matched
+fused-down-off stack (`+2.14%`) and `12.9824` for the earlier
+fused-expert-off control (`+4.63%` cumulatively). Every repetition retained
+completion digest
 `c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`.
-A separate 1,067-token coding-prompt screen produced `13.2637` versus
-`12.9288` tok/s (`+2.59%`) and retained digest
+A separate 1,067-token coding-prompt screen produced `13.5102` versus
+`13.2637` tok/s for the fused-down-off stack (`+1.86%`) and `12.9288`
+tok/s for the earlier control (`+4.50%` cumulatively), while retaining digest
 `9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959`.
 Peak memory remained approximately `414 GB` per rank for the canonical case.
+
+An exact fused-router prototype reached `13.7189` median decode tok/s, but
+all five live repetitions changed the canonical completion digest to
+`905f41a15d7933fd33da36382e1766469fffbe17c9da03084c22e62376f77cfc`.
+It is therefore excluded from this coordinated branch and remains a
+correctness investigation rather than a release recommendation.
 
 The authoritative representation removes approximately `7.44 GB` decimal
 (`6.93 GiB`) of persistent duplicate projection storage per TP2 rank. The
@@ -82,7 +95,7 @@ The matched full-model TP2 prefill A/B reached `147.4168` prompt tok/s versus
 and peak memory was unchanged within measurement noise.
 
 The sanitized per-repetition record is published with the coordinated
-[EXO branch](https://github.com/EternaPeptix/exo/blob/experiment/kimi-k3-uvmax-optimization-stack/docs/kimi_k3_tp2_benchmark_20260730.json).
+[EXO branch](https://github.com/EternaPeptix/exo/blob/experiment/kimi-k3-uvmax-optimization-stack-v2/docs/kimi_k3_tp2_benchmark_20260730.json).
 
 On a matched three-repetition canonical TP2 screening run, the feature-off
 reference produced a median `12.0465` decode tok/s. The `laguna8` hidden-state
