@@ -64,6 +64,75 @@ def _fused_mla_prefill_attention(
     )
 
 
+def _indexer_key_chunk_size() -> int:
+    """Return the bounded-memory DSA indexer key block size, or zero if off."""
+    try:
+        return max(
+            0,
+            int(os.environ.get("MLX_DSA_INDEXER_KEY_CHUNK_SIZE", "0")),
+        )
+    except ValueError:
+        return 0
+
+
+def _indexer_topk(
+    q: mx.array,
+    k: mx.array,
+    weights: mx.array,
+    mask: Optional[mx.array],
+    *,
+    topk: int,
+    key_chunk_size: int,
+) -> mx.array:
+    """Select exact DSA top-k keys without materializing all head-wise scores."""
+
+    def score_block(start: int, end: int) -> mx.array:
+        scores = q @ k[..., start:end, :].swapaxes(-1, -2)
+        scores = mx.maximum(scores, 0)
+        scores = (scores * weights).sum(axis=1, keepdims=True)
+        if mask is not None:
+            scores = mx.where(mask[..., start:end], scores, -float("inf"))
+        return scores
+
+    key_count = k.shape[2]
+    if key_chunk_size <= 0 or key_chunk_size >= key_count:
+        scores = score_block(0, key_count)
+        return mx.argpartition(scores, kth=-topk, axis=-1)[..., -topk:]
+
+    running_scores = None
+    running_indices = None
+    for start in range(0, key_count, key_chunk_size):
+        end = min(start + key_chunk_size, key_count)
+        scores = score_block(start, end)
+        keep = min(topk, end - start)
+        if end - start > keep:
+            indices = mx.argpartition(scores, kth=-keep, axis=-1)[..., -keep:]
+            scores = mx.take_along_axis(scores, indices, axis=-1)
+        else:
+            indices = mx.broadcast_to(
+                mx.arange(end - start, dtype=mx.int32),
+                scores.shape,
+            )
+        indices = indices + start
+
+        if running_scores is not None:
+            scores = mx.concatenate((running_scores, scores), axis=-1)
+            indices = mx.concatenate((running_indices, indices), axis=-1)
+        if scores.shape[-1] > topk:
+            keep_indices = mx.argpartition(
+                scores,
+                kth=-topk,
+                axis=-1,
+            )[..., -topk:]
+            scores = mx.take_along_axis(scores, keep_indices, axis=-1)
+            indices = mx.take_along_axis(indices, keep_indices, axis=-1)
+        running_scores = scores
+        running_indices = indices
+
+    assert running_indices is not None
+    return running_indices
+
+
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "deepseek_v32"
@@ -149,17 +218,16 @@ class Indexer(nn.Module):
             k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
         if k.shape[2] <= self.index_topk:
             return None
-        scores = q @ k.swapaxes(-1, -2)
-        scores = mx.maximum(scores, 0)
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
-        scores = scores * weights
-        scores = scores.sum(axis=1, keepdims=True)
-        if mask is not None:
-            scores = mx.where(mask, scores, -float("inf"))
-        return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
-            ..., -self.index_topk :
-        ]
+        return _indexer_topk(
+            q,
+            k,
+            weights,
+            mask,
+            topk=self.index_topk,
+            key_chunk_size=_indexer_key_chunk_size(),
+        )
 
 
 class DeepseekV32Attention(nn.Module):

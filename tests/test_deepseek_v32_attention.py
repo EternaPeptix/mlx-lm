@@ -5,10 +5,50 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.models.base import scaled_dot_product_attention
-from mlx_lm.models.deepseek_v32 import _fused_mla_prefill_attention
+from mlx_lm.models.deepseek_v32 import (
+    _fused_mla_prefill_attention,
+    _indexer_topk,
+)
 
 
 class TestDeepseekV32Attention(unittest.TestCase):
+    def test_streaming_indexer_topk_matches_full_scores(self):
+        mx.random.seed(11)
+        batch, heads, queries, keys, dims = 1, 4, 5, 19, 8
+        topk = 5
+        q = mx.random.normal((batch, heads, queries, dims))
+        k = mx.random.normal((batch, 1, keys, dims))
+        weights = mx.random.normal((batch, heads, queries, 1))
+        mask = mx.tril(
+            mx.ones((queries, keys), dtype=mx.bool_),
+            k=keys - queries,
+        )
+
+        reference = _indexer_topk(
+            q,
+            k,
+            weights,
+            mask,
+            topk=topk,
+            key_chunk_size=0,
+        )
+        candidate = _indexer_topk(
+            q,
+            k,
+            weights,
+            mask,
+            topk=topk,
+            key_chunk_size=7,
+        )
+        mx.eval(reference, candidate)
+
+        self.assertTrue(
+            mx.array_equal(
+                mx.sort(reference, axis=-1),
+                mx.sort(candidate, axis=-1),
+            )
+        )
+
     def test_fused_mla_prefill_attention(self):
         mx.random.seed(7)
         batch, heads, tokens = 1, 4, 17
