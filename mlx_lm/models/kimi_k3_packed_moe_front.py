@@ -26,7 +26,9 @@ import mlx.nn as nn
 
 
 PACKED_MOE_FRONT_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT"
+AUTHORITATIVE_PACKED_MOE_FRONT_ENV = "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT"
 _UNSUPPORTED = object()
+_PACKED_ARRAY_NAMES = ("weight", "scales", "biases", "bias")
 
 
 class PackedMoEFrontUnsupported(ValueError):
@@ -36,6 +38,11 @@ class PackedMoEFrontUnsupported(ValueError):
 @lru_cache(maxsize=1)
 def packed_moe_front_enabled() -> bool:
     return os.environ.get(PACKED_MOE_FRONT_ENV, "0") == "1"
+
+
+@lru_cache(maxsize=1)
+def authoritative_packed_moe_front_enabled() -> bool:
+    return os.environ.get(AUTHORITATIVE_PACKED_MOE_FRONT_ENV, "0") == "1"
 
 
 def _array_parameter(module: Any, name: str) -> mx.array | None:
@@ -80,9 +87,7 @@ def _same_source_signature(
 ) -> bool:
     if len(expected) != len(actual):
         return False
-    for expected_projection, actual_projection in zip(
-        expected, actual, strict=True
-    ):
+    for expected_projection, actual_projection in zip(expected, actual, strict=True):
         if any(
             expected_projection[index] is not actual_projection[index]
             for index in range(5)
@@ -233,26 +238,113 @@ class PackedK3MoEFront(nn.Module):
         return tuple(mx.split(output, self._split_indices, axis=-1))
 
 
-def _build_packed_front(sparse_moe: Any) -> PackedK3MoEFront:
+class AuthoritativePackedK3MoEFront(PackedK3MoEFront):
+    """A packed QMV whose row views are the source modules' parameters.
+
+    ``PackedK3MoEFront`` retains both the original banks and their
+    concatenation.  This variant evaluates the concatenations once, replaces
+    the original module arrays with zero-copy row views, and then releases the
+    original arrays.  The hidden full-width arrays are therefore the only
+    backing allocations while parameter traversal keeps the checkpoint's
+    original names and shapes.
+    """
+
+    def __init__(self, modules: Sequence[Any]):
+        modules = tuple(modules)
+        super().__init__(modules)
+
+        # Force the concatenations to finish while all source arrays are valid.
+        # Packing is a one-time operation, and evaluating here bounds transient
+        # duplication to the layer currently being installed.
+        mx.eval(self.parameters())
+
+        source_views: dict[str, tuple[mx.array, ...]] = {}
+        for name in _PACKED_ARRAY_NAMES:
+            packed_array = _array_parameter(self, name)
+            if packed_array is not None:
+                source_views[name] = tuple(
+                    mx.split(packed_array, self._split_indices, axis=0)
+                )
+        mx.eval(*(value for views in source_views.values() for value in views))
+
+        # Do not mutate a source module until every packed array and every view
+        # has evaluated successfully.  Constructor failures remain fail closed.
+        for index, module in enumerate(modules):
+            for name, views in source_views.items():
+                setattr(module, name, views[index])
+
+        # super().__init__ captured the pre-pack arrays. Replace that signature
+        # so no reference keeps the superseded allocations alive.
+        object.__setattr__(self, "_source_signature", _source_signature(modules))
+
+    def detach_source_views(self) -> None:
+        """Give installed source views independent, byte-identical storage.
+
+        Normal loading shards weights before the first decode, so this is only
+        needed for a later call to ``Model.shard`` or explicit invalidation.
+        A byte-wise xor with zero is used because array construction,
+        ``copy.copy``, and contiguous conversion may all preserve the same MLX
+        backing allocation.
+        """
+
+        replacements: list[tuple[Any, str, mx.array]] = []
+        for signature in self._source_signature:
+            module = signature[0]
+            for name, expected in zip(
+                _PACKED_ARRAY_NAMES,
+                signature[1:5],
+                strict=True,
+            ):
+                current = _array_parameter(module, name)
+                if current is expected and current is not None:
+                    copied = mx.bitwise_xor(
+                        current.view(mx.uint8),
+                        mx.array(0, dtype=mx.uint8),
+                    ).view(current.dtype)
+                    replacements.append((module, name, copied))
+
+        if replacements:
+            mx.eval(*(value for _, _, value in replacements))
+        for module, name, value in replacements:
+            setattr(module, name, value)
+
+
+def _front_modules(sparse_moe: Any) -> tuple[Any, Any, Any, Any]:
     shared = getattr(sparse_moe, "shared_experts", None)
     routed_down = getattr(sparse_moe, "routed_expert_down_proj", None)
     if shared is None or routed_down is None:
         raise PackedMoEFrontUnsupported(
             "packed path requires shared experts and latent routed experts"
         )
-    return PackedK3MoEFront(
-        (
-            shared.gate_proj,
-            shared.up_proj,
-            sparse_moe.gate,
-            routed_down,
-        )
+    return (
+        shared.gate_proj,
+        shared.up_proj,
+        sparse_moe.gate,
+        routed_down,
     )
 
 
-def invalidate_packed_k3_moe_front(sparse_moe: Any) -> None:
-    """Drop hidden packed state before sharding or other weight mutation."""
+def _build_packed_front(sparse_moe: Any) -> PackedK3MoEFront:
+    return PackedK3MoEFront(_front_modules(sparse_moe))
 
+
+def _build_authoritative_packed_front(
+    sparse_moe: Any,
+) -> AuthoritativePackedK3MoEFront:
+    return AuthoritativePackedK3MoEFront(_front_modules(sparse_moe))
+
+
+def _drop_authoritative_packed_k3_moe_front(sparse_moe: Any) -> None:
+    for name in (
+        "_authoritative_packed_k3_moe_front",
+        "_authoritative_packed_k3_moe_front_reason",
+        "_authoritative_packed_k3_moe_front_source_signature",
+    ):
+        if hasattr(sparse_moe, name):
+            object.__delattr__(sparse_moe, name)
+
+
+def _drop_duplicating_packed_k3_moe_front(sparse_moe: Any) -> None:
     for name in (
         "_packed_k3_moe_front",
         "_packed_k3_moe_front_reason",
@@ -260,6 +352,117 @@ def invalidate_packed_k3_moe_front(sparse_moe: Any) -> None:
     ):
         if hasattr(sparse_moe, name):
             object.__delattr__(sparse_moe, name)
+
+
+def invalidate_packed_k3_moe_front(sparse_moe: Any) -> None:
+    """Drop hidden packed state before sharding or other weight mutation."""
+
+    authoritative = getattr(
+        sparse_moe,
+        "_authoritative_packed_k3_moe_front",
+        None,
+    )
+    if isinstance(authoritative, AuthoritativePackedK3MoEFront):
+        authoritative.detach_source_views()
+    _drop_authoritative_packed_k3_moe_front(sparse_moe)
+    _drop_duplicating_packed_k3_moe_front(sparse_moe)
+
+
+def maybe_authoritative_packed_k3_moe_front(
+    sparse_moe: Any,
+    x: mx.array,
+) -> tuple[mx.array, ...] | None:
+    """Return one native packed QMV backed by authoritative source views."""
+
+    if not authoritative_packed_moe_front_enabled():
+        return None
+
+    # Runtime experiment toggles must not leave the older duplicate cache
+    # resident beside the authoritative allocation.
+    _drop_duplicating_packed_k3_moe_front(sparse_moe)
+
+    if (
+        getattr(sparse_moe, "training", True)
+        or x.ndim != 3
+        or x.shape[0] * x.shape[1] != 1
+    ):
+        return None
+
+    try:
+        modules = _front_modules(sparse_moe)
+    except (AttributeError, PackedMoEFrontUnsupported):
+        return None
+
+    packed = getattr(
+        sparse_moe,
+        "_authoritative_packed_k3_moe_front",
+        None,
+    )
+    stale_packed = None
+    current_signature = _source_signature(modules)
+    if packed is _UNSUPPORTED:
+        unsupported_signature = getattr(
+            sparse_moe,
+            "_authoritative_packed_k3_moe_front_source_signature",
+            (),
+        )
+        if _same_source_signature(unsupported_signature, current_signature):
+            return None
+        _drop_authoritative_packed_k3_moe_front(sparse_moe)
+        packed = None
+    elif packed is not None:
+        try:
+            if not packed.matches_sources(modules):
+                # Do not detach unchanged row views here. The replacement pack
+                # can consume them directly, then atomically replace all four
+                # banks and release the old parent allocation.
+                stale_packed = packed
+                _drop_authoritative_packed_k3_moe_front(sparse_moe)
+                packed = None
+        except (AttributeError, TypeError, ValueError):
+            if isinstance(packed, AuthoritativePackedK3MoEFront):
+                stale_packed = packed
+            _drop_authoritative_packed_k3_moe_front(sparse_moe)
+            packed = None
+
+    if packed is None:
+        try:
+            packed = _build_authoritative_packed_front(sparse_moe)
+        except (
+            AttributeError,
+            PackedMoEFrontUnsupported,
+            TypeError,
+            ValueError,
+        ) as exc:
+            if isinstance(stale_packed, AuthoritativePackedK3MoEFront):
+                stale_packed.detach_source_views()
+                current_signature = _source_signature(modules)
+            object.__setattr__(
+                sparse_moe,
+                "_authoritative_packed_k3_moe_front_reason",
+                str(exc),
+            )
+            object.__setattr__(
+                sparse_moe,
+                "_authoritative_packed_k3_moe_front",
+                _UNSUPPORTED,
+            )
+            object.__setattr__(
+                sparse_moe,
+                "_authoritative_packed_k3_moe_front_source_signature",
+                current_signature,
+            )
+            return None
+        object.__setattr__(
+            sparse_moe,
+            "_authoritative_packed_k3_moe_front",
+            packed,
+        )
+
+    try:
+        return packed(x)
+    except PackedMoEFrontUnsupported:
+        return None
 
 
 def maybe_packed_k3_moe_front(
@@ -270,6 +473,7 @@ def maybe_packed_k3_moe_front(
 
     if (
         not packed_moe_front_enabled()
+        or authoritative_packed_moe_front_enabled()
         or getattr(sparse_moe, "training", True)
         or x.ndim != 3
         or x.shape[0] * x.shape[1] != 1

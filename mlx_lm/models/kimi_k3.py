@@ -25,6 +25,7 @@ from .kimi_k3_fused_expert import (
 from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
 from .kimi_k3_packed_moe_front import (
     invalidate_packed_k3_moe_front,
+    maybe_authoritative_packed_k3_moe_front,
     maybe_packed_k3_moe_front,
 )
 from .kimi_linear import ShortConv1d
@@ -955,6 +956,8 @@ class KimiK3SparseMoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         optimized_front = maybe_multibank_k3_moe_front(self, x)
+        if optimized_front is None:
+            optimized_front = maybe_authoritative_packed_k3_moe_front(self, x)
         if optimized_front is None:
             optimized_front = maybe_packed_k3_moe_front(self, x)
         if optimized_front is None:
