@@ -129,6 +129,37 @@ class FusedRouterTest(unittest.TestCase):
         bias[200:225] = 2
         self.assertExact(gates, bias)
 
+    def test_normalization_matches_stock_small_row_reduction_order(self):
+        # These selected scores put the fifth and sixth normalized weights
+        # exactly on a BF16 midpoint under MLX's sequential small-row sum.
+        # A pairwise SIMD denominator rounds one FP32 ULP lower and changes
+        # both emitted BF16 weights.
+        selected_gates = mx.array(
+            [
+                3.09375,
+                3.09375,
+                3.03125,
+                2.640625,
+                2.546875,
+                2.546875,
+                2.53125,
+                2.5,
+                2.46875,
+                2.46875,
+                2.4375,
+                2.28125,
+                2.234375,
+                2.21875,
+                2.203125,
+                2.171875,
+            ],
+            dtype=mx.bfloat16,
+        )
+        gates = mx.full((1, 1, 896), -4, dtype=mx.bfloat16)
+        gates[0, 0, :16] = selected_gates
+        bias = mx.zeros((896,), dtype=mx.float32)
+        self.assertExact(gates, bias)
+
     def test_extremes_and_nan_follow_stock_argpartition(self):
         gates = mx.zeros((1, 1, 896), dtype=mx.bfloat16)
         bias = mx.zeros((896,), dtype=mx.float32)

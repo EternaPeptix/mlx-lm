@@ -116,10 +116,11 @@ for (uint slot = 0u; slot < EXPERTS_PER_THREAD; ++slot) {
 }
 
 uint selected_index = 0u;
-float selected_score = 0.0f;
 threadgroup float simdgroup_scores[SIMDGROUPS];
 threadgroup uint simdgroup_indices[SIMDGROUPS];
 threadgroup uint global_winner;
+threadgroup float selected_scores[TOP_K];
+threadgroup float denominator;
 
 for (uint rank = 0u; rank < TOP_K; ++rank) {
   float simd_winner_score = lane_score;
@@ -192,23 +193,29 @@ for (uint rank = 0u; rank < TOP_K; ++rank) {
   }
   if (thread_id == rank) {
     selected_index = winner;
-    selected_score = row_scores[winner];
+    selected_scores[rank] = row_scores[winner];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// MLX's FP32 reduction is pairwise on Metal.  A SIMD reduction over the
-// selected 16 values (with zero in the upper half) retains that association.
-const float denominator =
-    simdgroup == 0u
-        ? simd_sum(lane < TOP_K ? selected_score : 0.0f) + 1.0e-20f
-        : 1.0f;
+// MLX's small-row reduction handles this 16-element row in one thread and
+// folds the values from slot 0 through slot 15.  Preserve that exact
+// association: a SIMD reduction can differ by one FP32 ULP, which is enough
+// to cross a BF16 rounding midpoint after normalization.
+if (thread_id == 0u) {
+  float total = 0.0f;
+  for (uint rank = 0u; rank < TOP_K; ++rank) {
+    total = selected_scores[rank] + total;
+  }
+  denominator = total + 1.0e-20f;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
 
 if (thread_id < TOP_K) {
   const uint output = row * TOP_K + thread_id;
   indices[output] = selected_index;
   weights[output] =
-      static_cast<WeightT>(selected_score / denominator);
+      static_cast<WeightT>(selected_scores[thread_id] / denominator);
 }
 """
 
