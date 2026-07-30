@@ -1087,6 +1087,33 @@ class LanguageModel(nn.Module):
         return predicate
 
 
+class VocabParallelHead(nn.Module):
+    """Row-shard an untied LM head and reconstruct full-vocabulary logits.
+
+    This preserves the standard model contract for sampling and logprobs
+    while avoiding replicated projection work.  The vocabulary axis is moved
+    to the front because MLX ``all_gather`` concatenates its leading axis.
+    """
+
+    def __init__(self, lm_head: nn.Module, group: mx.distributed.Group):
+        super().__init__()
+        self.group = group
+        self.local_head = shard_linear(
+            lm_head,
+            "all-to-sharded",
+            group=group,
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        local_logits = self.local_head(x)
+        vocab_first = mx.contiguous(mx.moveaxis(local_logits, -1, 0))
+        full_vocab_first = mx.distributed.all_gather(
+            vocab_first,
+            group=self.group,
+        )
+        return mx.contiguous(mx.moveaxis(full_vocab_first, 0, -1))
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -1111,6 +1138,22 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.language_model.make_cache()
+
+    def shard_vocab_head(
+        self,
+        group: Optional[mx.distributed.Group] = None,
+    ) -> None:
+        """Shard the loaded untied LM head while preserving full logits."""
+
+        group = group or mx.distributed.init()
+        lm_head = self.language_model.lm_head
+        if (
+            group.size() == 1
+            or lm_head is None
+            or isinstance(lm_head, VocabParallelHead)
+        ):
+            return
+        self.language_model.lm_head = VocabParallelHead(lm_head, group)
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()

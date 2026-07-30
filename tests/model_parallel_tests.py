@@ -4,12 +4,55 @@ import importlib
 import unittest
 
 import mlx.core as mx
+import mlx.nn as nn
 
-import mlx_lm
+
+def _kimi_k3_config():
+    return {
+        "model_type": "kimi_k3",
+        "vocab_size": 1024,
+        "num_hidden_layers": 4,
+        "text_config": {
+            "model_type": "kimi_linear",
+            "vocab_size": 1024,
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "intermediate_size": 96,
+            "rms_norm_eps": 1e-5,
+            "hidden_act": "situ",
+            "activation_situ_beta": 4.0,
+            "activation_situ_linear_beta": 25.0,
+            "linear_attn_config": {
+                "kda_layers": [1, 2, 3],
+                "full_attn_layers": [4],
+                "num_heads": 2,
+                "head_dim": 32,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0,
+                "use_full_rank_gate": True,
+            },
+            "num_experts": 8,
+            "moe_intermediate_size": 32,
+            "q_lora_rank": 24,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "mla_use_nope": True,
+            "mla_use_output_gate": True,
+            "num_experts_per_token": 2,
+            "num_shared_experts": 1,
+            "first_k_dense_replace": 1,
+            "routed_expert_hidden_size": 32,
+            "latent_moe_use_norm": True,
+            "attn_res_block_size": 2,
+        },
+    }
 
 
 class TestModelParallel(unittest.TestCase):
-
     def test_shard(self):
         test_configs = [
             {
@@ -108,6 +151,43 @@ class TestModelParallel(unittest.TestCase):
                 model.shard()
                 out = model(x)
                 self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
+
+    def test_kimi_k3_vocab_parallel_head(self):
+        group = mx.distributed.init()
+        if group.size() == 1:
+            self.skipTest("requires mlx.launch with at least two ranks")
+
+        from mlx_lm.models import kimi_k3
+
+        for quantized in (False, True):
+            with self.subTest(quantized=quantized):
+                mx.random.seed(0)
+                args = kimi_k3.ModelArgs.from_dict(_kimi_k3_config())
+                model = kimi_k3.Model(args)
+                if quantized:
+                    nn.quantize(
+                        model.language_model.lm_head,
+                        group_size=64,
+                        bits=4,
+                    )
+                x = mx.random.randint(
+                    0,
+                    args.text_config.vocab_size,
+                    shape=(2, 4),
+                )
+                expected = model(x)
+                mx.eval(expected)
+
+                model.shard_vocab_head(group)
+                actual = model(x)
+                mx.eval(actual)
+
+                self.assertEqual(actual.shape, expected.shape)
+                self.assertTrue(mx.allclose(expected, actual, rtol=1e-3, atol=1e-3))
+
+                wrapped = model.language_model.lm_head
+                model.shard_vocab_head(group)
+                self.assertIs(model.language_model.lm_head, wrapped)
 
 
 if __name__ == "__main__":
