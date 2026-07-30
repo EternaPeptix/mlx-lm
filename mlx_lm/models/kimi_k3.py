@@ -24,6 +24,7 @@ from .kimi_k3_fused_expert import (
     maybe_fused_k3_switch_glu,
     maybe_fused_k3_switch_glu_reduce,
 )
+from .kimi_k3_fused_router import maybe_fused_k3_router
 from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
 from .kimi_k3_packed_moe_front import (
     invalidate_packed_k3_moe_front,
@@ -967,15 +968,28 @@ class KimiK3SparseMoE(nn.Module):
             y = self.routed_expert_down_proj(x) if self.latent_size is not None else x
         else:
             shared_gate, shared_up, scores, y = optimized_front
-        inds, weights = _group_expert_select(
+        routed = maybe_fused_k3_router(
             scores,
             self.e_score_correction_bias,
-            self.args.num_experts_per_token,
-            self.args.num_expert_group,
-            self.args.topk_group,
-            self.args.routed_scaling_factor,
-            self.args.moe_renormalize,
+            top_k=self.args.num_experts_per_token,
+            n_group=self.args.num_expert_group,
+            topk_group=self.args.topk_group,
+            routed_scaling_factor=self.args.routed_scaling_factor,
+            renormalize=self.args.moe_renormalize,
+            training=getattr(self, "training", True),
         )
+        if routed is None:
+            inds, weights = _group_expert_select(
+                scores,
+                self.e_score_correction_bias,
+                self.args.num_experts_per_token,
+                self.args.num_expert_group,
+                self.args.topk_group,
+                self.args.routed_scaling_factor,
+                self.args.moe_renormalize,
+            )
+        else:
+            inds, weights = routed
         fused_reduced_y = maybe_fused_k3_switch_glu_reduce(
             self.switch_mlp,
             y,
