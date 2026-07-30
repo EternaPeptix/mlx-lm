@@ -12,6 +12,7 @@ from mlx_lm.models.kimi_k3 import KimiK3SparseMoE, TextArgs
 from mlx_lm.models.kimi_k3_packed_moe_front import (
     PACKED_MOE_FRONT_ENV,
     PackedK3MoEFront,
+    _build_packed_front,
     packed_moe_front_enabled,
 )
 
@@ -52,7 +53,12 @@ class _QuantizedProjection:
         )
 
 
-def _small_sparse_moe(*, bits: int = 8) -> KimiK3SparseMoE:
+def _small_sparse_moe(
+    *,
+    bits: int = 8,
+    shared_experts: int = 1,
+    latent_size: int | None = 64,
+) -> KimiK3SparseMoE:
     args = TextArgs(
         hidden_size=128,
         intermediate_size=256,
@@ -60,9 +66,9 @@ def _small_sparse_moe(*, bits: int = 8) -> KimiK3SparseMoE:
         num_experts_per_token=2,
         num_expert_group=1,
         topk_group=1,
-        num_shared_experts=1,
+        num_shared_experts=shared_experts,
         moe_intermediate_size=64,
-        routed_expert_hidden_size=64,
+        routed_expert_hidden_size=latent_size,
         activation_situ_beta=4.0,
         activation_situ_linear_beta=25.0,
     )
@@ -157,6 +163,23 @@ class PackedK3MoEFrontTests(unittest.TestCase):
         self.assertTrue(bool(mx.array_equal(expected, actual).item()))
         self.assertFalse(hasattr(module, "_packed_k3_moe_front"))
 
+    def test_missing_shared_and_latent_projections_fall_back(self):
+        module = _small_sparse_moe(shared_experts=0, latent_size=None)
+        x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+
+        with patch.dict(os.environ, {PACKED_MOE_FRONT_ENV: "0"}):
+            packed_moe_front_enabled.cache_clear()
+            expected = module(x)
+            mx.eval(expected)
+
+        with patch.dict(os.environ, {PACKED_MOE_FRONT_ENV: "1"}):
+            packed_moe_front_enabled.cache_clear()
+            actual = module(x)
+            mx.eval(actual)
+
+        self.assertTrue(bool(mx.array_equal(expected, actual).item()))
+        self.assertFalse(hasattr(module, "_packed_k3_moe_front"))
+
     def test_source_mutation_rebuilds_hidden_packed_copy(self):
         module = _small_sparse_moe()
         x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
@@ -200,6 +223,22 @@ class PackedK3MoEFrontTests(unittest.TestCase):
 
         self.assertTrue(bool(mx.array_equal(expected, actual).item()))
         self.assertIn("8-bit", module._packed_k3_moe_front_reason)
+
+    def test_unchanged_unsupported_layout_is_not_rebuilt_each_token(self):
+        module = _small_sparse_moe(bits=4)
+        x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+
+        with patch.dict(os.environ, {PACKED_MOE_FRONT_ENV: "1"}):
+            packed_moe_front_enabled.cache_clear()
+            with patch(
+                "mlx_lm.models.kimi_k3_packed_moe_front._build_packed_front",
+                wraps=_build_packed_front,
+            ) as build:
+                first = module(x)
+                second = module(x)
+                mx.eval(first, second)
+
+        self.assertEqual(build.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -74,6 +74,25 @@ def _source_signature(modules: Sequence[Any]) -> tuple[tuple[Any, ...], ...]:
     )
 
 
+def _same_source_signature(
+    expected: tuple[tuple[Any, ...], ...],
+    actual: tuple[tuple[Any, ...], ...],
+) -> bool:
+    if len(expected) != len(actual):
+        return False
+    for expected_projection, actual_projection in zip(
+        expected, actual, strict=True
+    ):
+        if any(
+            expected_projection[index] is not actual_projection[index]
+            for index in range(5)
+        ):
+            return False
+        if expected_projection[5:] != actual_projection[5:]:
+            return False
+    return True
+
+
 class PackedK3MoEFront(nn.Module):
     """One lossless quantized projection split into the four original rows."""
 
@@ -183,18 +202,10 @@ class PackedK3MoEFront(nn.Module):
     def matches_sources(self, modules: Sequence[Any]) -> bool:
         """Return whether every authoritative projection array is unchanged."""
 
-        current = _source_signature(modules)
-        if len(current) != len(self._source_signature):
-            return False
-        for expected, actual in zip(self._source_signature, current, strict=True):
-            if any(
-                expected[index] is not actual[index]
-                for index in range(5)
-            ):
-                return False
-            if expected[5:] != actual[5:]:
-                return False
-        return True
+        return _same_source_signature(
+            self._source_signature,
+            _source_signature(modules),
+        )
 
     def __call__(self, x: mx.array) -> tuple[mx.array, ...]:
         if x.ndim != 3 or x.shape[0] * x.shape[1] != 1:
@@ -242,7 +253,11 @@ def _build_packed_front(sparse_moe: Any) -> PackedK3MoEFront:
 def invalidate_packed_k3_moe_front(sparse_moe: Any) -> None:
     """Drop hidden packed state before sharding or other weight mutation."""
 
-    for name in ("_packed_k3_moe_front", "_packed_k3_moe_front_reason"):
+    for name in (
+        "_packed_k3_moe_front",
+        "_packed_k3_moe_front_reason",
+        "_packed_k3_moe_front_source_signature",
+    ):
         if hasattr(sparse_moe, name):
             object.__delattr__(sparse_moe, name)
 
@@ -261,17 +276,30 @@ def maybe_packed_k3_moe_front(
     ):
         return None
 
+    shared = getattr(sparse_moe, "shared_experts", None)
+    routed_down = getattr(sparse_moe, "routed_expert_down_proj", None)
+    if shared is None or routed_down is None:
+        return None
     packed = getattr(sparse_moe, "_packed_k3_moe_front", None)
+    modules = (
+        shared.gate_proj,
+        shared.up_proj,
+        sparse_moe.gate,
+        routed_down,
+    )
+    current_signature = _source_signature(modules)
     if packed is _UNSUPPORTED:
+        unsupported_signature = getattr(
+            sparse_moe,
+            "_packed_k3_moe_front_source_signature",
+            (),
+        )
+        if _same_source_signature(unsupported_signature, current_signature):
+            return None
+        invalidate_packed_k3_moe_front(sparse_moe)
         packed = None
     elif packed is not None:
         try:
-            modules = (
-                sparse_moe.shared_experts.gate_proj,
-                sparse_moe.shared_experts.up_proj,
-                sparse_moe.gate,
-                sparse_moe.routed_expert_down_proj,
-            )
             if not packed.matches_sources(modules):
                 invalidate_packed_k3_moe_front(sparse_moe)
                 packed = None
@@ -289,6 +317,11 @@ def maybe_packed_k3_moe_front(
         ) as exc:
             object.__setattr__(sparse_moe, "_packed_k3_moe_front_reason", str(exc))
             object.__setattr__(sparse_moe, "_packed_k3_moe_front", _UNSUPPORTED)
+            object.__setattr__(
+                sparse_moe,
+                "_packed_k3_moe_front_source_signature",
+                current_signature,
+            )
             return None
         # Keep the optimization out of the model parameter tree: the original
         # modules remain authoritative for checkpoint save/load and prefill.

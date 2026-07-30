@@ -84,8 +84,8 @@ verification gate remains failed.
 The bisection selector passed 13 focused single-rank Metal tests (with one
 expected TP2 skip) and a local two-rank exact logits/cache comparison for full
 and mixed schedules. After integrating MoE-front packing, the combined branch
-completed 60 focused Metal/unit tests across packed/fused experts, compiled
+completed 62 focused Metal/unit tests across packed/fused experts, compiled
 decode, speculative cache transactions, generation lifecycle, and prompt
-lookup (59 passed, one expected TP2 skip), plus all 22 prompt-cache
+lookup (61 passed, one expected TP2 skip), plus all 22 prompt-cache
 regressions. Full-model strict-v3,
 long-memory, acceptance-rate, and live-cluster speed gates remain outstanding.
