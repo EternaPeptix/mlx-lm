@@ -22,6 +22,7 @@ from .kimi_k3_fused_expert import (
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
 )
+from .kimi_k3_packed_moe_front import maybe_packed_k3_moe_front
 from .kimi_linear import ShortConv1d
 from .mla import MultiLinear
 from .switch_layers import SwitchGLU
@@ -742,7 +743,12 @@ class KimiK3SparseMoE(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        scores = self.gate(x)
+        packed_front = maybe_packed_k3_moe_front(self, x)
+        if packed_front is None:
+            scores = self.gate(x)
+            y = self.routed_expert_down_proj(x) if self.latent_size is not None else x
+        else:
+            shared_gate, shared_up, scores, y = packed_front
         inds, weights = _group_expert_select(
             scores,
             self.e_score_correction_bias,
@@ -752,11 +758,22 @@ class KimiK3SparseMoE(nn.Module):
             self.args.routed_scaling_factor,
             self.args.moe_renormalize,
         )
-        y = self.routed_expert_down_proj(x) if self.latent_size is not None else x
         fused_y = maybe_fused_k3_switch_glu(self.switch_mlp, y, inds)
         y = self.switch_mlp(y, inds) if fused_y is None else fused_y
         y = (y * weights[..., None]).sum(axis=-2)
-        shared = self.shared_experts(x) if self.shared_experts is not None else None
+        if self.shared_experts is None:
+            shared = None
+        elif packed_front is None:
+            shared = self.shared_experts(x)
+        else:
+            shared = self.shared_experts.down_proj(
+                _situ(
+                    shared_up,
+                    shared_gate,
+                    self.shared_experts.beta,
+                    self.shared_experts.linear_beta,
+                )
+            )
         if self.sharding_group is not None:
             if shared is not None:
                 split = y.shape[-1]
