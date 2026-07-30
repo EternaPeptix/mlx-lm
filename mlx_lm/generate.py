@@ -10,7 +10,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
-from functools import partial
 from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
@@ -1089,6 +1088,11 @@ def stream_generate(
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        # ``async_lookahead`` controls the ordinary one-token generator.
+        # Speculative generation manages its own target-round submission and
+        # transaction lifecycle, so forwarding this otherwise valid
+        # stream_generate option would fail at the speculative boundary.
+        kwargs.pop("async_lookahead", None)
         token_generator = speculative_generate_step(
             prompt,
             model,
@@ -1626,7 +1630,7 @@ class PromptProcessingBatch:
         # Calculate if we need to pad
         lengths = [len(p) for p in tokens]
         max_length = max(lengths)
-        padding = [max_length - l for l in lengths]
+        padding = [max_length - length for length in lengths]
         max_padding = max(padding)
 
         # Prepare the caches and inputs. Right pad if needed otherwise just

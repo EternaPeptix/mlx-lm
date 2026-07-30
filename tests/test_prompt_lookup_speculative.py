@@ -291,6 +291,7 @@ class PromptLookupGenerationTest(unittest.TestCase):
                 prompt_lookup_num_tokens=2,
                 speculative_round_callback=stats.append,
                 prompt_cache=[_FakeCache()],
+                async_lookahead=True,
             )
         )
 
