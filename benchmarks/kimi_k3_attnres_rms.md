@@ -61,8 +61,19 @@ Peak and active allocation above resident inputs are unchanged at 0.013672
 MiB because MLX already donates the stock intermediate buffer to RMSNorm.
 This is a latency/traffic optimization, not a memory-capacity optimization.
 
-If the isolated saving transferred perfectly to the current 13.2985 tok/s
-TP2 result, it would imply roughly 13.675 tok/s. That is only an upper-bound
-projection: the real async/JACCL schedule can hide some dispatch cost, so a
-two-rank completion-hash and throughput A/B is still required before enabling
-the flag in deployment.
+## Live TP2 result
+
+The fusion passed a real-weight, two-rank M3 Ultra TP2 gate on top of the
+exact fused-down stack. Five canonical
+575-prompt-token/128-generation-token repetitions retained completion digest
+`c84d0f0464acc5f0226e5a9686e2bb8ed4b243064dfafb99d7aa7fc5cd5b0c71`
+and improved median decode from `13.5835` to `13.6714` tok/s (`+0.65%`).
+This is a `0.473 ms/token` live saving, showing that the asynchronous/JACCL
+schedule hides most of the isolated `2.070 ms/token` projection.
+
+Three 1,067-token coding-prompt repetitions retained digest
+`9936f17d98ac76b2a3ad3ab768e78fae5379259da0b745881f06e7cf9c7a7959`
+and improved median decode from `13.5102` to `13.6354` tok/s (`+0.93%`).
+Peak memory remained approximately `414 GB` per rank for the canonical case.
+The path remains opt-in because its supported decode geometry is deliberately
+narrow.
