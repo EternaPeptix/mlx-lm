@@ -2,9 +2,9 @@
 
 This branch is one part of a coordinated public experiment:
 
-- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack-v4)
-- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v4)
-- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v4)
+- [EXO](https://github.com/EternaPeptix/exo/tree/experiment/kimi-k3-uvmax-optimization-stack-v6)
+- [MLX-LM](https://github.com/EternaPeptix/mlx-lm/tree/experiment/kimi-k3-uvmax-optimization-stack-v6)
+- [MLX](https://github.com/EternaPeptix/mlx/tree/experiment/kimi-k3-uvmax-optimization-stack-v6)
 
 It contains the Kimi K3 support and TP2 changes used to run
 `kernelpool/Kimi-K3-2bit-UVMAX` across two 512 GB M3 Ultra systems, including:
@@ -21,6 +21,15 @@ It contains the Kimi K3 support and TP2 changes used to run
 - opt-in zero-copy packs for KDA's same-input skinny and wide projections;
 - an opt-in exact routed-up/shared/residual output fusion for TP2 decode; and
 - focused Metal and distributed tests for those paths.
+
+The v6 checkpoint keeps the benchmark-accepted runtime code at
+`95fc8ad485e8d2568eda4e468c4169f6a556919a`; later commits on this branch add
+only sanitized benchmark documentation. The default-off speculative-KDA
+rewrite and blockwise/tiled dual-source MLA prototypes remain on separate
+research branches because none has passed the strict real-model TP2 promotion
+gate. The blockwise scalar MLA prototype bounds score memory but is slower
+than the accepted expanded path, so it is capacity evidence rather than a
+speed candidate.
 
 ## Feature flags
 
@@ -120,7 +129,7 @@ The matched full-model TP2 prefill A/B reached `147.4168` prompt tok/s versus
 and peak memory was unchanged within measurement noise.
 
 The sanitized per-repetition record is published with the coordinated
-[EXO branch](https://github.com/EternaPeptix/exo/blob/experiment/kimi-k3-uvmax-optimization-stack-v4/docs/kimi_k3_tp2_benchmark_20260730.json).
+[EXO branch](https://github.com/EternaPeptix/exo/blob/experiment/kimi-k3-uvmax-optimization-stack-v6/docs/kimi_k3_tp2_benchmark_20260730.json).
 
 On a matched three-repetition canonical TP2 screening run, the feature-off
 reference produced a median `12.0465` decode tok/s. The `laguna8` hidden-state
@@ -169,10 +178,13 @@ lookup index from the full logical token history without re-prefilling it; the
 history must end with the explicit prompt suffix. Cache-only prefixes remain
 invisible unless the caller supplies that history.
 
-The EXO repository contains the strict target-verification and divergence
-diagnostic tools. A sampled width-2 run kept the same top-1 continuation but
-diverged numerically in the first recurrent KDA layer, so the strict
-verification gate remains failed.
+The EXO repository contains strict target-verification and divergence
+diagnostic tools. Width 1 remains exact. Widths 2 and above retained the
+sampled top-1 continuation but failed the numerical/cache gate. The
+real-checkpoint layer-0 localizer found KDA attention exact when both paths
+received the same prepared input, narrowing the first unresolved divergence
+to the surrounding decoder-layer preparation/wrapper path. The strict gate
+therefore remains failed.
 
 The bisection selector passed 13 focused single-rank Metal tests (with one
 expected TP2 skip) and a local two-rank exact logits/cache comparison for full
@@ -180,5 +192,5 @@ and mixed schedules. After integrating MoE-front packing, the combined branch
 completed 62 focused Metal/unit tests across packed/fused experts, compiled
 decode, speculative cache transactions, generation lifecycle, and prompt
 lookup (61 passed, one expected TP2 skip), plus all 22 prompt-cache
-regressions. Full-model strict-v3,
-long-memory, acceptance-rate, and live-cluster speed gates remain outstanding.
+regressions. Full-model strict-v3 multi-token equivalence remains failed;
+long-memory and live prompt-lookup acceptance/speed gates remain outstanding.
