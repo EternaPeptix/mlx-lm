@@ -170,8 +170,10 @@ _gated_delta_kernel_vec_masked_history = _make_gated_delta_kernel(
 
 
 _EXPERIMENTAL_KDA_ROW_PREFILL_ENV = "MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL"
+_EXPERIMENTAL_KDA_ROW_DECODE_ENV = "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE"
 _EXPERIMENTAL_KDA_ROW_PREFILL_MIN_TOKENS = 128
 _EXPERIMENTAL_KDA_ROWS_PER_SIMD = 4
+_EXPERIMENTAL_KDA_DECODE_ROWS_PER_SIMD = 2
 
 
 def _make_experimental_kda_row_prefill_kernel():
@@ -303,6 +305,48 @@ def experimental_kda_row_prefill_enabled() -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def experimental_kda_row_decode_enabled() -> bool:
+    """Return whether the default-off row-tiled decode path was requested."""
+
+    value = os.environ.get(_EXPERIMENTAL_KDA_ROW_DECODE_ENV, "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def experimental_kda_row_eligible(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    state: mx.array,
+    mask: Optional[mx.array] = None,
+    return_state_history: bool = False,
+) -> bool:
+    """Check the narrow Kimi K3 row-tiled prefill or decode contract."""
+
+    tokens = q.shape[1] if q.ndim == 4 else 0
+    phase_enabled = (
+        experimental_kda_row_prefill_enabled()
+        and tokens >= _EXPERIMENTAL_KDA_ROW_PREFILL_MIN_TOKENS
+    ) or (experimental_kda_row_decode_enabled() and tokens == 1)
+    return (
+        phase_enabled
+        and _experimental_kda_row_prefill_kernel is not None
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+        and mask is None
+        and not return_state_history
+        and g.ndim == 4
+        and q.ndim == 4
+        and k.ndim == 4
+        and v.ndim == 4
+        and q.shape[-1] == 128
+        and k.shape[-1] == 128
+        and v.shape[-1] == 128
+        and v.shape[2] % k.shape[2] == 0
+        and state.dtype == mx.float32
+    )
+
+
 def experimental_kda_row_prefill_eligible(
     q: mx.array,
     k: mx.array,
@@ -315,22 +359,16 @@ def experimental_kda_row_prefill_eligible(
     """Check the deliberately narrow Kimi K3 prefill contract."""
 
     return (
-        experimental_kda_row_prefill_enabled()
-        and _experimental_kda_row_prefill_kernel is not None
-        and mx.default_device() == mx.gpu
-        and mx.metal.is_available()
-        and mask is None
-        and not return_state_history
-        and g.ndim == 4
-        and q.ndim == 4
-        and k.ndim == 4
-        and v.ndim == 4
+        experimental_kda_row_eligible(
+            q,
+            k,
+            v,
+            g,
+            state,
+            mask,
+            return_state_history,
+        )
         and q.shape[1] >= _EXPERIMENTAL_KDA_ROW_PREFILL_MIN_TOKENS
-        and q.shape[-1] == 128
-        and k.shape[-1] == 128
-        and v.shape[-1] == 128
-        and v.shape[2] % k.shape[2] == 0
-        and state.dtype == mx.float32
     )
 
 
@@ -572,7 +610,7 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if use_kernel and experimental_kda_row_prefill_eligible(
+    if use_kernel and experimental_kda_row_eligible(
         q,
         k,
         v,
@@ -588,6 +626,11 @@ def gated_delta_update(
             g,
             beta,
             state,
+            rows_per_simd=(
+                _EXPERIMENTAL_KDA_DECODE_ROWS_PER_SIMD
+                if q.shape[1] == 1
+                else _EXPERIMENTAL_KDA_ROWS_PER_SIMD
+            ),
         )
 
     if (
