@@ -56,6 +56,56 @@ class _Projection:
         projection.biases = mx.zeros_like(projection.scales)
         return projection
 
+    @classmethod
+    def packed_nonuniform(
+        cls,
+        *,
+        experts: int,
+        input_width: int,
+        output_width: int,
+        salt: int,
+    ):
+        """Build exact packed tensors whose every addressing axis matters."""
+
+        projection = cls.__new__(cls)
+        expert = mx.arange(experts, dtype=mx.uint32).reshape(experts, 1, 1)
+        output = mx.arange(output_width, dtype=mx.uint32).reshape(
+            1, output_width, 1
+        )
+        packed_k = mx.arange(input_width // 16, dtype=mx.uint32).reshape(
+            1, 1, input_width // 16
+        )
+        projection.weight = mx.bitwise_xor(
+            mx.bitwise_xor(
+                mx.array(salt, dtype=mx.uint32),
+                expert * mx.array(0x9E3779B9, dtype=mx.uint32),
+            ),
+            mx.bitwise_xor(
+                output * mx.array(0x85EBCA6B, dtype=mx.uint32),
+                packed_k * mx.array(0xC2B2AE35, dtype=mx.uint32),
+            ),
+        )
+
+        group_k = mx.arange(input_width // 128, dtype=mx.uint32).reshape(
+            1, 1, input_width // 128
+        )
+        metadata_code = (
+            expert * mx.array(17, dtype=mx.uint32)
+            + output * mx.array(5, dtype=mx.uint32)
+            + group_k * mx.array(3, dtype=mx.uint32)
+            + mx.array(salt & 0xFF, dtype=mx.uint32)
+        )
+        projection.scales = (
+            mx.array(1 / 128, dtype=mx.float32)
+            + (metadata_code % 13).astype(mx.float32)
+            * mx.array(1 / 4096, dtype=mx.float32)
+        ).astype(mx.bfloat16)
+        projection.biases = (
+            ((metadata_code % 17).astype(mx.float32) - 8)
+            * mx.array(1 / 4096, dtype=mx.float32)
+        ).astype(mx.bfloat16)
+        return projection
+
     def __contains__(self, name):
         return False
 
@@ -111,6 +161,31 @@ class _Switch:
             input_width=1536,
             output_width=3584,
             packed_value=0x24681357,
+        )
+        return switch
+
+    @classmethod
+    def bounded_tp2_geometry_nonuniform(cls):
+        """Use K3 TP2 dimensions with address-sensitive packed parameters."""
+
+        switch = cls.__new__(cls)
+        switch.gate_proj = _Projection.packed_nonuniform(
+            experts=16,
+            input_width=3584,
+            output_width=1536,
+            salt=0x13579BDF,
+        )
+        switch.up_proj = _Projection.packed_nonuniform(
+            experts=16,
+            input_width=3584,
+            output_width=1536,
+            salt=0x2468ACE0,
+        )
+        switch.down_proj = _Projection.packed_nonuniform(
+            experts=16,
+            input_width=1536,
+            output_width=3584,
+            salt=0x55AA55AA,
         )
         return switch
 
@@ -230,6 +305,35 @@ class IntegrationTest(unittest.TestCase):
         mx.eval(reference, candidate)
         self.assertEqual(candidate.shape, (1, width, 3584))
         self.assertTrue(bool(mx.all(reference == candidate).item()))
+
+    def test_width_two_full_fused_expert_nonuniform_packing_is_bit_exact(self):
+        os.environ[FUSED_EXPERT_WIDTH2_ENV] = "1"
+        fused_k3_expert_width2_enabled.cache_clear()
+        mx.random.seed(20260801)
+        switch = _Switch.bounded_tp2_geometry_nonuniform()
+        width = 2
+        x = mx.random.normal((1, width, 3584), dtype=mx.bfloat16)
+        base = mx.arange(16, dtype=mx.uint32)
+        indices = mx.stack(
+            [(base * 5 + shift * 3) % 16 for shift in range(width)]
+        )[None]
+        router_weights = mx.random.uniform(
+            shape=(1, width, 16),
+            dtype=mx.bfloat16,
+        )
+        reference = (
+            switch.stock(x, indices) * router_weights[..., None]
+        ).sum(axis=-2)
+        candidate = maybe_fused_k3_switch_glu_reduce(
+            switch,
+            x,
+            indices,
+            router_weights,
+        )
+        self.assertIsNotNone(candidate)
+        mx.eval(reference, candidate)
+        self.assertEqual(candidate.shape, (1, width, 3584))
+        self.assertTrue(bool(mx.array_equal(reference, candidate).item()))
 
     def test_width_two_has_an_independent_default_off_flag(self):
         switch = _Switch.bounded_tp2_geometry()

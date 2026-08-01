@@ -234,8 +234,20 @@ class TestModelParallel(unittest.TestCase):
                 if not quantized:
                     wrapped.local_head.weight = mx.zeros_like(wrapped.local_head.weight)
                     tied = model.vocab_parallel_greedy(x)
-                    mx.eval(tied)
+                    tied_verify = model.forward_with_aux_hidden_states_greedy(
+                        x,
+                        cache=None,
+                        layer_ids=(0, 2),
+                        banned_token_ids=(0,),
+                    )
+                    mx.eval(tied, tied_verify.tokens)
                     self.assertEqual(tied.tolist(), [0, 0])
+                    self.assertTrue(
+                        mx.array_equal(
+                            tied_verify.tokens,
+                            mx.ones(x.shape, dtype=mx.uint32),
+                        )
+                    )
 
     def test_kimi_k3_speculative_cache_tp2_width_two_and_eight(self):
         group = mx.distributed.init()
