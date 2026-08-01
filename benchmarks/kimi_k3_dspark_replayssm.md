@@ -2,31 +2,65 @@
 
 Date: 2026-08-01
 
-Status: local prototype only. No model weights were downloaded and no EXO or
-Mac inference process was changed.
+Status: local, default-off implementation slice. This branch did not change an
+EXO or Mac inference process and has not run the production checkpoint.
 
 ## Scope
 
-This branch adds the smallest target-side primitives needed to evaluate the
-public `RadixArk/Kimi-K3-DSpark` checkpoint at an initial verification width of
-three:
+This branch adds the target- and draft-side primitives needed to evaluate the
+public `RadixArk/Kimi-K3-DSpark` checkpoint:
 
 - post-layer target hidden-state taps at layers `7, 23, 51, 67, 83`;
 - a strict contract for the released 2,249,289,601-parameter BF16 drafter;
+- the five-layer Qwen3 GQA backbone, vanilla rank-256 Markov head, and
+  confidence head with exact checkpoint key names;
+- a pinned local-file loader with key, shape, dtype, element-count, byte-size,
+  and SHA256 attestation;
+- target embedding and vocabulary-head binding by reference, so the drafter
+  does not own duplicate copies;
+- an isolated greedy proposer that leaves target verification and acceptance
+  to its caller;
 - replicated-drafter placement as the only accepted TP2 placement; and
 - an opt-in exact ReplaySSM rollback path for Kimi K3 KDA state.
 
-It does not yet implement the DSpark model, weight loader, proposer, sampler,
-or EXO rank coordination. The existing full-state-history rollback remains the
-default. ReplaySSM is enabled only with:
+The checkpoint's `block_size=7` is model-native gamma 7: the drafter runs a
+seven-position block (anchor plus six mask tokens), produces seven proposals,
+and the target verifies an eight-token window (anchor plus seven proposals).
+Verification width three is retained only as an explicit screening override;
+it still runs the full seven-position bidirectional draft backbone and projects
+only its first two proposal positions. It is not presented as checkpoint-native
+behavior.
+
+The proposer, ReplaySSM, and optional stacked context-KV projection are all
+local and default off:
 
 ```text
+MLX_LM_KIMI_K3_DSPARK_PROPOSER=1
 MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE=1
+MLX_LM_KIMI_K3_DSPARK_STACKED_CONTEXT_KV=1
 ```
 
-Any value other than `0` or `1` fails closed. The existing transaction guards
+Any value other than `0` or `1` fails closed. The stacked projection implements
+the SGLang optimization of concatenating all five layers' target K/V weights,
+performing one projection, then taking per-layer views. The per-layer path is
+the default correctness reference. The existing target transaction guards
 continue to require batch one, populated unpadded caches, Metal, no pipeline
 parallelism, and verification width 2 through 8.
+
+The loader API is:
+
+```python
+drafter = load_kimi_k3_dspark(
+    checkpoint_dir,
+    target_model,
+    verify_weights_sha256=True,
+)
+proposer = KimiK3DSparkProposer(drafter)  # native gamma 7 / verify width 8
+```
+
+The loader reads only `config.json` and `model.safetensors`; it does not import
+or execute remote checkpoint Python. The two borrowed target modules remain
+excluded from the drafter's MLX parameter tree.
 
 ## Exact ReplaySSM contract
 
@@ -49,8 +83,8 @@ accepted-prefix lengths 1, 2, and 3 relative to the existing full-history path.
 ## Capacity model
 
 For the production TP2 KDA geometry (69 KDA layers, 48 global heads, head
-dimension 128, convolution kernel 4, verification width 3), the logical
-transaction-history payload is:
+dimension 128, convolution kernel 4) under the explicit verification-width-3
+screening scenario, the logical transaction-history payload is:
 
 | History | Bytes per TP rank | MiB per TP rank |
 | --- | ---: | ---: |
@@ -79,16 +113,19 @@ making a throughput claim.
 
 ## Verification
 
-Focused tests:
+Focused DSpark contract/model, target-cache, and ReplaySSM capacity tests:
 
 ```text
-30 passed, 17 subtests passed
+40 passed, 20 subtests passed
 ```
 
-The broader Kimi K3 plus speculative-generation suite passed 145 tests (with
-one skip) and had one unrelated fused SwitchGLU equality failure. The same
-isolated failure reproduces on the untouched v6 base, so it is not introduced
-by this branch.
+They cover the complete 62-key, 2,249,289,601-element production inventory;
+shape/dtype/key failures; no-copy target-module binding; the reference and
+stacked context-KV paths; strict feature gates; native gamma 7 versus explicit
+width-3 screening; and a synthetic end-to-end Markov proposal. The broader
+Kimi K3 plus speculative-generation suite passed 154 tests, with one skip and
+119 subtests. The known fused SwitchGLU equality test was excluded; its isolated
+failure reproduces on the untouched v6 base and is unrelated to this branch.
 
 ## Pinned primary sources
 
@@ -101,23 +138,31 @@ by this branch.
   `93098e69c05de76ffb72e63ba2ba670a9e9addb65819f76a211f2cbdf5bf884a`
 - SGLang DSpark config source SHA256:
   `a4aa2d41bd4144024afadbc720ed712f24ec34b6b95732bd5e43abe3f0d8ea7c`
-- `RadixArk/Kimi-K3-DSpark` config SHA256:
-  `410dd228c75ff91b57af8a1581d44d2ea096d5604f0d37fbd400470e90d961d3`
+- `RadixArk/Kimi-K3-DSpark` revision:
+  `eb03982e58d4fb79bcfc099e902158f562e2e27b`
+- Raw `config.json`: 1,288 bytes, SHA256
+  `6aed20890d95cd69cf2ec006d1f30506fbd4f3091d44ca8e8b93e9fc7d50928f`
+- Raw `model.safetensors`: 4,498,585,858 bytes, SHA256
+  `29df0e8eafb81909f785df55cb352b90d6a1500c609b1d60526c1a62b4d42495`
+- Pinned snapshot: 6 files, 4,498,617,103 bytes.
 
 The source model reports an average accepted length around 2.7 on its chat
 evaluation, while its public checkpoint card reports higher full-block
-acceptance on some workloads. Those CUDA results motivate width three; they do
-not establish MLX acceptance or speed.
+acceptance on some workloads. Those CUDA results make width three useful as a
+screening experiment; they do not change the released gamma-7 contract or
+establish MLX acceptance or speed.
 
 ## Remaining end-to-end work
 
-1. Port the five-layer GQA DSpark architecture and its exact tensor-name loader.
-2. Bind target embedding and vocabulary head, because the checkpoint owns
-   neither.
-3. Replicate the draft on both target TP ranks and make proposal/acceptance
+1. Replicate the draft on both target TP ranks and make proposal/acceptance
    decisions deterministic on both ranks.
-4. Join the hidden taps, width-three target transaction, and DSpark proposer to
-   the generation loop behind one default-off feature gate.
-5. Prove 256+ greedy tokens against baseline, then measure acceptance, target
+2. Join target hidden taps, incremental context projection, the native
+   width-eight target transaction, DSpark proposals, prefix verification,
+   ReplaySSM commit, and target bonus emission in the generation loop behind a
+   default-off feature gate.
+3. Keep all TP ranks in lockstep for proposal IDs, accepted-prefix length, and
+   target-cache resolution; fail closed on divergence.
+4. Prove 256+ greedy tokens against baseline, then measure acceptance, target
    step latency, draft latency, ReplaySSM latency, peak memory, and effective
-   token/s on the real TP2 checkpoint.
+   token/s on the real TP2 checkpoint. Compare native width eight with the
+   explicitly labeled width-three screening override.

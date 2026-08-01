@@ -6,6 +6,7 @@ import unittest
 from mlx_lm.models.kimi_k3 import _validate_aux_hidden_state_layer_ids
 from mlx_lm.models.kimi_k3_dspark import (
     KIMI_K3_DSPARK_INITIAL_VERIFY_WIDTH,
+    KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH,
     RADIXARK_KIMI_K3_DSPARK_PARAMETERS,
     RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS,
     KimiK3DSparkContract,
@@ -49,11 +50,11 @@ def _official_config():
 
 
 class KimiK3DSparkContractTest(unittest.TestCase):
-    def test_official_contract_uses_replicated_width_three_draft(self):
+    def test_official_contract_uses_replicated_native_gamma_seven(self):
         contract = KimiK3DSparkContract.from_config(_official_config())
 
         self.assertEqual(contract.verify_width, KIMI_K3_DSPARK_INITIAL_VERIFY_WIDTH)
-        self.assertEqual(contract.num_draft_tokens, 2)
+        self.assertEqual(contract.num_draft_tokens, 7)
         self.assertEqual(contract.maximum_verify_width, 8)
         self.assertEqual(
             contract.target_layer_ids, RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS
@@ -62,6 +63,23 @@ class KimiK3DSparkContractTest(unittest.TestCase):
         self.assertEqual(contract.placement, "replicated")
         self.assertFalse(contract.owns_embedding)
         self.assertFalse(contract.owns_lm_head)
+        self.assertFalse(contract.screening_override)
+
+    def test_width_three_requires_explicit_screening_override(self):
+        with self.assertRaisesRegex(ValueError, "screening override"):
+            KimiK3DSparkContract.from_config(
+                _official_config(),
+                verify_width=KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH,
+            )
+
+        contract = KimiK3DSparkContract.from_config(
+            _official_config(),
+            verify_width=KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH,
+            screening_override=True,
+        )
+        self.assertEqual(contract.verify_width, 3)
+        self.assertEqual(contract.num_draft_tokens, 2)
+        self.assertTrue(contract.screening_override)
 
     def test_checkpoint_shape_mismatch_fails_closed(self):
         for field, invalid in (
@@ -101,12 +119,23 @@ class KimiK3DSparkContractTest(unittest.TestCase):
 
     def test_width_and_placement_are_bounded(self):
         for width in (1, 9):
-            with self.subTest(width=width):
-                with self.assertRaisesRegex(ValueError, "verify width"):
-                    KimiK3DSparkContract.from_config(
-                        _official_config(),
-                        verify_width=width,
-                    )
+            with (
+                self.subTest(width=width),
+                self.assertRaisesRegex(ValueError, "verify width"),
+            ):
+                KimiK3DSparkContract.from_config(
+                    _official_config(),
+                    verify_width=width,
+                )
+        for width in (2, 4, 7):
+            with (
+                self.subTest(width=width),
+                self.assertRaisesRegex(ValueError, "screening override"),
+            ):
+                KimiK3DSparkContract.from_config(
+                    _official_config(),
+                    verify_width=width,
+                )
         with self.assertRaisesRegex(ValueError, "replicated"):
             KimiK3DSparkContract.from_config(
                 _official_config(),
@@ -122,9 +151,11 @@ class KimiK3DSparkContractTest(unittest.TestCase):
             RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS,
         )
         for layer_ids in ((7, 7), (23, 7), (-1, 7), (7, 93)):
-            with self.subTest(layer_ids=layer_ids):
-                with self.assertRaises((TypeError, ValueError)):
-                    _validate_aux_hidden_state_layer_ids(layer_ids, 93)
+            with (
+                self.subTest(layer_ids=layer_ids),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                _validate_aux_hidden_state_layer_ids(layer_ids, 93)
 
 
 if __name__ == "__main__":
