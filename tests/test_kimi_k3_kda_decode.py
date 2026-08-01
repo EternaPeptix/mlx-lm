@@ -6,16 +6,41 @@ from unittest import mock
 
 import mlx.core as mx
 
-import mlx_lm.models.gated_delta as gated_delta
+from mlx_lm.models import gated_delta
 from mlx_lm.models.gated_delta import (
     _EXPERIMENTAL_KDA_ROW_DECODE_ENV,
+    _EXPERIMENTAL_KDA_ROW_DECODE_ROWS_ENV,
     _EXPERIMENTAL_KDA_ROW_PREFILL_ENV,
     experimental_kda_row_decode_enabled,
+    experimental_kda_row_decode_rows,
     experimental_kda_row_eligible,
     experimental_kda_row_prefill_kernel,
     gated_delta_kernel,
     gated_delta_update,
 )
+
+
+class KimiK3KDADecodeConfigTest(unittest.TestCase):
+    def test_default_and_explicit_rows(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(experimental_kda_row_decode_enabled())
+            self.assertEqual(experimental_kda_row_decode_rows(), 2)
+        for rows in (1, 2, 4, 8):
+            with self.subTest(rows=rows), mock.patch.dict(
+                os.environ,
+                {_EXPERIMENTAL_KDA_ROW_DECODE_ROWS_ENV: str(rows)},
+                clear=True,
+            ):
+                self.assertEqual(experimental_kda_row_decode_rows(), rows)
+
+    def test_invalid_rows_fail_closed(self):
+        for value in ("", "0", "3", "16", "four"):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ,
+                {_EXPERIMENTAL_KDA_ROW_DECODE_ROWS_ENV: value},
+                clear=True,
+            ), self.assertRaisesRegex(ValueError, "must be 1, 2, 4, or 8"):
+                experimental_kda_row_decode_rows()
 
 
 @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
@@ -88,6 +113,17 @@ class KimiK3KDADecodeTest(unittest.TestCase):
             self.assertTrue(bool(mx.all(reference[0] == candidate[0]).item()))
             self.assertTrue(bool(mx.all(reference[1] == candidate[1]).item()))
 
+    def test_actual_tp2_geometry_is_bit_exact(self):
+        inputs = self._inputs(key_heads=48, value_heads=48)
+        reference = gated_delta_kernel(*inputs)
+        candidate = experimental_kda_row_prefill_kernel(
+            *inputs,
+            rows_per_simd=4,
+        )
+        mx.eval(*reference, *candidate)
+        self.assertTrue(bool(mx.all(reference[0] == candidate[0]).item()))
+        self.assertTrue(bool(mx.all(reference[1] == candidate[1]).item()))
+
     def test_opt_in_update_dispatch_is_bit_exact(self):
         q, k, v, _, _, state = self._inputs()
         batch, tokens, heads, dim = v.shape
@@ -110,7 +146,10 @@ class KimiK3KDADecodeTest(unittest.TestCase):
             )
         with mock.patch.dict(
             os.environ,
-            {_EXPERIMENTAL_KDA_ROW_DECODE_ENV: "1"},
+            {
+                _EXPERIMENTAL_KDA_ROW_DECODE_ENV: "1",
+                _EXPERIMENTAL_KDA_ROW_DECODE_ROWS_ENV: "4",
+            },
             clear=True,
         ), mock.patch.object(
             gated_delta,
@@ -128,7 +167,7 @@ class KimiK3KDADecodeTest(unittest.TestCase):
                 state,
                 lower_bound=-5.0,
             )
-            self.assertEqual(row_kernel.call_args.kwargs["rows_per_simd"], 2)
+            self.assertEqual(row_kernel.call_args.kwargs["rows_per_simd"], 4)
 
         mx.eval(*reference, *candidate)
         self.assertTrue(bool(mx.all(reference[0] == candidate[0]).item()))

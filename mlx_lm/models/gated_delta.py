@@ -171,6 +171,7 @@ _gated_delta_kernel_vec_masked_history = _make_gated_delta_kernel(
 
 _EXPERIMENTAL_KDA_ROW_PREFILL_ENV = "MLX_LM_EXPERIMENTAL_KDA_ROW_PREFILL"
 _EXPERIMENTAL_KDA_ROW_DECODE_ENV = "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE"
+_EXPERIMENTAL_KDA_ROW_DECODE_ROWS_ENV = "MLX_LM_EXPERIMENTAL_KDA_ROW_DECODE_ROWS"
 _EXPERIMENTAL_KDA_ROW_PREFILL_MIN_TOKENS = 128
 _EXPERIMENTAL_KDA_ROWS_PER_SIMD = 4
 _EXPERIMENTAL_KDA_DECODE_ROWS_PER_SIMD = 2
@@ -310,6 +311,26 @@ def experimental_kda_row_decode_enabled() -> bool:
 
     value = os.environ.get(_EXPERIMENTAL_KDA_ROW_DECODE_ENV, "")
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def experimental_kda_row_decode_rows() -> int:
+    """Return the explicitly selected row tile for an Ultra tuning sweep."""
+
+    value = os.environ.get(
+        _EXPERIMENTAL_KDA_ROW_DECODE_ROWS_ENV,
+        str(_EXPERIMENTAL_KDA_DECODE_ROWS_PER_SIMD),
+    )
+    try:
+        rows = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{_EXPERIMENTAL_KDA_ROW_DECODE_ROWS_ENV} must be 1, 2, 4, or 8"
+        ) from error
+    if rows not in (1, 2, 4, 8):
+        raise ValueError(
+            f"{_EXPERIMENTAL_KDA_ROW_DECODE_ROWS_ENV} must be 1, 2, 4, or 8"
+        )
+    return rows
 
 
 def experimental_kda_row_eligible(
@@ -627,7 +648,7 @@ def gated_delta_update(
             beta,
             state,
             rows_per_simd=(
-                _EXPERIMENTAL_KDA_DECODE_ROWS_PER_SIMD
+                experimental_kda_row_decode_rows()
                 if q.shape[1] == 1
                 else _EXPERIMENTAL_KDA_ROWS_PER_SIMD
             ),
