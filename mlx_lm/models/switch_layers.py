@@ -73,16 +73,18 @@ class QuantizedSwitchLinear(nn.Module):
         return self.weight.shape[0]
 
     def __call__(self, x, indices, sorted_indices=False):
+        runtime_mode = getattr(self, "_runtime_quantization_mode", self.mode)
+        biases = None if runtime_mode == "affine2" else self.get("biases")
         x = mx.gather_qmm(
             x,
             self["weight"],
             self["scales"],
-            self.get("biases"),
+            biases,
             rhs_indices=indices,
             transpose=True,
             group_size=self.group_size,
             bits=self.bits,
-            mode=self.mode,
+            mode=runtime_mode,
             sorted_indices=sorted_indices,
         )
         if "bias" in self:

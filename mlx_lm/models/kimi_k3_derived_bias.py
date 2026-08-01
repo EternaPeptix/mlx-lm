@@ -1,10 +1,11 @@
 """Fail-closed contract for Kimi K3's derived affine-2bit biases.
 
 The K3 UVMAX routed expert banks store BF16 affine metadata with an exact
-``bias == -2 * scale`` relationship.  Decode kernels may skip the bias load
-only after the complete incoming metadata has passed a bitwise check.  The
-raw bias tensors remain part of the model so stock, prefill, and fallback
-paths are unchanged.
+``bias == -2 * scale`` relationship.  Kernels may skip the bias load only
+after the complete incoming metadata has passed a bitwise check.  A separate
+opt-in may then alias each validated bias parameter to its scale parameter and
+use MLX's inference-only ``affine2`` gather mode, reclaiming the raw allocation
+without changing non-exact fallback banks.
 """
 
 from __future__ import annotations
@@ -16,7 +17,11 @@ from typing import Any, Mapping, Sequence
 import mlx.core as mx
 
 DERIVE_AFFINE2_BIAS_ENV = "MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS"
+ELIDE_AFFINE2_BIAS_ENV = "MLX_LM_KIMI_K3_ELIDE_AFFINE2_BIAS"
 _VALIDATED_ATTR = "_k3_affine2_derived_bias_validated"
+_ELIDED_ATTR = "_k3_affine2_bias_elided"
+_ELISION_AUTH_ATTR = "_k3_affine2_elision_authorizations"
+_RUNTIME_MODE_ATTR = "_runtime_quantization_mode"
 _STRICT_PROJECTIONS = ("gate_proj", "up_proj")
 _SELECTIVE_PROJECTIONS = ("down_proj",)
 
@@ -29,6 +34,46 @@ def derive_affine2_bias_enabled() -> bool:
     if value not in {"0", "1"}:
         raise ValueError(f"{DERIVE_AFFINE2_BIAS_ENV} must be exactly '0' or '1'")
     return value == "1"
+
+
+@lru_cache(maxsize=1)
+def elide_affine2_bias_enabled() -> bool:
+    """Parse the allocation-elision opt-in and require derived execution."""
+
+    value = os.environ.get(ELIDE_AFFINE2_BIAS_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{ELIDE_AFFINE2_BIAS_ENV} must be exactly '0' or '1'")
+    if value == "1" and not derive_affine2_bias_enabled():
+        raise ValueError(
+            f"{ELIDE_AFFINE2_BIAS_ENV}=1 requires {DERIVE_AFFINE2_BIAS_ENV}=1"
+        )
+    return value == "1"
+
+
+@lru_cache(maxsize=1)
+def affine2_gather_core_available() -> bool:
+    """Evaluate a tiny graph so parser-only or missing-kernel builds fail."""
+
+    if not mx.metal.is_available():
+        return False
+    x = mx.zeros((1, 1, 512), dtype=mx.bfloat16)
+    weight = mx.zeros((1, 8, 32), dtype=mx.uint32)
+    scales = mx.ones((1, 8, 4), dtype=mx.bfloat16)
+    indices = mx.zeros((1,), dtype=mx.uint32)
+    try:
+        out = mx.gather_qmm(
+            x,
+            weight,
+            scales,
+            rhs_indices=indices,
+            group_size=128,
+            bits=2,
+            mode="affine2",
+        )
+        mx.eval(out)
+    except (ValueError, RuntimeError):
+        return False
+    return True
 
 
 def derived_affine2_biases(scales: mx.array) -> mx.array:
@@ -176,6 +221,7 @@ def validate_k3_biases_for_load(
         switch_mlp = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
         if switch_mlp is None:
             continue
+        authorizations = set()
         for projection_name in (*_STRICT_PROJECTIONS, *_SELECTIVE_PROJECTIONS):
             projection = getattr(switch_mlp, projection_name)
             prefix = f"model.layers.{layer_index}.mlp.switch_mlp.{projection_name}"
@@ -211,17 +257,113 @@ def validate_k3_biases_for_load(
                 )
             if _target_projection(projection):
                 setattr(projection, _VALIDATED_ATTR, True)
+            # Keep only object identities, never a second reference to the raw
+            # bias tensor.  Standard loading assigns these exact arrays into
+            # the quantized module after sanitize returns.
+            authorizations.add((projection_name, id(scales), id(biases)))
             validated += 1
+        setattr(switch_mlp, _ELISION_AUTH_ATTR, frozenset(authorizations))
     return validated
+
+
+def _elide_validated_k3_biases(
+    layers: Sequence[Any],
+    *,
+    after_shard: bool,
+) -> int:
+    """Implement load-time elision or post-shard re-aliasing.
+
+    The authorization is produced only by the full-array validation above and
+    is bound to the exact incoming MLX array objects.  Load-time finalization
+    always checks those identities, including checkpoint reloads.  Post-shard
+    re-entry may bypass the identities only for modules that were already
+    validated and elided before the internal transform.
+    """
+
+    if not elide_affine2_bias_enabled():
+        return 0
+    if not affine2_gather_core_available():
+        raise RuntimeError(
+            "K3 affine2 bias elision requires an MLX core with Metal "
+            "gather_qmm(mode='affine2') support"
+        )
+
+    elided = 0
+    for layer_index, layer in enumerate(layers):
+        switch_mlp = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
+        if switch_mlp is None:
+            continue
+        authorizations = getattr(switch_mlp, _ELISION_AUTH_ATTR, frozenset())
+        for projection_name, scales_id, biases_id in authorizations:
+            projection = getattr(switch_mlp, projection_name)
+            prefix = f"model.layers.{layer_index}.mlp.switch_mlp.{projection_name}"
+            already_elided = getattr(projection, _ELIDED_ATTR, None) is True
+            if after_shard and not already_elided:
+                continue
+            if not _target_projection(projection):
+                raise RuntimeError(
+                    f"{prefix} changed after affine2 validation and cannot elide bias"
+                )
+            scales = projection.get("scales")
+            biases = projection.get("biases")
+            if (
+                not isinstance(scales, mx.array)
+                or not isinstance(biases, mx.array)
+                or scales.dtype != mx.bfloat16
+                or biases.dtype != mx.bfloat16
+                or scales.shape != biases.shape
+            ):
+                raise RuntimeError(
+                    f"{prefix} no longer has matching BF16 affine metadata"
+                )
+            if not after_shard and (
+                id(scales) != scales_id or id(biases) != biases_id
+            ):
+                raise RuntimeError(
+                    f"{prefix} loaded different metadata than the validated arrays"
+                )
+            if after_shard and (
+                getattr(projection, _VALIDATED_ATTR, None) is not True
+                or getattr(projection, _RUNTIME_MODE_ATTR, None) != "affine2"
+            ):
+                raise RuntimeError(
+                    f"{prefix} lost its validated affine2 state during sharding"
+                )
+
+            # Preserve the six-input affine primitive ABI with one allocation:
+            # MLX core binds scales into the bias slot as an affine2 scale alias.
+            projection.biases = projection.scales
+            setattr(projection, _VALIDATED_ATTR, True)
+            setattr(projection, _ELIDED_ATTR, True)
+            setattr(projection, _RUNTIME_MODE_ATTR, "affine2")
+            elided += 1
+    return elided
+
+
+def elide_validated_k3_biases(layers: Sequence[Any]) -> int:
+    """Alias only the exact arrays authorized by the current checkpoint load."""
+
+    return _elide_validated_k3_biases(layers, after_shard=False)
+
+
+def reelide_sharded_k3_biases(layers: Sequence[Any]) -> int:
+    """Re-establish aliases only for modules elided before an internal shard."""
+
+    return _elide_validated_k3_biases(layers, after_shard=True)
 
 
 __all__ = [
     "DERIVE_AFFINE2_BIAS_ENV",
+    "ELIDE_AFFINE2_BIAS_ENV",
+    "affine2_gather_core_available",
     "affine2_bias_relation_is_exact",
     "affine2_biases_are_fast_derivable",
     "derive_affine2_bias_enabled",
     "derived_affine2_biases",
+    "elide_affine2_bias_enabled",
+    "elide_validated_k3_biases",
     "projection_has_validated_derived_bias",
+    "reelide_sharded_k3_biases",
     "validate_affine2_bias_relation",
     "validate_k3_biases_for_load",
 ]

@@ -1,4 +1,4 @@
-# Kimi K3 decode-time derived affine bias
+# Kimi K3 derived affine bias and allocation elision
 
 ## Candidate
 
@@ -14,8 +14,31 @@ It removes the bias metadata read from the strictly validated fused gate/up
 kernel.  It now does the same for each independently validated down bank in
 the tuned-down and fused-down/reduce kernels.  A non-exact down bank keeps its
 stored bias and incumbent kernel.  The flag is exact `0`/`1` and defaults to
-`0`.  Bias tensors remain loaded, so prefill, stock, and unsupported fallbacks
-are unchanged.
+`0`.  With only this flag, bias tensors remain loaded, so prefill, stock, and
+unsupported fallbacks are unchanged.
+
+The follow-on allocation candidate additionally sets:
+
+```text
+MLX_LM_KIMI_K3_ELIDE_AFFINE2_BIAS=1
+```
+
+It requires the derive flag and the paired MLX core `affine2` gather patch.
+After strict loading, each validated module aliases its `biases` parameter to
+the same MLX array as `scales`; the raw bias allocation can then be released.
+Stock `QuantizedSwitchLinear` dispatch omits bias and uses `mode="affine2"` for
+both short gather-QMV and sorted gather-QMM-RHS prefill.  Non-exact down banks
+retain their original parameter and ordinary affine mode.  Validation stores
+only incoming array identities, not hidden tensor references, and elision
+fails closed if load assigns different metadata or the patched core is absent.
+
+Each TP-local bias bank is 77,070,336 bytes.  The audited rank-0 checkpoint can
+elide all 184 gate/up plus 84 exact down banks: 20,654,850,048 bytes (19.236
+GiB).  Rank 1 can elide 184 plus 86: 20,808,990,720 bytes (19.380 GiB).  These
+are allocation reductions, not a measured context or throughput claim.  The
+stock loader now discards its raw weights dictionary and clears unused cached
+allocations before eager evaluation; external rank-local loaders must do the
+same before peak-memory measurement.
 
 Before enabling a kernel arm, model sanitization performs a complete bitwise
 check of its scale and bias arrays and requires finite-normal BF16 scales.

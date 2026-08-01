@@ -24,7 +24,11 @@ from .gated_delta import (
     gated_delta_update,
 )
 from .kimi_k3_attnres_rms import maybe_fused_attnres_rms
-from .kimi_k3_derived_bias import validate_k3_biases_for_load
+from .kimi_k3_derived_bias import (
+    elide_validated_k3_biases,
+    reelide_sharded_k3_biases,
+    validate_k3_biases_for_load,
+)
 from .kimi_k3_fused_expert import (
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
@@ -2903,6 +2907,13 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.language_model = LanguageModel(args.text_config)
 
+    def load_weights(self, file_or_weights, strict: bool = True):
+        """Load first, then release only fully validated affine2 bias banks."""
+
+        super().load_weights(file_or_weights, strict=strict)
+        elide_validated_k3_biases(self.language_model.model.layers)
+        return self
+
     def __call__(
         self,
         inputs: mx.array,
@@ -3105,6 +3116,10 @@ class Model(nn.Module):
                 layer.mlp.down_proj = shard_linear(
                     layer.mlp.down_proj, "sharded-to-all", group=group
                 )
+
+        # A post-load shard produces new scale views.  Re-establish the alias
+        # only for projections that were already authorized and elided.
+        reelide_sharded_k3_biases(self.language_model.model.layers)
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         prefix = "language_model."

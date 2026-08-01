@@ -444,8 +444,13 @@ def load_model(
 
     model.eval()
     model.load_weights(list(weights.items()), strict=strict)
+    # Parameters now own the loaded arrays.  Drop the loader's duplicate
+    # references before eager evaluation so model-specific allocation elision
+    # can release replaced metadata at the highest-memory point of loading.
+    weights.clear()
 
     if not lazy:
+        mx.clear_cache()
         mx.eval(model.parameters())
 
     return model, config

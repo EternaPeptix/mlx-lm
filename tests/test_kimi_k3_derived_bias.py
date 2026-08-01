@@ -5,29 +5,39 @@ import unittest
 from unittest import mock
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from mlx_lm.models.kimi_k3_derived_bias import (
     DERIVE_AFFINE2_BIAS_ENV,
+    ELIDE_AFFINE2_BIAS_ENV,
+    affine2_gather_core_available,
     affine2_bias_relation_is_exact,
     affine2_biases_are_fast_derivable,
     derive_affine2_bias_enabled,
     derived_affine2_biases,
+    elide_affine2_bias_enabled,
+    elide_validated_k3_biases,
     projection_has_validated_derived_bias,
+    reelide_sharded_k3_biases,
     validate_k3_biases_for_load,
 )
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
 
 def _bf16_bits(values: list[int]) -> mx.array:
     return mx.array(values, dtype=mx.uint16).view(mx.bfloat16)
 
 
-class _Projection:
-    bits = 2
-    group_size = 128
-    mode = "affine"
-
-    def __contains__(self, name):
-        return False
+class _Projection(nn.Module):
+    def __init__(self, scales=None, biases=None):
+        super().__init__()
+        self.bits = 2
+        self.group_size = 128
+        self.mode = "affine"
+        if scales is not None:
+            self.scales = scales
+        if biases is not None:
+            self.biases = biases
 
 
 class _Switch:
@@ -50,7 +60,10 @@ class _Layer:
 class DerivedBiasContractTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop(DERIVE_AFFINE2_BIAS_ENV, None)
+        os.environ.pop(ELIDE_AFFINE2_BIAS_ENV, None)
         derive_affine2_bias_enabled.cache_clear()
+        elide_affine2_bias_enabled.cache_clear()
+        affine2_gather_core_available.cache_clear()
 
     def test_flag_is_default_off_and_strict(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -75,6 +88,59 @@ class DerivedBiasContractTest(unittest.TestCase):
                     derive_affine2_bias_enabled.cache_clear()
                     with self.assertRaisesRegex(ValueError, "exactly '0' or '1'"):
                         derive_affine2_bias_enabled()
+
+    def test_elision_flag_is_strict_and_requires_derive(self):
+        for value, expected in (("0", False), ("1", True)):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        DERIVE_AFFINE2_BIAS_ENV: "1",
+                        ELIDE_AFFINE2_BIAS_ENV: value,
+                    },
+                    clear=True,
+                ):
+                    derive_affine2_bias_enabled.cache_clear()
+                    elide_affine2_bias_enabled.cache_clear()
+                    self.assertEqual(elide_affine2_bias_enabled(), expected)
+        with mock.patch.dict(
+            os.environ,
+            {ELIDE_AFFINE2_BIAS_ENV: "1"},
+            clear=True,
+        ):
+            derive_affine2_bias_enabled.cache_clear()
+            elide_affine2_bias_enabled.cache_clear()
+            with self.assertRaisesRegex(ValueError, "requires"):
+                elide_affine2_bias_enabled()
+        for value in ("", "true", "01", "yes", "2"):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        DERIVE_AFFINE2_BIAS_ENV: "1",
+                        ELIDE_AFFINE2_BIAS_ENV: value,
+                    },
+                    clear=True,
+                ):
+                    derive_affine2_bias_enabled.cache_clear()
+                    elide_affine2_bias_enabled.cache_clear()
+                    with self.assertRaisesRegex(ValueError, "exactly '0' or '1'"):
+                        elide_affine2_bias_enabled()
+
+    def test_core_probe_evaluates_kernel_and_fails_closed(self):
+        sentinel = object()
+        with (
+            mock.patch.object(mx.metal, "is_available", return_value=True),
+            mock.patch.object(mx, "gather_qmm", return_value=sentinel),
+            mock.patch.object(
+                mx,
+                "eval",
+                side_effect=RuntimeError("missing affine2 Metal kernel"),
+            ) as evaluate,
+        ):
+            affine2_gather_core_available.cache_clear()
+            self.assertFalse(affine2_gather_core_available())
+            evaluate.assert_called_once_with(sentinel)
 
     def test_exact_bits_cover_zero_subnormal_and_infinity(self):
         # +0, -0, minimum signed subnormals, +/-infinity, and +/-1.
@@ -241,6 +307,171 @@ class DerivedBiasContractTest(unittest.TestCase):
                 derived_affine2_biases(scales),
             )
         )
+
+    def test_elision_aliases_only_authorized_banks(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        os.environ[ELIDE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        elide_affine2_bias_enabled.cache_clear()
+        layer = _Layer()
+        weights = {}
+        original = {}
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            scales = _bf16_bits([0x3F80, 0xBF80])
+            biases = derived_affine2_biases(scales)
+            if name == "down_proj":
+                biases = _bf16_bits([0x0000, 0x4000])
+            projection = _Projection(scales, biases)
+            setattr(layer.mlp.switch_mlp, name, projection)
+            prefix = f"model.layers.0.mlp.switch_mlp.{name}"
+            weights[f"{prefix}.scales"] = scales
+            weights[f"{prefix}.biases"] = biases
+            original[name] = biases
+
+        self.assertEqual(validate_k3_biases_for_load([layer], weights), 2)
+        with mock.patch(
+            "mlx_lm.models.kimi_k3_derived_bias.affine2_gather_core_available",
+            return_value=True,
+        ):
+            self.assertEqual(elide_validated_k3_biases([layer]), 2)
+
+        for name in ("gate_proj", "up_proj"):
+            projection = getattr(layer.mlp.switch_mlp, name)
+            self.assertIs(projection.biases, projection.scales)
+            self.assertEqual(projection._runtime_quantization_mode, "affine2")
+            self.assertTrue(
+                projection_has_validated_derived_bias(
+                    projection,
+                    projection.scales,
+                    projection.biases,
+                )
+            )
+        down = layer.mlp.switch_mlp.down_proj
+        self.assertIs(down.biases, original["down_proj"])
+        self.assertFalse(hasattr(down, "_runtime_quantization_mode"))
+
+    def test_elision_rejects_metadata_replaced_after_validation(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        os.environ[ELIDE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        elide_affine2_bias_enabled.cache_clear()
+        layer = _Layer()
+        scales = _bf16_bits([0x3F80])
+        biases = derived_affine2_biases(scales)
+        projection = _Projection(scales, biases)
+        layer.mlp.switch_mlp.gate_proj = projection
+        prefix = "model.layers.0.mlp.switch_mlp.gate_proj"
+        validate_k3_biases_for_load(
+            [layer],
+            {f"{prefix}.scales": scales, f"{prefix}.biases": biases},
+        )
+        with mock.patch(
+            "mlx_lm.models.kimi_k3_derived_bias.affine2_gather_core_available",
+            return_value=True,
+        ):
+            self.assertEqual(elide_validated_k3_biases([layer]), 1)
+            projection.scales = _bf16_bits([0x4000])
+            projection.biases = derived_affine2_biases(projection.scales)
+            with self.assertRaisesRegex(RuntimeError, "different metadata"):
+                elide_validated_k3_biases([layer])
+
+    def test_shard_realias_skips_never_elided_modules(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        os.environ[ELIDE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        elide_affine2_bias_enabled.cache_clear()
+        layer = _Layer()
+        scales = _bf16_bits([0x3F80, 0xBF80])
+        biases = derived_affine2_biases(scales)
+        projection = _Projection(scales, biases)
+        layer.mlp.switch_mlp.gate_proj = projection
+        prefix = "model.layers.0.mlp.switch_mlp.gate_proj"
+        validate_k3_biases_for_load(
+            [layer],
+            {f"{prefix}.scales": scales, f"{prefix}.biases": biases},
+        )
+        projection.scales = mx.concatenate([scales])
+        projection.biases = mx.concatenate([biases])
+        with mock.patch(
+            "mlx_lm.models.kimi_k3_derived_bias.affine2_gather_core_available",
+            return_value=True,
+        ):
+            self.assertEqual(reelide_sharded_k3_biases([layer]), 0)
+        self.assertIsNot(projection.biases, projection.scales)
+
+    def test_shard_realias_preserves_only_prior_elision(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        os.environ[ELIDE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        elide_affine2_bias_enabled.cache_clear()
+        layer = _Layer()
+        scales = _bf16_bits([0x3F80, 0xBF80])
+        biases = derived_affine2_biases(scales)
+        projection = _Projection(scales, biases)
+        layer.mlp.switch_mlp.gate_proj = projection
+        prefix = "model.layers.0.mlp.switch_mlp.gate_proj"
+        validate_k3_biases_for_load(
+            [layer],
+            {f"{prefix}.scales": scales, f"{prefix}.biases": biases},
+        )
+        with mock.patch(
+            "mlx_lm.models.kimi_k3_derived_bias.affine2_gather_core_available",
+            return_value=True,
+        ):
+            self.assertEqual(elide_validated_k3_biases([layer]), 1)
+            projection.scales = mx.concatenate([projection.scales])
+            projection.biases = mx.concatenate([projection.biases])
+            self.assertEqual(reelide_sharded_k3_biases([layer]), 1)
+        self.assertIs(projection.biases, projection.scales)
+
+    def test_quantized_switch_omits_elided_bias_from_core_call(self):
+        projection = QuantizedSwitchLinear(
+            512,
+            8,
+            1,
+            bias=False,
+            group_size=128,
+            bits=2,
+        )
+        projection.biases = projection.scales
+        projection._runtime_quantization_mode = "affine2"
+        x = mx.zeros((1, 1, 512), dtype=mx.bfloat16)
+        indices = mx.zeros((1,), dtype=mx.uint32)
+        expected = mx.zeros((1, 1, 8), dtype=mx.bfloat16)
+        with mock.patch(
+            "mlx_lm.models.switch_layers.mx.gather_qmm",
+            return_value=expected,
+        ) as gather:
+            self.assertIs(projection(x, indices), expected)
+        args, kwargs = gather.call_args
+        self.assertIsNone(args[3])
+        self.assertEqual(kwargs["mode"], "affine2")
+
+    @unittest.skipUnless(
+        affine2_gather_core_available(),
+        "requires MLX affine2 gather support",
+    )
+    def test_quantized_switch_affine2_is_bit_exact(self):
+        projection = QuantizedSwitchLinear(
+            512,
+            40,
+            8,
+            bias=False,
+            group_size=128,
+            bits=2,
+        )
+        projection.scales = projection.scales.astype(mx.bfloat16)
+        stored_biases = derived_affine2_biases(projection.scales)
+        projection.biases = stored_biases
+        x = mx.random.normal((40, 1, 512)).astype(mx.bfloat16)
+        indices = mx.repeat(mx.arange(8), 5)
+        expected = projection(x, indices, sorted_indices=True)
+
+        projection.biases = projection.scales
+        projection._runtime_quantization_mode = "affine2"
+        actual = projection(x, indices, sorted_indices=True)
+        mx.eval(expected, actual)
+        self.assertTrue(mx.array_equal(expected, actual).item())
 
 
 if __name__ == "__main__":
