@@ -30,7 +30,7 @@ INTERMEDIATE = 1536
 TOP_K = 16
 GROUP_SIZE = 128
 MLX_BASE = "2cfb83040011c273377a25df8ed16def80c6646c"
-MLX_LM_BASE = "bf378e33831e745715a88418a44ce20ab1075b9b"
+MLX_LM_BASE = "2606b9c089177270cecc60fb130dc6e39e046d95"
 
 
 @dataclass(frozen=True)
@@ -209,6 +209,28 @@ def _full_chain(
     return hidden
 
 
+def _selective_down_chain(
+    hidden: mx.array,
+    indices: mx.array,
+    router_weights: mx.array,
+    banks: Sequence[ExpertBank],
+    *,
+    derive_down_bias: bool,
+) -> mx.array:
+    """Compare the retained gate/up arm with only the down arm changed."""
+
+    for bank in banks:
+        activated = _front(hidden, indices, bank, derive_bias=True)
+        hidden = _fused_down(
+            activated,
+            indices,
+            router_weights,
+            bank,
+            derive_bias=derive_down_bias,
+        )
+    return hidden
+
+
 def _eval_result(value: mx.array | Sequence[mx.array]) -> None:
     if isinstance(value, mx.array):
         mx.eval(value)
@@ -352,6 +374,23 @@ def main() -> None:
                 derive_bias=True,
             ),
         ),
+        (
+            "selective_down_full_chain",
+            lambda: _selective_down_chain(
+                hidden,
+                indices,
+                router_weights,
+                banks,
+                derive_down_bias=False,
+            ),
+            lambda: _selective_down_chain(
+                hidden,
+                indices,
+                router_weights,
+                banks,
+                derive_down_bias=True,
+            ),
+        ),
     ):
         expected = incumbent()
         actual = candidate()
@@ -413,6 +452,22 @@ def main() -> None:
                 router_weights,
                 banks,
                 derive_bias=True,
+            ),
+        ),
+        "selective_down_full_chain": (
+            lambda: _selective_down_chain(
+                hidden,
+                indices,
+                router_weights,
+                banks,
+                derive_down_bias=False,
+            ),
+            lambda: _selective_down_chain(
+                hidden,
+                indices,
+                router_weights,
+                banks,
+                derive_down_bias=True,
             ),
         ),
     }

@@ -17,7 +17,8 @@ import mlx.core as mx
 
 DERIVE_AFFINE2_BIAS_ENV = "MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS"
 _VALIDATED_ATTR = "_k3_affine2_derived_bias_validated"
-_PROJECTIONS = ("gate_proj", "up_proj")
+_STRICT_PROJECTIONS = ("gate_proj", "up_proj")
+_SELECTIVE_PROJECTIONS = ("down_proj",)
 
 
 @lru_cache(maxsize=1)
@@ -155,15 +156,16 @@ def validate_k3_biases_for_load(
     layers: Sequence[Any],
     weights: Mapping[str, mx.array],
 ) -> int:
-    """Validate and mark every routed gate/up projection present in a load.
+    """Validate and mark routed expert projections present in a load.
 
     A metadata-only model construction legitimately supplies no expert
     tensors and returns zero.  Once any member of a projection is present,
-    both metadata arrays are mandatory and a mismatch fails the load.  The
-    check is intentionally full-array and bitwise; sampled validation is not
-    sufficient authority to skip a runtime metadata load.  Down projections
-    retain their authoritative bias arrays because the shipped rank-1 weights
-    contain at least one bank that violates the derivation contract.
+    both metadata arrays are mandatory.  The check is intentionally full-array
+    and bitwise; sampled validation is not sufficient authority to skip a
+    runtime metadata load.  Gate/up failures remain fatal because their
+    derived kernels are requested as a pair.  A down-projection mismatch is
+    marked ineligible instead: its stored bias remains authoritative and only
+    that module uses the incumbent down path.
     """
 
     if not derive_affine2_bias_enabled():
@@ -174,7 +176,7 @@ def validate_k3_biases_for_load(
         switch_mlp = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
         if switch_mlp is None:
             continue
-        for projection_name in _PROJECTIONS:
+        for projection_name in (*_STRICT_PROJECTIONS, *_SELECTIVE_PROJECTIONS):
             projection = getattr(switch_mlp, projection_name)
             prefix = f"model.layers.{layer_index}.mlp.switch_mlp.{projection_name}"
             scales = weights.get(f"{prefix}.scales")
@@ -196,7 +198,12 @@ def validate_k3_biases_for_load(
                     raise ValueError(
                         f"{prefix} is not affine 2-bit/group-128 without output bias"
                     )
-            if not affine2_biases_are_fast_derivable(scales, biases):
+            fast_derivable = affine2_biases_are_fast_derivable(scales, biases)
+            if not fast_derivable and projection_name in _SELECTIVE_PROJECTIONS:
+                if _target_projection(projection):
+                    setattr(projection, _VALIDATED_ATTR, False)
+                continue
+            if not fast_derivable:
                 validate_affine2_bias_relation(scales, biases, label=prefix)
                 raise ValueError(
                     f"{prefix} contains a zero, subnormal, infinity, or NaN scale; "
