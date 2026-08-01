@@ -10,8 +10,9 @@ vector before its routed and shared experts:
 
 At the single-token decode shape, concatenating their already-quantized output
 rows lets MLX issue one QMV instead of four while preserving every output bit.
-No weight is dequantized or requantized.  Multi-token calls remain on the stock
-path because a wider QMM may choose a different accumulation tiling.
+No weight is dequantized or requantized.  An independent, default-off gate can
+admit the exact width-eight K3 target-verification shape after its QMM kernel
+has been validated; every other multi-token call remains on the stock path.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import mlx.nn as nn
 
 PACKED_MOE_FRONT_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT"
 AUTHORITATIVE_PACKED_MOE_FRONT_ENV = "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT"
+PACKED_MOE_FRONT_WIDTH8_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8"
 _UNSUPPORTED = object()
 _PACKED_ARRAY_NAMES = ("weight", "scales", "biases", "bias")
 
@@ -43,6 +45,18 @@ def packed_moe_front_enabled() -> bool:
 @lru_cache(maxsize=1)
 def authoritative_packed_moe_front_enabled() -> bool:
     return os.environ.get(AUTHORITATIVE_PACKED_MOE_FRONT_ENV, "0") == "1"
+
+
+@lru_cache(maxsize=1)
+def packed_moe_front_width8_enabled() -> bool:
+    return os.environ.get(PACKED_MOE_FRONT_WIDTH8_ENV, "0") == "1"
+
+
+def _packed_input_supported(x: mx.array) -> bool:
+    if x.ndim != 3 or x.shape[0] != 1:
+        return False
+    width = int(x.shape[1])
+    return width == 1 or (width == 8 and packed_moe_front_width8_enabled())
 
 
 def _array_parameter(module: Any, name: str) -> mx.array | None:
@@ -213,9 +227,10 @@ class PackedK3MoEFront(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> tuple[mx.array, ...]:
-        if x.ndim != 3 or x.shape[0] * x.shape[1] != 1:
+        if not _packed_input_supported(x):
             raise PackedMoEFrontUnsupported(
-                "packed K3 MoE front is decode-only (one total token)"
+                "packed K3 MoE front requires one decode token or an enabled "
+                "width-eight target block"
             )
         if int(x.shape[-1]) != self._input_dims:
             raise PackedMoEFrontUnsupported(
@@ -383,8 +398,7 @@ def maybe_authoritative_packed_k3_moe_front(
 
     if (
         getattr(sparse_moe, "training", True)
-        or x.ndim != 3
-        or x.shape[0] * x.shape[1] != 1
+        or not _packed_input_supported(x)
     ):
         return None
 
@@ -475,8 +489,7 @@ def maybe_packed_k3_moe_front(
         not packed_moe_front_enabled()
         or authoritative_packed_moe_front_enabled()
         or getattr(sparse_moe, "training", True)
-        or x.ndim != 3
-        or x.shape[0] * x.shape[1] != 1
+        or not _packed_input_supported(x)
     ):
         return None
 

@@ -18,13 +18,16 @@ from mlx_lm.models.kimi_k3_multibank_moe_front import (
 from mlx_lm.models.kimi_k3_packed_moe_front import (
     AUTHORITATIVE_PACKED_MOE_FRONT_ENV,
     PACKED_MOE_FRONT_ENV,
+    PACKED_MOE_FRONT_WIDTH8_ENV,
     AuthoritativePackedK3MoEFront,
     PackedK3MoEFront,
+    PackedMoEFrontUnsupported,
     _build_authoritative_packed_front,
     _build_packed_front,
     authoritative_packed_moe_front_enabled,
     invalidate_packed_k3_moe_front,
     packed_moe_front_enabled,
+    packed_moe_front_width8_enabled,
 )
 
 
@@ -104,11 +107,13 @@ class PackedK3MoEFrontTests(unittest.TestCase):
         multibank_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
         packed_moe_front_enabled.cache_clear()
+        packed_moe_front_width8_enabled.cache_clear()
 
     def tearDown(self):
         multibank_moe_front_enabled.cache_clear()
         packed_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
+        packed_moe_front_width8_enabled.cache_clear()
 
     def test_single_token_rows_are_bit_exact(self):
         mx.random.seed(7)
@@ -145,8 +150,38 @@ class PackedK3MoEFrontTests(unittest.TestCase):
         projections = tuple(_QuantizedProjection(128, 64) for _ in range(4))
         packed = PackedK3MoEFront(projections)
         x = mx.zeros((1, 2, 128), dtype=mx.bfloat16)
-        with self.assertRaisesRegex(ValueError, "decode-only"):
+        with self.assertRaisesRegex(ValueError, "one decode token"):
             packed(x)
+
+    def test_width_eight_rows_are_bit_exact_when_independently_enabled(self):
+        mx.random.seed(11)
+        projections = (
+            _QuantizedProjection(128, 96),
+            _QuantizedProjection(128, 80),
+            _QuantizedProjection(128, 24),
+            _QuantizedProjection(128, 64),
+        )
+        packed = PackedK3MoEFront(projections)
+        x = mx.random.normal((1, 8, 128)).astype(mx.bfloat16)
+        expected = tuple(projection(x) for projection in projections)
+
+        with patch.dict(os.environ, {PACKED_MOE_FRONT_WIDTH8_ENV: "1"}):
+            packed_moe_front_width8_enabled.cache_clear()
+            actual = packed(x)
+            mx.eval(*expected, *actual)
+
+        for want, got in zip(expected, actual, strict=True):
+            self.assertTrue(bool(mx.array_equal(want, got).item()))
+
+    def test_width_eight_gate_rejects_other_widths_and_batches(self):
+        projections = tuple(_QuantizedProjection(128, 64) for _ in range(4))
+        packed = PackedK3MoEFront(projections)
+        with patch.dict(os.environ, {PACKED_MOE_FRONT_WIDTH8_ENV: "1"}):
+            packed_moe_front_width8_enabled.cache_clear()
+            for shape in ((1, 2, 128), (1, 7, 128), (2, 1, 128)):
+                with self.subTest(shape=shape):
+                    with self.assertRaises(PackedMoEFrontUnsupported):
+                        packed(mx.zeros(shape, dtype=mx.bfloat16))
 
     def test_full_sparse_moe_output_is_bit_exact(self):
         mx.random.seed(19)
@@ -271,11 +306,46 @@ class AuthoritativePackedK3MoEFrontTests(unittest.TestCase):
         multibank_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
         packed_moe_front_enabled.cache_clear()
+        packed_moe_front_width8_enabled.cache_clear()
 
     def tearDown(self):
         multibank_moe_front_enabled.cache_clear()
         packed_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
+        packed_moe_front_width8_enabled.cache_clear()
+
+    def test_width_eight_authoritative_sparse_moe_is_bit_exact(self):
+        mx.random.seed(30)
+        module = _small_sparse_moe()
+        x = mx.random.normal((1, 8, 128)).astype(mx.bfloat16)
+        with patch.dict(
+            os.environ,
+            {
+                MULTIBANK_MOE_FRONT_ENV: "0",
+                AUTHORITATIVE_PACKED_MOE_FRONT_ENV: "0",
+                PACKED_MOE_FRONT_WIDTH8_ENV: "0",
+            },
+        ):
+            authoritative_packed_moe_front_enabled.cache_clear()
+            packed_moe_front_width8_enabled.cache_clear()
+            expected = module(x)
+            mx.eval(expected)
+
+        with patch.dict(
+            os.environ,
+            {
+                MULTIBANK_MOE_FRONT_ENV: "0",
+                AUTHORITATIVE_PACKED_MOE_FRONT_ENV: "1",
+                PACKED_MOE_FRONT_WIDTH8_ENV: "1",
+            },
+        ):
+            authoritative_packed_moe_front_enabled.cache_clear()
+            packed_moe_front_width8_enabled.cache_clear()
+            actual = module(x)
+            mx.eval(actual)
+
+        self.assertTrue(bool(mx.array_equal(expected, actual).item()))
+        self.assertTrue(hasattr(module, "_authoritative_packed_k3_moe_front"))
 
     def test_rows_are_bit_exact_and_original_arrays_are_not_retained(self):
         mx.random.seed(29)
