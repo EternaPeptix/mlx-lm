@@ -98,6 +98,98 @@ def exact_wide_short_conv_enabled() -> bool:
     if value not in {"0", "1"}:
         raise ValueError(f"{EXACT_WIDE_SHORT_CONV_ENV} must be exactly '0' or '1'")
     return value == "1"
+FACTORIZED_SDPA_PREFILL_ENV = "MLX_LM_KIMI_K3_FACTORIZED_SDPA_PREFILL"
+
+
+def _factorized_sdpa_prefill_requested() -> bool:
+    """Return whether the strict, default-off K3 prefill path was requested."""
+
+    return os.environ.get(FACTORIZED_SDPA_PREFILL_ENV, "0") == "1"
+
+
+def _factorized_sdpa_prefill_primitive() -> Optional[Callable]:
+    """Return the bounded-memory Metal primitive, or ``None`` fail closed."""
+
+    primitive = getattr(
+        mx.fast,
+        "factorized_scaled_dot_product_attention",
+        None,
+    )
+    if (
+        primitive is None
+        or not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+    ):
+        return None
+    return primitive
+
+
+def _mask_broadcasts_to(mask: mx.array, shape: Tuple[int, ...]) -> bool:
+    if mask.ndim > len(shape):
+        return False
+    mask_shape = (1,) * (len(shape) - mask.ndim) + tuple(mask.shape)
+    return all(actual in (1, expected) for actual, expected in zip(mask_shape, shape))
+
+
+def _can_use_factorized_sdpa_prefill(
+    q0: mx.array,
+    k0: mx.array,
+    value: mx.array,
+    q1: mx.array,
+    k1: mx.array,
+    *,
+    mask: Optional[mx.array],
+    cache: Optional[KVCache],
+) -> bool:
+    """Match the first MLX Metal specialization exactly.
+
+    This policy is deliberately narrower than the public primitive.  In
+    particular, Kimi K3 currently creates boolean causal/padding masks, and
+    quantized caches require the existing quantized attention implementation.
+    """
+
+    arrays = (q0, k0, value, q1, k1)
+    if any(not isinstance(array, mx.array) or array.ndim != 4 for array in arrays):
+        return False
+    if cache is not None and hasattr(cache, "bits"):
+        return False
+
+    dtype = q0.dtype
+    if dtype not in (mx.float16, mx.bfloat16) or any(
+        array.dtype != dtype for array in arrays[1:]
+    ):
+        return False
+
+    batch, query_heads, query_length, primary_dim = q0.shape
+    primary_heads, key_length = k0.shape[1:3]
+    if (
+        batch <= 0
+        or query_heads not in (48, 96)
+        or query_length <= 8
+        or key_length < query_length
+        or primary_dim != 128
+        or q1.shape != (batch, query_heads, query_length, 64)
+        or k0.shape != (batch, primary_heads, key_length, 128)
+        or value.shape != (batch, primary_heads, key_length, 128)
+        or k1.shape[0] != batch
+        or k1.shape[2:] != (key_length, 64)
+        or primary_heads <= 0
+        or k1.shape[1] <= 0
+        or query_heads % primary_heads != 0
+        or query_heads % k1.shape[1] != 0
+    ):
+        return False
+
+    if mask is None:
+        return True
+    return (
+        isinstance(mask, mx.array)
+        and mask.dtype == mx.bool_
+        and _mask_broadcasts_to(
+            mask,
+            (batch, query_heads, query_length, key_length),
+        )
+    )
 
 
 def _parse_compiled_decode_segments(
@@ -1103,6 +1195,17 @@ class KimiK3MLAAttention(nn.Module):
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
+        # Resolve the opt-in and runtime symbol before constructing expanded
+        # K/V.  Unsupported runtimes retain the exact accepted implementation.
+        factorized_sdpa = None
+        if (
+            L > 8
+            and not self.training
+            and not (cache is not None and hasattr(cache, "bits"))
+            and _factorized_sdpa_prefill_requested()
+        ):
+            factorized_sdpa = _factorized_sdpa_prefill_primitive()
+
         compressed_kv = self.kv_a_proj_with_mqa(x)
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
@@ -1113,14 +1216,6 @@ class KimiK3MLAAttention(nn.Module):
         if cache is not None:
             kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
-        if mask is not None:
-            pe_scores = mx.where(
-                mask,
-                pe_scores,
-                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
-            )
-
         if L == 1:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
@@ -1128,9 +1223,40 @@ class KimiK3MLAAttention(nn.Module):
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
 
-        output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-        )
+        if factorized_sdpa is not None and _can_use_factorized_sdpa_prefill(
+            q_nope,
+            k,
+            v,
+            q_pe,
+            k_pe,
+            mask=mask,
+            cache=cache,
+        ):
+            # Do not catch errors here.  Every model-side fast-path condition
+            # matches MLX's fused Metal specialization, so silently recovering
+            # through its score-materializing composite would be unsafe at
+            # 128K/1M context lengths.
+            output = factorized_sdpa(
+                q_nope,
+                k,
+                v,
+                q_pe,
+                k_pe,
+                scale0=self.scale,
+                scale1=self.scale,
+                mask=mask,
+            )
+        else:
+            pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+            if mask is not None:
+                pe_scores = mx.where(
+                    mask,
+                    pe_scores,
+                    mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+                )
+            output = scaled_dot_product_attention(
+                q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            )
 
         if L == 1:
             output = self.unembed_out(output)
