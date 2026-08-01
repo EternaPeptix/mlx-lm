@@ -68,6 +68,11 @@ inline float k3_down_reduce_qdot_2bit(
   }
   return scale * accum + sum * bias;
 }
+
+template <typename T>
+inline float k3_down_reduce_derive_affine2_bias(T scale) {
+  return -2.0f * static_cast<float>(scale);
+}
 """
 
 
@@ -121,11 +126,19 @@ for (uint expert_slot = simd_slot;
   for (uint k = 0; k < input_width; k += BLOCK_SIZE) {
     float sum = k3_down_reduce_load_x_2bit<T>(x_ptr, x_thread);
     for (uint row = 0; row < RESULTS; ++row) {
+      T scale_value = scale_ptr[row * scale_width];
+      float scale = static_cast<float>(scale_value);
+      float bias;
+      if constexpr (DERIVE_BIAS) {
+        bias = k3_down_reduce_derive_affine2_bias<T>(scale_value);
+      } else {
+        bias = static_cast<float>(bias_ptr[row * scale_width]);
+      }
       result[row] += k3_down_reduce_qdot_2bit(
           weight_ptr + row * packed_input_width,
           x_thread,
-          static_cast<float>(scale_ptr[row * scale_width]),
-          static_cast<float>(bias_ptr[row * scale_width]),
+          scale,
+          bias,
           sum);
     }
     x_ptr += BLOCK_SIZE;
@@ -270,9 +283,12 @@ def fused_down_reduce_decode(
     *,
     results_per_threadgroup: int = 4,
     simdgroups_per_threadgroup: int = 8,
+    derive_bias: bool = False,
 ) -> mx.array:
     """Project, BF16-route, and reduce K3's selected decode experts."""
 
+    if not isinstance(derive_bias, bool):
+        raise TypeError("derive_bias must be a bool")
     if not supports_fused_down_reduce(
         activated,
         indices,
@@ -298,6 +314,7 @@ def fused_down_reduce_decode(
             ("T", activated.dtype),
             ("RESULTS", results_per_threadgroup),
             ("SIMDS", simdgroups_per_threadgroup),
+            ("DERIVE_BIAS", derive_bias),
         ],
         grid=(
             (K3_DOWN_OUTPUT_WIDTH // results_per_threadgroup)

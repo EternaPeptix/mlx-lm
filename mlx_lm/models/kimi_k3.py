@@ -19,6 +19,7 @@ from .base import (
 from .cache import ArraysCache, BatchKVCache, KVCache
 from .gated_delta import gated_delta_update
 from .kimi_k3_attnres_rms import maybe_fused_attnres_rms
+from .kimi_k3_derived_bias import validate_k3_biases_for_load
 from .kimi_k3_fused_expert import (
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
@@ -2399,6 +2400,7 @@ class LanguageModel(nn.Module):
                 weights[f"{ap}.embed_q.weight"] = wk
                 weights[f"{ap}.unembed_out.weight"] = wv
 
+        validate_k3_biases_for_load(self.model.layers, weights)
         return weights
 
     @property
