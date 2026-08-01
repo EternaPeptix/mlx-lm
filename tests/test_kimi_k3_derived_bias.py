@@ -102,20 +102,20 @@ class DerivedBiasContractTest(unittest.TestCase):
         ).view(mx.bfloat16)
         self.assertFalse(affine2_bias_relation_is_exact(scales, corrupt))
 
-    def test_load_validation_marks_only_gate_and_up_projections(self):
+    def test_load_validation_marks_all_exact_projections(self):
         os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
         derive_affine2_bias_enabled.cache_clear()
         layer = _Layer()
         weights = {}
         scales = _bf16_bits([0x0080, 0x8080, 0x3F80, 0xFF7F])
         biases = derived_affine2_biases(scales)
-        for name in ("gate_proj", "up_proj"):
+        for name in ("gate_proj", "up_proj", "down_proj"):
             prefix = f"model.layers.0.mlp.switch_mlp.{name}"
             weights[f"{prefix}.scales"] = scales
             weights[f"{prefix}.biases"] = biases
 
-        self.assertEqual(validate_k3_biases_for_load([layer], weights), 2)
-        for name in ("gate_proj", "up_proj"):
+        self.assertEqual(validate_k3_biases_for_load([layer], weights), 3)
+        for name in ("gate_proj", "up_proj", "down_proj"):
             projection = getattr(layer.mlp.switch_mlp, name)
             self.assertTrue(
                 projection_has_validated_derived_bias(
@@ -124,10 +124,77 @@ class DerivedBiasContractTest(unittest.TestCase):
                     biases,
                 )
             )
+
+    def test_load_validation_marks_only_mismatched_down_ineligible(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        layer = _Layer()
+        weights = {}
+        scales = _bf16_bits([0x3F80, 0xBF80])
+        biases = derived_affine2_biases(scales)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            prefix = f"model.layers.0.mlp.switch_mlp.{name}"
+            weights[f"{prefix}.scales"] = scales
+            weights[f"{prefix}.biases"] = biases
+        down_prefix = "model.layers.0.mlp.switch_mlp.down_proj"
+        weights[f"{down_prefix}.biases"] = _bf16_bits([0x0000, 0x4000])
+
+        self.assertEqual(validate_k3_biases_for_load([layer], weights), 2)
+        self.assertTrue(
+            projection_has_validated_derived_bias(
+                layer.mlp.switch_mlp.gate_proj,
+                scales,
+                biases,
+            )
+        )
+        self.assertTrue(
+            projection_has_validated_derived_bias(
+                layer.mlp.switch_mlp.up_proj,
+                scales,
+                biases,
+            )
+        )
         self.assertFalse(
-            hasattr(
+            projection_has_validated_derived_bias(
                 layer.mlp.switch_mlp.down_proj,
-                "_k3_affine2_derived_bias_validated",
+                scales,
+                biases,
+            )
+        )
+
+    def test_load_validation_still_requires_complete_down_metadata(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        prefix = "model.layers.0.mlp.switch_mlp.down_proj"
+        with self.assertRaisesRegex(ValueError, "both scales and biases"):
+            validate_k3_biases_for_load(
+                [_Layer()],
+                {f"{prefix}.scales": _bf16_bits([0x3F80])},
+            )
+
+    def test_load_validation_marks_nonfast_exact_down_ineligible(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        layer = _Layer()
+        prefix = "model.layers.0.mlp.switch_mlp.down_proj"
+        scales = _bf16_bits([0x0000, 0x0001, 0x7F80])
+        biases = derived_affine2_biases(scales)
+
+        self.assertEqual(
+            validate_k3_biases_for_load(
+                [layer],
+                {
+                    f"{prefix}.scales": scales,
+                    f"{prefix}.biases": biases,
+                },
+            ),
+            0,
+        )
+        self.assertFalse(
+            projection_has_validated_derived_bias(
+                layer.mlp.switch_mlp.down_proj,
+                _bf16_bits([0x3F80]),
+                _bf16_bits([0xC000]),
             )
         )
 

@@ -9,6 +9,7 @@ from mlx_lm.models.kimi_k3_derived_bias import (
     DERIVE_AFFINE2_BIAS_ENV,
     derive_affine2_bias_enabled,
     derived_affine2_biases,
+    projection_has_validated_derived_bias,
 )
 from mlx_lm.models.kimi_k3_fused_expert import (
     FUSED_DOWN_REDUCE_ENV,
@@ -200,11 +201,18 @@ class _Switch:
         return self.down_proj(activated, indices).squeeze(-2)
 
 
-def _install_derived_biases(switch: _Switch) -> None:
-    for projection in (
+def _install_derived_biases(
+    switch: _Switch,
+    *,
+    include_down: bool = False,
+) -> None:
+    projections = (
         switch.gate_proj,
         switch.up_proj,
-    ):
+    )
+    if include_down:
+        projections += (switch.down_proj,)
+    for projection in projections:
         projection.biases = derived_affine2_biases(projection.scales)
 
 
@@ -288,7 +296,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(candidate.shape, (1, 1, 3584))
         self.assertTrue(bool(mx.all(reference == candidate).item()))
 
-    def test_derived_bias_full_tp2_path_is_bit_exact(self):
+    def test_derived_bias_keeps_mismatched_down_on_stored_path(self):
         os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
         derive_affine2_bias_enabled.cache_clear()
         switch = _Switch.bounded_tp2_geometry_nonuniform()
@@ -299,16 +307,64 @@ class IntegrationTest(unittest.TestCase):
             shape=(1, 1, 16),
             dtype=mx.bfloat16,
         )
-        reference = (switch.stock(x, indices) * router_weights[..., None]).sum(axis=-2)
+        unreduced_reference = switch.stock(x, indices)
+        reference = (unreduced_reference * router_weights[..., None]).sum(axis=-2)
+        unreduced_candidate = maybe_fused_k3_switch_glu(switch, x, indices)
         candidate = maybe_fused_k3_switch_glu_reduce(
             switch,
             x,
             indices,
             router_weights,
         )
+        self.assertIsNotNone(unreduced_candidate)
         self.assertIsNotNone(candidate)
-        mx.eval(reference, candidate)
+        mx.eval(unreduced_reference, unreduced_candidate, reference, candidate)
+        self.assertTrue(
+            bool(mx.array_equal(unreduced_reference, unreduced_candidate).item())
+        )
         self.assertTrue(bool(mx.array_equal(reference, candidate).item()))
+        self.assertFalse(
+            projection_has_validated_derived_bias(
+                switch.down_proj,
+                switch.down_proj.scales,
+                switch.down_proj.biases,
+            )
+        )
+
+    def test_derived_bias_uses_exact_down_bank_and_is_bit_exact(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        switch = _Switch.bounded_tp2_geometry_nonuniform()
+        _install_derived_biases(switch, include_down=True)
+        x = mx.random.normal((1, 1, 3584), dtype=mx.bfloat16)
+        indices = mx.arange(16, dtype=mx.uint32).reshape(1, 1, 16)
+        router_weights = mx.random.uniform(
+            shape=(1, 1, 16),
+            dtype=mx.bfloat16,
+        )
+        unreduced_reference = switch.stock(x, indices)
+        reference = (unreduced_reference * router_weights[..., None]).sum(axis=-2)
+        unreduced_candidate = maybe_fused_k3_switch_glu(switch, x, indices)
+        candidate = maybe_fused_k3_switch_glu_reduce(
+            switch,
+            x,
+            indices,
+            router_weights,
+        )
+        self.assertIsNotNone(unreduced_candidate)
+        self.assertIsNotNone(candidate)
+        mx.eval(unreduced_reference, unreduced_candidate, reference, candidate)
+        self.assertTrue(
+            bool(mx.array_equal(unreduced_reference, unreduced_candidate).item())
+        )
+        self.assertTrue(bool(mx.array_equal(reference, candidate).item()))
+        self.assertTrue(
+            projection_has_validated_derived_bias(
+                switch.down_proj,
+                switch.down_proj.scales,
+                switch.down_proj.biases,
+            )
+        )
 
     def test_derived_bias_violation_falls_back_before_dispatch(self):
         os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
