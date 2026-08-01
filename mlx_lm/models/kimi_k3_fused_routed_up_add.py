@@ -24,6 +24,7 @@ FUSED_ROUTED_UP_ADD_ENV = "MLX_LM_KIMI_K3_FUSED_ROUTED_UP_ADD"
 
 K3_ROUTED_LATENT_SIZE = 3584
 K3_HIDDEN_SIZE = 7168
+K3_TP2_LOCAL_HIDDEN_SIZE = K3_HIDDEN_SIZE // 2
 K3_GROUP_SIZE = 64
 K3_BITS = 8
 
@@ -179,24 +180,32 @@ def supports_fused_routed_up_add(
     residual: mx.array,
     projection: tuple[mx.array, mx.array, mx.array],
 ) -> bool:
-    """Return whether values satisfy the exact K3 TP2 decode contract."""
+    """Return whether values satisfy an exact K3 routed-up decode contract.
+
+    Besides the accepted full-width path, the kernel may operate on one
+    output-row half for the separately gated TP2 column-sharding prototype.
+    The ordinary model adapter still passes full-width inputs, so broadening
+    this low-level primitive cannot silently enable the prototype.
+    """
 
     weight, scales, biases = projection
+    output_width = shared.shape[-1] if shared.ndim == 3 else 0
     static_contract = (
         routed_latent.shape == (1, 1, K3_ROUTED_LATENT_SIZE)
-        and shared.shape == (1, 1, K3_HIDDEN_SIZE)
+        and output_width in (K3_TP2_LOCAL_HIDDEN_SIZE, K3_HIDDEN_SIZE)
+        and shared.shape == (1, 1, output_width)
         and residual.shape == shared.shape
         and routed_latent.dtype == mx.bfloat16
         and shared.dtype == mx.bfloat16
         and residual.dtype == mx.bfloat16
         and weight.shape
         == (
-            K3_HIDDEN_SIZE,
+            output_width,
             K3_ROUTED_LATENT_SIZE * K3_BITS // 32,
         )
         and scales.shape
         == (
-            K3_HIDDEN_SIZE,
+            output_width,
             K3_ROUTED_LATENT_SIZE // K3_GROUP_SIZE,
         )
         and biases.shape == scales.shape
@@ -229,6 +238,7 @@ def fused_routed_up_add(
     kernel = _kernel()
     assert kernel is not None
     weight, scales, biases = projection
+    output_width = shared.shape[-1]
     return kernel(
         inputs=[
             routed_latent,
@@ -239,7 +249,7 @@ def fused_routed_up_add(
             biases,
         ],
         template=[("T", routed_latent.dtype)],
-        grid=(32, (K3_HIDDEN_SIZE // 8) * 2, 1),
+        grid=(32, (output_width // 8) * 2, 1),
         threadgroup=(32, 2, 1),
         output_shapes=[shared.shape],
         output_dtypes=[routed_latent.dtype],

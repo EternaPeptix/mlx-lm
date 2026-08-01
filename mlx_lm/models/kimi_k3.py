@@ -31,6 +31,11 @@ from .kimi_k3_fused_expert import (
 )
 from .kimi_k3_fused_routed_up_add import maybe_fused_k3_routed_up_add
 from .kimi_k3_fused_router import maybe_fused_k3_router
+from .kimi_k3_tp2_routed_up_column import (
+    configure_k3_tp2_routed_up_column,
+    maybe_k3_tp2_routed_up_column,
+    tp2_routed_up_column_enabled,
+)
 from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
 from .kimi_k3_packed_kda_projections import (
     invalidate_packed_k3_kda_skinny,
@@ -1383,22 +1388,33 @@ class KimiK3SparseMoE(nn.Module):
             y = self.routed_expert_norm(y)
         residual_consumed = False
         if self.latent_size is not None:
-            fused_up_add = (
-                maybe_fused_k3_routed_up_add(
-                    self,
-                    y,
-                    shared,
-                    residual,
-                )
-                if shared is not None and residual is not None
-                else None
+            tp2_up_add = maybe_k3_tp2_routed_up_column(
+                self,
+                y,
+                shared,
+                residual,
             )
-            if fused_up_add is None:
-                y = self.routed_expert_up_proj(y)
-            else:
-                y = fused_up_add
+            if tp2_up_add is not None:
+                y = tp2_up_add
                 shared = None
                 residual_consumed = True
+            else:
+                fused_up_add = (
+                    maybe_fused_k3_routed_up_add(
+                        self,
+                        y,
+                        shared,
+                        residual,
+                    )
+                    if shared is not None and residual is not None
+                    else None
+                )
+                if fused_up_add is None:
+                    y = self.routed_expert_up_proj(y)
+                else:
+                    y = fused_up_add
+                    shared = None
+                    residual_consumed = True
         if shared is not None:
             y = y + shared
         return y, residual_consumed
@@ -2931,6 +2947,11 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
+        if tp2_routed_up_column_enabled() and N != 2:
+            raise ValueError(
+                "Kimi K3 routed-up column sharding requires exactly TP2, "
+                f"got TP{N}"
+            )
         if N == 1:
             return
         self.model._invalidate_compiled_decode()
@@ -3030,6 +3051,7 @@ class Model(nn.Module):
                         "sharded-to-all",
                         group=group,
                     )
+                configure_k3_tp2_routed_up_column(layer.mlp, group)
             else:
                 layer.mlp.gate_proj = shard_linear(
                     layer.mlp.gate_proj, "all-to-sharded", group=group
