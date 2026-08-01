@@ -102,14 +102,32 @@ Reproduce it with:
 ```bash
 python3 benchmarks/kimi_k3_replayssm_capacity.py \
   --target-step-ms 130 --draft-step-ms 10 --replay-step-ms 1 \
-  --expected-accepted 2.6
+  --expected-emitted 2.6
 ```
 
 The latency flags above are an illustrative break-even scenario, not measured
-DSpark-on-MLX timings. They imply 2.397 accepted tokens per 141 ms round to
-clear 17 token/s, and 18.44 token/s at 2.6 accepted tokens per round. A live
-TP2 A/B must supply target, draft, replay, and acceptance measurements before
+DSpark-on-MLX timings. They imply 2.397 emitted tokens per 141 ms round—or
+1.397 accepted draft tokens plus the mandatory target bonus token—to clear
+17 token/s, and 18.44 token/s at 2.6 emitted tokens per round. A live TP2 A/B
+must supply target, draft, replay, and accepted-prefix measurements before
 making a throughput claim.
+
+The utility can also compare ordinary decode with pre-built width-three and
+width-eight tiers using an observed accepted-prefix survival curve. These are
+the cumulative probabilities `P(accepted_prefix >= i)`, not independent token
+acceptance probabilities:
+
+```bash
+python3 benchmarks/kimi_k3_replayssm_capacity.py \
+  --ordinary-step-ms 69.893 \
+  --acceptance-survival 0.95,0.75,0.35,0.15,0.05,0.02,0.01 \
+  --tier 3:132.64:8:0 --tier 8:255.13:8:0
+```
+
+This mirrors the cost-aware adaptive-speculation principle without putting a
+policy in the serving path prematurely. The real controller must use an EMA
+over measured round costs and survival counts, apply hysteresis, and switch
+only among pre-validated ordinary, width-three, and width-eight states.
 
 ## Verification
 
