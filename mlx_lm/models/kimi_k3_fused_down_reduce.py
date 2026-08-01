@@ -1,6 +1,6 @@
 """Exact Kimi K3 down-QMV, router weighting, and expert reduction.
 
-This decode-only Metal prototype keeps the sixteen selected-expert down
+This Metal prototype keeps the sixteen selected-expert down
 projection rows in threadgroup memory.  It then reproduces MLX's BF16 router
 multiply and fixed slot-order reduction before emitting the routed branch.
 The stock ``[top_k, latent]`` down-projection result is therefore never
@@ -12,7 +12,8 @@ The contract is intentionally limited to Kimi K3's TP2 geometry:
 * affine 2-bit weights with group size 128;
 * BF16 activations, scales, biases, and router weights;
 * a 1536-wide rank-local expert input; and
-* a 3584-wide routed latent output.
+* a 3584-wide routed latent output; and
+* one decode token or an exact width-two target-verification block.
 
 Unsupported platforms, shapes, or dtypes must use the stock MLX-LM path.
 """
@@ -79,6 +80,7 @@ constexpr uint GROUP_SIZE = 128;
 constexpr uint EXPERTS_PER_TOKEN = 16;
 
 const uint tile = threadgroup_position_in_grid.x;
+const uint token_index = threadgroup_position_in_grid.y;
 const uint simd_slot = simdgroup_index_in_threadgroup;
 const uint lane = thread_index_in_simdgroup;
 const uint output_base = tile * RESULTS;
@@ -87,6 +89,13 @@ const uint input_width = scales_shape[scales_ndim - 1] * GROUP_SIZE;
 const uint output_width = scales_shape[scales_ndim - 2];
 const uint packed_input_width = input_width / 4;
 const uint scale_width = input_width / GROUP_SIZE;
+const device uint32_t* token_indices =
+    indices + token_index * EXPERTS_PER_TOKEN;
+const device T* token_router_weights =
+    router_weights + token_index * EXPERTS_PER_TOKEN;
+const device T* token_x =
+    x + token_index * EXPERTS_PER_TOKEN * input_width;
+device T* token_routed = routed + token_index * output_width;
 
 thread float x_thread[VALUES_PER_THREAD];
 thread float result[RESULTS];
@@ -98,9 +107,9 @@ threadgroup T expert_outputs[EXPERTS_PER_TOKEN * RESULTS];
 for (uint expert_slot = simd_slot;
      expert_slot < EXPERTS_PER_TOKEN;
      expert_slot += SIMDS) {
-  const uint expert = indices[expert_slot];
+  const uint expert = token_indices[expert_slot];
   const device T* x_ptr =
-      x + expert_slot * input_width + lane * VALUES_PER_THREAD;
+      token_x + expert_slot * input_width + lane * VALUES_PER_THREAD;
   const device uint8_t* weight_ptr =
       reinterpret_cast<const device uint8_t*>(weight) +
       (expert * output_width + output_base) * packed_input_width +
@@ -154,7 +163,7 @@ if (simd_slot == 0 && lane < RESULTS) {
   for (uint row = 0; row < 8; ++row) {
     T partial = static_cast<T>(0.0f);
     for (uint slot = row; slot < EXPERTS_PER_TOKEN; slot += 8) {
-      T route_weight = static_cast<T>(router_weights[slot]);
+      T route_weight = static_cast<T>(token_router_weights[slot]);
       T product = static_cast<T>(
           expert_outputs[slot * RESULTS + lane] * route_weight);
       partial = static_cast<T>(product + partial);
@@ -165,7 +174,7 @@ if (simd_slot == 0 && lane < RESULTS) {
   for (uint row = 1; row < 8; ++row) {
     total = static_cast<T>(partials[row] + total);
   }
-  routed[output_base + lane] = total;
+  token_routed[output_base + lane] = total;
 }
 """
 
@@ -211,7 +220,9 @@ def supports_fused_down_reduce_projection(
     weight, scales, biases = projection
     if (
         indices.ndim != 3
-        or indices.shape != (1, 1, K3_TOP_K)
+        or indices.shape[0] != 1
+        or indices.shape[1] not in (1, 2)
+        or indices.shape[2] != K3_TOP_K
         or indices.dtype != mx.uint32
         or router_weights.shape != indices.shape
         or router_weights.dtype != mx.bfloat16
@@ -248,10 +259,18 @@ def supports_fused_down_reduce(
 ) -> bool:
     """Return whether all inputs satisfy the fail-closed decode contract."""
 
+    if indices.ndim != 3:
+        return False
     return (
         activated.dtype == mx.bfloat16
         and activated.shape
-        == (1, 1, K3_TOP_K, 1, K3_DOWN_INPUT_WIDTH)
+        == (
+            1,
+            indices.shape[1],
+            K3_TOP_K,
+            1,
+            K3_DOWN_INPUT_WIDTH,
+        )
         and supports_fused_down_reduce_projection(
             indices,
             router_weights,
@@ -271,7 +290,7 @@ def fused_down_reduce_decode(
     results_per_threadgroup: int = 4,
     simdgroups_per_threadgroup: int = 8,
 ) -> mx.array:
-    """Project, BF16-route, and reduce K3's selected decode experts."""
+    """Project, BF16-route, and reduce K3's selected routed experts."""
 
     if not supports_fused_down_reduce(
         activated,
@@ -303,11 +322,11 @@ def fused_down_reduce_decode(
             (K3_DOWN_OUTPUT_WIDTH // results_per_threadgroup)
             * 32
             * simdgroups_per_threadgroup,
-            1,
+            indices.shape[1],
             1,
         ),
         threadgroup=(32 * simdgroups_per_threadgroup, 1, 1),
-        output_shapes=[(1, 1, K3_DOWN_OUTPUT_WIDTH)],
+        output_shapes=[(1, indices.shape[1], K3_DOWN_OUTPUT_WIDTH)],
         output_dtypes=[activated.dtype],
         stream=mx.gpu,
     )[0]

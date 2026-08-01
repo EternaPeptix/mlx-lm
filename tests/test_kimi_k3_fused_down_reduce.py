@@ -92,6 +92,41 @@ class FusedDownReduceTest(unittest.TestCase):
                 f"results={results}, simdgroups={simdgroups}",
             )
 
+    def test_width_two_verification_is_bit_exact(self):
+        mx.random.seed(39)
+        width = 2
+        activated = mx.random.normal(
+            (1, width, K3_TOP_K, 1, K3_DOWN_INPUT_WIDTH),
+            dtype=mx.bfloat16,
+        )
+        indices = mx.stack(
+            [
+                mx.roll(mx.arange(K3_TOP_K, dtype=mx.uint32), shift)
+                for shift in range(width)
+            ]
+        )[None]
+        router_weights = mx.random.uniform(
+            shape=(1, width, K3_TOP_K),
+            dtype=mx.bfloat16,
+        )
+        reference = _stock_down_reduce(
+            activated,
+            indices,
+            router_weights,
+            self.projection,
+        )
+        candidate = fused_down_reduce_decode(
+            activated,
+            indices,
+            router_weights,
+            self.projection,
+            results_per_threadgroup=4,
+            simdgroups_per_threadgroup=16,
+        )
+        mx.eval(reference, candidate)
+        self.assertEqual(candidate.shape, (1, width, K3_DOWN_OUTPUT_WIDTH))
+        self.assertTrue(bool(mx.all(reference == candidate).item()))
+
     def test_router_weights_remain_dynamic_on_cached_kernel(self):
         mx.random.seed(41)
         activated = mx.random.normal(
@@ -152,6 +187,14 @@ class FusedDownReduceTest(unittest.TestCase):
                 activated,
                 self.indices,
                 router_weights.astype(mx.float32),
+            ),
+            (
+                mx.broadcast_to(
+                    activated,
+                    (1, 3, K3_TOP_K, 1, K3_DOWN_INPUT_WIDTH),
+                ),
+                mx.broadcast_to(self.indices, (1, 3, K3_TOP_K)),
+                mx.broadcast_to(router_weights, (1, 3, K3_TOP_K)),
             ),
         )
         for values, indices, weights in cases:

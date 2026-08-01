@@ -1,9 +1,9 @@
-"""Exact-weight fused 2-bit SwitchGLU input projection for Kimi K3 decode.
+"""Exact-weight fused 2-bit SwitchGLU input projection for Kimi K3.
 
-This is an inference prototype for the Metal decode case only:
+This is an inference prototype for Metal decode and target verification:
 
 * affine 2-bit weights with group size 128;
-* one token, top-k expert routing;
+* one decode token or an exact width-two target-verification block;
 * input width divisible by 512 and rank-local intermediate width by 8;
 * BF16 activations; and
 * Kimi K3's SiTU(beta=4, linear_beta=25).
@@ -77,8 +77,11 @@ constexpr int GROUP_SIZE = 128;
 constexpr float BETA = 4.0f;
 constexpr float LINEAR_BETA = 25.0f;
 
-const uint expert_slot = threadgroup_position_in_grid.z;
-const uint expert = indices[expert_slot];
+const uint experts_per_token = indices_shape[indices_ndim - 1];
+const uint flattened_slot = threadgroup_position_in_grid.z;
+const uint token_index = flattened_slot / experts_per_token;
+const uint expert_slot = flattened_slot - token_index * experts_per_token;
+const uint expert = indices[flattened_slot];
 const uint output_base =
     threadgroup_position_in_grid.y * OUTPUTS_PER_THREADGROUP +
     simdgroup_index_in_threadgroup * RESULTS;
@@ -89,7 +92,8 @@ const uint output_width = up_scales_shape[up_scales_ndim - 2];
 const uint packed_input_width = input_width / 4;
 const uint scale_width = input_width / GROUP_SIZE;
 
-const device T* x_ptr = x + lane * VALUES_PER_THREAD;
+const device T* x_ptr =
+    x + token_index * input_width + lane * VALUES_PER_THREAD;
 const device uint8_t* up_ptr =
     reinterpret_cast<const device uint8_t*>(up_weight) +
     (expert * output_width + output_base) * packed_input_width +
@@ -162,7 +166,7 @@ for (int row = 0; row < RESULTS; ++row) {
     up_value =
         LINEAR_BETA * metal::precise::tanh(up_value / LINEAR_BETA);
     const uint output = output_base + row;
-    y[expert_slot * output_width + output] =
+    y[flattened_slot * output_width + output] =
         static_cast<T>(activation * up_value);
   }
 }
@@ -202,7 +206,12 @@ def supports_fused_switch_situ(
 
     if x.dtype != mx.bfloat16 or _kernel() is None:
         return False
-    if x.ndim != 3 or x.shape[0] != 1 or x.shape[-2] != 1 or indices.ndim != 3:
+    if (
+        x.ndim != 3
+        or x.shape[0] != 1
+        or x.shape[-2] not in (1, 2)
+        or indices.ndim != 3
+    ):
         return False
     if indices.shape[:-1] != x.shape[:-1] or indices.dtype != mx.uint32:
         return False
@@ -248,7 +257,7 @@ def fused_switch_situ_decode(
     kernel = _kernel()
     assert kernel is not None
     output_width = up[1].shape[-2]
-    top_k = indices.shape[-1]
+    routed_slots = indices.size
     tile = results_per_simdgroup * simdgroups
     if output_width % tile:
         raise ValueError("output width must be divisible by the fused tile")
@@ -259,7 +268,7 @@ def fused_switch_situ_decode(
             ("RESULTS", results_per_simdgroup),
             ("SIMDS", simdgroups),
         ],
-        grid=(32, (output_width // tile) * simdgroups, top_k),
+        grid=(32, (output_width // tile) * simdgroups, routed_slots),
         threadgroup=(32, simdgroups, 1),
         output_shapes=[(*indices.shape, 1, output_width)],
         output_dtypes=[x.dtype],

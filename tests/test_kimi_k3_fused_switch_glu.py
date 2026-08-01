@@ -46,28 +46,36 @@ class FusedSwitchGLUTest(unittest.TestCase):
         mx.eval(self.x, self.indices, *self.up, *self.gate)
 
     def test_matches_native_quantized_path(self):
-        reference = _reference(self.x, self.indices, self.up, self.gate)
-        for results, simds in ((2, 1), (4, 2), (4, 4), (8, 1), (8, 2)):
-            candidate = fused_switch_situ_decode(
-                self.x,
-                self.indices,
-                self.up,
-                self.gate,
-                results_per_simdgroup=results,
-                simdgroups=simds,
+        for width in (1, 2):
+            x = mx.random.normal((1, width, 512), dtype=mx.bfloat16)
+            indices = mx.concatenate(
+                [mx.roll(self.indices, shift, axis=-1) for shift in range(width)],
+                axis=1,
             )
-            mx.eval(reference, candidate)
-            self.assertEqual(reference.shape, candidate.shape)
-            self.assertTrue(
-                bool(mx.all(reference == candidate).item()),
-                (results, simds),
-            )
+            reference = _reference(x, indices, self.up, self.gate)
+            for results, simds in ((2, 1), (4, 2), (4, 4), (8, 1), (8, 2)):
+                candidate = fused_switch_situ_decode(
+                    x,
+                    indices,
+                    self.up,
+                    self.gate,
+                    results_per_simdgroup=results,
+                    simdgroups=simds,
+                )
+                mx.eval(reference, candidate)
+                self.assertEqual(reference.shape, candidate.shape)
+                self.assertTrue(
+                    bool(mx.all(reference == candidate).item()),
+                    (width, results, simds),
+                )
 
-    def test_contract_rejects_prefill(self):
-        prefill = mx.broadcast_to(self.x, (1, 2, 512))
-        self.assertFalse(
-            supports_fused_switch_situ(prefill, self.indices, self.up, self.gate)
-        )
+    def test_contract_rejects_unproven_verification_widths(self):
+        for width in (3, 8):
+            prefill = mx.broadcast_to(self.x, (1, width, 512))
+            indices = mx.broadcast_to(self.indices, (1, width, 4))
+            self.assertFalse(
+                supports_fused_switch_situ(prefill, indices, self.up, self.gate)
+            )
 
 
 if __name__ == "__main__":

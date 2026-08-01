@@ -124,7 +124,7 @@ def maybe_fused_k3_switch_glu(
     x: mx.array,
     indices: mx.array,
 ) -> mx.array | None:
-    """Return an exact fused decode result, or ``None`` for the stock path."""
+    """Return an exact fused decode/verification result, or ``None``."""
 
     if not fused_k3_experts_enabled() or getattr(switch_mlp, "training", True):
         return None
@@ -164,7 +164,7 @@ def maybe_fused_k3_switch_glu_reduce(
     indices: mx.array,
     router_weights: mx.array,
 ) -> mx.array | None:
-    """Return the fully reduced exact decode result, or use the stock path."""
+    """Return the fully reduced exact decode/verification result, or stock."""
 
     if (
         not fused_k3_experts_enabled()

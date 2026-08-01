@@ -200,6 +200,30 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(candidate.shape, (1, 1, 3584))
         self.assertTrue(bool(mx.all(reference == candidate).item()))
 
+    def test_width_two_full_fused_expert_is_bit_exact(self):
+        switch = _Switch.bounded_tp2_geometry()
+        width = 2
+        x = mx.random.normal((1, width, 3584), dtype=mx.bfloat16)
+        base = mx.arange(16, dtype=mx.uint32)
+        indices = mx.stack([mx.roll(base, shift) for shift in range(width)])[None]
+        router_weights = mx.random.uniform(
+            shape=(1, width, 16),
+            dtype=mx.bfloat16,
+        )
+        reference = (
+            switch.stock(x, indices) * router_weights[..., None]
+        ).sum(axis=-2)
+        candidate = maybe_fused_k3_switch_glu_reduce(
+            switch,
+            x,
+            indices,
+            router_weights,
+        )
+        self.assertIsNotNone(candidate)
+        mx.eval(reference, candidate)
+        self.assertEqual(candidate.shape, (1, width, 3584))
+        self.assertTrue(bool(mx.all(reference == candidate).item()))
+
     def test_down_route_reduce_has_an_independent_default_off_flag(self):
         os.environ.pop(FUSED_DOWN_REDUCE_ENV)
         fused_k3_down_reduce_enabled.cache_clear()
@@ -254,13 +278,17 @@ class IntegrationTest(unittest.TestCase):
             )
         )
 
-    def test_non_decode_shapes_and_dtypes_fall_back(self):
+    def test_unsupported_shapes_and_dtypes_fall_back(self):
         switch = _Switch()
         indices = mx.array([[[1, 3, 5, 7]]], dtype=mx.uint32)
         cases = (
             (
-                mx.zeros((1, 2, 512), dtype=mx.bfloat16),
-                mx.broadcast_to(indices, (1, 2, 4)),
+                mx.zeros((1, 9, 512), dtype=mx.bfloat16),
+                mx.broadcast_to(indices, (1, 9, 4)),
+            ),
+            (
+                mx.zeros((2, 1, 512), dtype=mx.bfloat16),
+                mx.broadcast_to(indices, (2, 1, 4)),
             ),
             (mx.zeros((1, 1, 512), dtype=mx.float32), indices),
         )
