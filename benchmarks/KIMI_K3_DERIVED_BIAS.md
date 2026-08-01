@@ -75,10 +75,8 @@ derives gate/up bias in both arms; only the candidate derives down bias.
 | Selective full chain | 0.340406 ms/layer | 0.336531 ms/layer | 1.0115x | 1.0114x | 37/63 |
 
 Every tested output was bit exact.  The selective full-chain gain is small but
-positive, and applies to 81/92 layers on both ranks.  This passes an
-experimental retain gate, not a production promotion gate: the projected
-cluster-level decode gain is roughly 1%, and a whole-instance M3 Ultra TP2 A/B
-is still required before deployment.
+positive, and applies to 81/92 layers on both ranks.  This passed the local
+retain gate and was subsequently tested on the two-M3-Ultra TP2 instance.
 
 ## Laguna row-tile audit
 
@@ -98,19 +96,39 @@ is not transferable evidence.  It remains a valid separate M3 Ultra A/B, but
 must not be bundled with this candidate because doing so would confound the
 derived-bias result.
 
-## Live A/B contract
+## Live M3 Ultra TP2 A/B
 
-Both ranks must use the same MLX-LM commit and the same flag value before
-process start.  Keep the accepted TP2 feature set fixed and restart the whole
-instance between arms:
+The cluster A/B kept the accepted EXO, MLX core, rank-local checkpoints,
+JACCL mesh transport, asynchronous `laguna8` scheduling, and every feature
+flag fixed.  Both arms used
+`MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS=1`: retained commit `2606b9c` therefore
+derived gate/up only, while candidate `e76b7ce` additionally selected exact
+down banks and fell back to stored bias for the non-exact banks.  The whole
+instance was restarted between arms.
 
-```text
-control:   MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS=0
-candidate: MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS=1
-```
+The canonical five-run benchmark used an actual 218-token prompt and generated
+128 greedy tokens.  Every sample in both arms produced completion SHA-256
+`b657ce358ead5b2773b7bd95372d012dda8af62e84b7ce7cd447196ed63cf17f`.
 
-Run the canonical 575-prompt-token/128-decode-token benchmark for at least
-three repetitions and require the exact completion SHA to match the accepted
-control.  The harness must pass this environment variable identically to both
-ranks; changing it in a running process is unsupported because selectors and
-compiled graphs are cached.
+| Arm | Median generation throughput | Delta |
+|---|---:|---:|
+| Same-session retained control `2606b9c` | 14.295692 tok/s | baseline |
+| Selective down `e76b7ce` | 14.372490 tok/s | +0.537% |
+| Earlier canonical retained control | 14.339022 tok/s | candidate +0.233% |
+
+Artifacts:
+
+- candidate: `k3-tp2-benchmark-20260801T210233Z-summary.json`;
+- same-session control: `k3-tp2-benchmark-20260801T211245Z-summary.json`;
+- earlier canonical control: `k3-tp2-benchmark-20260801T190305Z-summary.json`.
+
+The matched prefill points were neutral within run variance: 575 tokens
+measured 114.8308 tok/s versus 114.9358 (-0.091%); 2,000 measured 147.8694
+versus 147.6961 (+0.117%); and 7,705 measured 154.7816 versus the closest
+retained 154.9246 (-0.092%).  Candidate artifact:
+`k3-tp2-benchmark-20260801T210438Z-summary.json`.
+
+This is a small exact decode win, not evidence for higher prefill throughput.
+It is suitable for an experimental/public branch and as an ingredient in a
+later compounded exact stack; it does not by itself justify a broad upstream
+performance claim.
