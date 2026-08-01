@@ -17,7 +17,7 @@ import mlx.core as mx
 
 DERIVE_AFFINE2_BIAS_ENV = "MLX_LM_KIMI_K3_DERIVE_AFFINE2_BIAS"
 _VALIDATED_ATTR = "_k3_affine2_derived_bias_validated"
-_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+_PROJECTIONS = ("gate_proj", "up_proj")
 
 
 @lru_cache(maxsize=1)
@@ -155,13 +155,15 @@ def validate_k3_biases_for_load(
     layers: Sequence[Any],
     weights: Mapping[str, mx.array],
 ) -> int:
-    """Validate and mark every routed expert projection present in a load.
+    """Validate and mark every routed gate/up projection present in a load.
 
     A metadata-only model construction legitimately supplies no expert
     tensors and returns zero.  Once any member of a projection is present,
     both metadata arrays are mandatory and a mismatch fails the load.  The
     check is intentionally full-array and bitwise; sampled validation is not
-    sufficient authority to skip a runtime metadata load.
+    sufficient authority to skip a runtime metadata load.  Down projections
+    retain their authoritative bias arrays because the shipped rank-1 weights
+    contain at least one bank that violates the derivation contract.
     """
 
     if not derive_affine2_bias_enabled():

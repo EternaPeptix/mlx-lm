@@ -102,27 +102,6 @@ def _compiled_tuned_gather_qmv(
 
 
 @partial(mx.compile, shapeless=False)
-def _compiled_tuned_gather_qmv_derived_bias(
-    x: mx.array,
-    indices: mx.array,
-    weight: mx.array,
-    scales: mx.array,
-    biases: mx.array,
-) -> mx.array:
-    """Run the tuned down stage while deriving validated affine biases."""
-
-    return tuned_gather_qmv(
-        x,
-        indices,
-        (weight, scales, biases),
-        results_per_simdgroup=4,
-        simdgroups=2,
-        broadcast_x=False,
-        derive_bias=True,
-    )
-
-
-@partial(mx.compile, shapeless=False)
 def _compiled_fused_down_reduce(
     x: mx.array,
     indices: mx.array,
@@ -141,28 +120,6 @@ def _compiled_fused_down_reduce(
         results_per_threadgroup=4,
         simdgroups_per_threadgroup=16,
         derive_bias=False,
-    )
-
-
-@partial(mx.compile, shapeless=False)
-def _compiled_fused_down_reduce_derived_bias(
-    x: mx.array,
-    indices: mx.array,
-    router_weights: mx.array,
-    weight: mx.array,
-    scales: mx.array,
-    biases: mx.array,
-) -> mx.array:
-    """Run fused down/reduce while deriving validated affine biases."""
-
-    return fused_down_reduce_decode(
-        x,
-        indices,
-        router_weights,
-        (weight, scales, biases),
-        results_per_threadgroup=4,
-        simdgroups_per_threadgroup=16,
-        derive_bias=True,
     )
 
 
@@ -247,7 +204,6 @@ def maybe_fused_k3_switch_glu(
         (
             (switch_mlp.up_proj, up),
             (switch_mlp.gate_proj, gate),
-            (switch_mlp.down_proj, down),
         )
     ):
         return None
@@ -267,11 +223,7 @@ def maybe_fused_k3_switch_glu(
         broadcast_x=False,
     ):
         return None
-    tuned_down = (
-        _compiled_tuned_gather_qmv_derived_bias
-        if derive_bias
-        else _compiled_tuned_gather_qmv
-    )
+    tuned_down = _compiled_tuned_gather_qmv
     output = tuned_down(activated, indices, *down)
     return output.squeeze(-2)
 
@@ -319,7 +271,6 @@ def maybe_fused_k3_switch_glu_reduce(
         (
             (switch_mlp.up_proj, up),
             (switch_mlp.gate_proj, gate),
-            (switch_mlp.down_proj, down),
         )
     ):
         return None
@@ -339,11 +290,7 @@ def maybe_fused_k3_switch_glu_reduce(
         simdgroups_per_threadgroup=16,
     ):
         return None
-    fused_down = (
-        _compiled_fused_down_reduce_derived_bias
-        if derive_bias
-        else _compiled_fused_down_reduce
-    )
+    fused_down = _compiled_fused_down_reduce
     return fused_down(
         activated,
         indices,

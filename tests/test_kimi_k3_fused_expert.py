@@ -208,7 +208,6 @@ def _install_derived_biases(switch: _Switch) -> None:
     for projection in (
         switch.gate_proj,
         switch.up_proj,
-        switch.down_proj,
     ):
         projection.biases = derived_affine2_biases(projection.scales)
 
