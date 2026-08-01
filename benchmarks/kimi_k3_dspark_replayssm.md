@@ -129,9 +129,47 @@ policy in the serving path prematurely. The real controller must use an EMA
 over measured round costs and survival counts, apply hysteresis, and switch
 only among pre-validated ordinary, width-three, and width-eight states.
 
+## Projected-context append storage
+
+`KimiK3DSparkContextCache` uses an occupied-prefix capacity buffer instead of
+concatenating the complete projected target context on every append. Capacity
+doubles while small, then grows by at most 65,536 tokens at a time. Only the
+occupied prefix is exposed to attention, so unused capacity cannot change the
+attention inputs or offsets. A caller that knows the complete request budget
+can allocate once:
+
+```python
+context_cache = proposer.make_context_cache(
+    capacity_hint=prompt_tokens + max_generated_tokens,
+)
+```
+
+For one million single-token appends, the default growth schedule produces 24
+allocations, a final capacity of 1,048,576, and 7,929,600 copied history-token
+positions per layer. Repeated exact-size concatenation would copy
+499,999,500,000 positions, 63,054.8 times as many. The capacity hint reduces
+intermediate history copies to zero when it covers the request.
+
+The production five-layer BF16 DSpark context stores 20,480 bytes per logical
+token across K and V. The bounded-growth schedule therefore keeps unused
+capacity below 1.25 GiB across all five layers; at one million tokens its
+48,576-token slack is about 0.93 GiB. These are deterministic allocation and
+copy-volume calculations, not a claim about end-to-end latency or MLX allocator
+peak residency.
+
 ## Verification
 
-Focused DSpark contract/model, target-cache, and ReplaySSM capacity tests:
+The cache-focused DSpark model suite passed 15 tests and 3 subtests. It covers
+content and offsets before, at, and after capacity growth; capacity-hint
+allocation; one-million-token copy/slack bounds; and bit-identical attention
+output for single-append versus split-append context.
+
+The complete Kimi K3 test glob on this branch passed 174 tests, skipped 2, and
+passed 145 subtests. One existing fused SwitchGLU exact-equality test failed in
+both this branch and the untouched `ebf0747` base under the same MLX runtime.
+
+Earlier focused DSpark contract/model, target-cache, and ReplaySSM capacity
+tests reported:
 
 ```text
 40 passed, 20 subtests passed

@@ -24,7 +24,9 @@ from mlx_lm.models.kimi_k3_dspark import (
     RADIXARK_KIMI_K3_DSPARK_WEIGHTS_BYTES,
     RADIXARK_KIMI_K3_DSPARK_WEIGHTS_SHA256,
     KimiK3DSparkArgs,
+    KimiK3DSparkAttention,
     KimiK3DSparkCheckpointFile,
+    KimiK3DSparkContextCache,
     KimiK3DSparkModel,
     KimiK3DSparkProposer,
     attest_kimi_k3_dspark_file,
@@ -154,6 +156,161 @@ class KimiK3DSparkInventoryTest(unittest.TestCase):
             path.write_bytes(payload + b"!")
             with self.assertRaisesRegex(ValueError, "bytes"):
                 attest_kimi_k3_dspark_file(path, manifest)
+
+
+class KimiK3DSparkContextCacheTest(unittest.TestCase):
+    @staticmethod
+    def _context_chunk(start: int, length: int) -> tuple[mx.array, mx.array]:
+        values = mx.arange(start, start + 6 * length, dtype=mx.float32)
+        keys = values.reshape(1, length, 2, 3).transpose(0, 2, 1, 3)
+        return keys, keys + 1_000
+
+    def test_append_preserves_content_across_capacity_boundaries(self):
+        cache = KimiK3DSparkContextCache(step=4, max_growth=8)
+        expected_keys = []
+        expected_values = []
+        offset = 0
+
+        for length, expected_capacity in ((3, 4), (1, 4), (1, 8), (3, 8), (5, 16)):
+            keys, values = self._context_chunk(6 * offset, length)
+            cache.append(keys, values)
+            expected_keys.append(keys)
+            expected_values.append(values)
+            offset += length
+
+            visible_keys = cache.keys
+            visible_values = cache.values
+            self.assertIsNotNone(visible_keys)
+            self.assertIsNotNone(visible_values)
+            assert visible_keys is not None and visible_values is not None
+            mx.eval(visible_keys, visible_values)
+            self.assertEqual(cache.length, offset)
+            self.assertEqual(cache.capacity, expected_capacity)
+            self.assertEqual(tuple(visible_keys.shape), (1, 2, offset, 3))
+            self.assertTrue(
+                bool(
+                    mx.array_equal(
+                        visible_keys,
+                        mx.concatenate(expected_keys, axis=2),
+                    ).item()
+                )
+            )
+            self.assertTrue(
+                bool(
+                    mx.array_equal(
+                        visible_values,
+                        mx.concatenate(expected_values, axis=2),
+                    ).item()
+                )
+            )
+
+        self.assertEqual(cache.allocation_count, 3)
+        self.assertEqual(cache.copied_tokens, 12)
+
+    def test_capacity_hint_avoids_intermediate_history_copies(self):
+        cache = KimiK3DSparkContextCache(
+            capacity_hint=10,
+            step=4,
+            max_growth=8,
+        )
+        first = self._context_chunk(0, 2)
+        second = self._context_chunk(12, 10)
+
+        cache.append(*first)
+        self.assertEqual(cache.capacity, 12)
+        cache.append(*second)
+        mx.eval(cache.keys, cache.values)
+
+        self.assertEqual(cache.length, 12)
+        self.assertEqual(cache.capacity, 12)
+        self.assertEqual(cache.allocation_count, 1)
+        self.assertEqual(cache.copied_tokens, 0)
+        self.assertTrue(
+            bool(
+                mx.array_equal(
+                    cache.keys,
+                    mx.concatenate([first[0], second[0]], axis=2),
+                ).item()
+            )
+        )
+
+    def test_proposer_forwards_capacity_hint_to_every_draft_layer(self):
+        model = KimiK3DSparkModel(_tiny_args())
+        proposer = KimiK3DSparkProposer(model)
+        context = proposer.make_context_cache(capacity_hint=512)
+        taps = (
+            mx.ones((1, 3, 8), dtype=mx.float32),
+            mx.full((1, 3, 8), 0.5, dtype=mx.float32),
+        )
+
+        proposer.append_target_context(
+            taps,
+            0,
+            context,
+            use_stacked_context_kv=False,
+        )
+        mx.eval(
+            *[cache.keys for cache in context],
+            *[cache.values for cache in context],
+        )
+
+        self.assertEqual({cache.length for cache in context}, {3})
+        self.assertEqual({cache.capacity for cache in context}, {512})
+        self.assertEqual({cache.allocation_count for cache in context}, {1})
+        self.assertEqual({cache.copied_tokens for cache in context}, {0})
+
+    def test_split_and_single_append_have_identical_attention_semantics(self):
+        args = _tiny_args()
+        attention = KimiK3DSparkAttention(args)
+        target_hidden = mx.arange(40, dtype=mx.float32).reshape(1, 5, 8) / 17
+        noise_hidden = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8) / 11
+        single = KimiK3DSparkContextCache(step=4, max_growth=8)
+        split = KimiK3DSparkContextCache(step=4, max_growth=8)
+
+        single.append(*attention.project_context(target_hidden, offset=0))
+        split.append(*attention.project_context(target_hidden[:, :2], offset=0))
+        split.append(*attention.project_context(target_hidden[:, 2:], offset=2))
+        single_output = attention(noise_hidden, block_offset=5, cache=single)
+        split_output = attention(noise_hidden, block_offset=5, cache=split)
+        mx.eval(single.keys, single.values, split.keys, split.values)
+        mx.eval(single_output, split_output)
+
+        self.assertEqual(single.length, split.length)
+        self.assertTrue(bool(mx.array_equal(single.keys, split.keys).item()))
+        self.assertTrue(bool(mx.array_equal(single.values, split.values).item()))
+        self.assertTrue(
+            bool(mx.allclose(single_output, split_output, rtol=0, atol=0).item())
+        )
+
+    def test_one_million_token_growth_has_bounded_slack_and_copy_cost(self):
+        cache = KimiK3DSparkContextCache()
+        total_tokens = 1_000_000
+        capacity = 0
+        copied_tokens = 0
+        allocations = 0
+
+        while capacity < total_tokens:
+            required = capacity + 1
+            if capacity:
+                copied_tokens += capacity
+            capacity = cache._planned_capacity(capacity, required)
+            allocations += 1
+
+        naive_copied_tokens = total_tokens * (total_tokens - 1) // 2
+        self.assertLess(capacity - total_tokens, cache.max_growth)
+        self.assertLess(copied_tokens, 8 * total_tokens)
+        self.assertGreater(naive_copied_tokens // copied_tokens, 60_000)
+        self.assertLess(allocations, 32)
+
+    def test_capacity_contract_rejects_invalid_values(self):
+        for kwargs in (
+            {"capacity_hint": -1},
+            {"step": 0},
+            {"max_growth": 128},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    KimiK3DSparkContextCache(**kwargs)
 
 
 class KimiK3DSparkModelTest(unittest.TestCase):

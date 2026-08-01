@@ -354,36 +354,164 @@ def attest_kimi_k3_dspark_weights(
 
 
 class KimiK3DSparkContextCache:
-    """Append-only projected target-context K/V for one draft layer."""
+    """Append-only projected target-context K/V for one draft layer.
 
-    __slots__ = ("keys", "values")
+    The occupied prefix is stored in a capacity buffer.  Small appends write
+    into existing storage instead of concatenating the complete context on
+    every token.  Capacity grows geometrically at first, then in bounded
+    increments so a long-context allocation does not reserve an unbounded
+    fraction of unused memory.
 
-    def __init__(self):
-        self.keys: mx.array | None = None
-        self.values: mx.array | None = None
+    ``capacity_hint`` is useful when the prompt length is known up front.  It
+    avoids every intermediate history copy while retaining the same logical
+    K/V shape exposed through :attr:`keys` and :attr:`values`.
+    """
+
+    step: int = 256
+    max_growth: int = 65_536
+
+    __slots__: tuple[str, ...] = (
+        "_allocation_count",
+        "_capacity_hint",
+        "_copied_tokens",
+        "_keys",
+        "_max_growth",
+        "_offset",
+        "_step",
+        "_values",
+    )
+
+    def __init__(
+        self,
+        *,
+        capacity_hint: int = 0,
+        step: int | None = None,
+        max_growth: int | None = None,
+    ):
+        step = self.step if step is None else step
+        max_growth = self.max_growth if max_growth is None else max_growth
+        if type(capacity_hint) is not int or capacity_hint < 0:
+            raise ValueError("Kimi K3 DSpark context capacity hint is invalid")
+        if type(step) is not int or step <= 0:
+            raise ValueError("Kimi K3 DSpark context capacity step is invalid")
+        if type(max_growth) is not int or max_growth < step:
+            raise ValueError("Kimi K3 DSpark context maximum growth is invalid")
+        self._keys: mx.array | None = None
+        self._values: mx.array | None = None
+        self._offset: int = 0
+        self._capacity_hint: int = capacity_hint
+        self._step: int = step
+        self._max_growth: int = max_growth
+        self._allocation_count: int = 0
+        self._copied_tokens: int = 0
+
+    @property
+    def keys(self) -> mx.array | None:
+        if self._keys is None:
+            return None
+        return self._keys[..., : self._offset, :]
+
+    @property
+    def values(self) -> mx.array | None:
+        if self._values is None:
+            return None
+        return self._values[..., : self._offset, :]
 
     @property
     def length(self) -> int:
-        return 0 if self.keys is None else int(self.keys.shape[2])
+        return self._offset
+
+    @property
+    def capacity(self) -> int:
+        return 0 if self._keys is None else int(self._keys.shape[2])
+
+    @property
+    def allocation_count(self) -> int:
+        """Number of backing-buffer allocations, including the first one."""
+
+        return self._allocation_count
+
+    @property
+    def copied_tokens(self) -> int:
+        """Logical history positions copied while growing the buffer."""
+
+        return self._copied_tokens
+
+    def _round_capacity(self, capacity: int) -> int:
+        return ((capacity + self._step - 1) // self._step) * self._step
+
+    def _planned_capacity(self, current: int, required: int) -> int:
+        if required <= current:
+            return current
+        if current == 0:
+            return self._round_capacity(max(required, self._capacity_hint))
+        growth = min(self._max_growth, max(self._step, current))
+        return self._round_capacity(max(required, current + growth))
+
+    def _next_capacity(self, required: int) -> int:
+        return self._planned_capacity(self.capacity, required)
+
+    @staticmethod
+    def _padding_like(value: mx.array, length: int) -> mx.array:
+        shape = (*value.shape[:2], length, value.shape[3])
+        return mx.zeros(shape, dtype=value.dtype)
+
+    def _allocate_with_append(
+        self,
+        keys: mx.array,
+        values: mx.array,
+        required: int,
+    ) -> None:
+        new_capacity = self._next_capacity(required)
+        padding = new_capacity - required
+        key_parts = [keys]
+        value_parts = [values]
+        if self._keys is not None:
+            assert self._values is not None
+            key_parts.insert(0, self._keys[..., : self._offset, :])
+            value_parts.insert(0, self._values[..., : self._offset, :])
+            self._copied_tokens += self._offset
+        if padding:
+            key_parts.append(self._padding_like(keys, padding))
+            value_parts.append(self._padding_like(values, padding))
+        self._keys = (
+            key_parts[0] if len(key_parts) == 1 else mx.concatenate(key_parts, axis=2)
+        )
+        self._values = (
+            value_parts[0]
+            if len(value_parts) == 1
+            else mx.concatenate(value_parts, axis=2)
+        )
+        self._allocation_count += 1
 
     def append(self, keys: mx.array, values: mx.array) -> None:
         if keys.shape != values.shape or keys.ndim != 4:
             raise ValueError("Kimi K3 DSpark context K/V shape does not match")
         if keys.dtype != values.dtype:
             raise ValueError("Kimi K3 DSpark context K/V dtype does not match")
-        if self.keys is None:
-            self.keys = keys
-            self.values = values
+        if self._keys is None and keys.shape[2] == 0:
+            self._keys = keys
+            self._values = values
             return
-        if (
-            self.values is None
-            or keys.shape[:2] != self.keys.shape[:2]
-            or keys.shape[3:] != self.keys.shape[3:]
-            or keys.dtype != self.keys.dtype
+        if self._keys is not None and (
+            self._values is None
+            or keys.shape[:2] != self._keys.shape[:2]
+            or keys.shape[3:] != self._keys.shape[3:]
+            or keys.dtype != self._keys.dtype
         ):
             raise ValueError("Kimi K3 DSpark context append is incompatible")
-        self.keys = mx.concatenate([self.keys, keys], axis=2)
-        self.values = mx.concatenate([self.values, values], axis=2)
+        append_length = int(keys.shape[2])
+        if append_length == 0:
+            return
+        previous = self._offset
+        required = previous + append_length
+        if required > self.capacity:
+            self._allocate_with_append(keys, values, required)
+        else:
+            assert self._keys is not None and self._values is not None
+            self._keys[..., previous:required, :] = keys
+            self._values[..., previous:required, :] = values
+        self._offset = required
 
 
 class KimiK3DSparkAttention(nn.Module):
@@ -586,8 +714,14 @@ class KimiK3DSparkModel(nn.Module):
             raise ValueError("Kimi K3 DSpark cannot find the untied target head")
         return self.bind_target_modules(inner.embed_tokens, vocab_head)
 
-    def make_context_cache(self) -> list[KimiK3DSparkContextCache]:
-        return [KimiK3DSparkContextCache() for _ in self.layers]
+    def make_context_cache(
+        self,
+        *,
+        capacity_hint: int = 0,
+    ) -> list[KimiK3DSparkContextCache]:
+        return [
+            KimiK3DSparkContextCache(capacity_hint=capacity_hint) for _ in self.layers
+        ]
 
     def _validate_context_cache(
         self,
@@ -855,8 +989,12 @@ class KimiK3DSparkProposer:
     def proposal_count(self) -> int:
         return self.verify_width - 1
 
-    def make_context_cache(self) -> list[KimiK3DSparkContextCache]:
-        return self.drafter.make_context_cache()
+    def make_context_cache(
+        self,
+        *,
+        capacity_hint: int = 0,
+    ) -> list[KimiK3DSparkContextCache]:
+        return self.drafter.make_context_cache(capacity_hint=capacity_hint)
 
     def append_target_context(
         self,
