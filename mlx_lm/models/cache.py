@@ -3,13 +3,72 @@
 import copy
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
+
+
+@dataclass(frozen=True)
+class SpeculativeReplayState:
+    """Compact raw-input history for one speculative recurrent state.
+
+    ``replay`` must rebuild the state after ``consumed`` inputs from the
+    transaction's immutable initial state.  ArraysCache evaluates every replay
+    result before committing any cache entry, so a failed replay rolls the
+    complete model transaction back.
+    """
+
+    width: int
+    raw_inputs: Tuple[mx.array, ...]
+    history_axis: int
+    state_shape: Tuple[int, ...]
+    state_dtype: Any
+    replay: Callable[[mx.array, Tuple[mx.array, ...], int], mx.array]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(int(value.nbytes) for value in self.raw_inputs)
+
+    def validate(self, transaction_width: int, current: mx.array) -> None:
+        if self.width != transaction_width:
+            raise ValueError("speculative replay width does not match the request")
+        if not self.raw_inputs:
+            raise ValueError("speculative replay requires raw input history")
+        for value in self.raw_inputs:
+            axis = (
+                self.history_axis
+                if self.history_axis >= 0
+                else value.ndim + self.history_axis
+            )
+            if axis < 0 or axis >= value.ndim:
+                raise ValueError("speculative replay history axis is invalid")
+            if value.shape[axis] != self.width:
+                raise ValueError(
+                    "speculative replay input width does not match the request"
+                )
+        if (
+            tuple(current.shape) != self.state_shape
+            or current.dtype != self.state_dtype
+        ):
+            raise ValueError("speculative replay state contract is incompatible")
+
+    def prepare(self, initial: mx.array, consumed: int) -> mx.array:
+        if (
+            tuple(initial.shape) != self.state_shape
+            or initial.dtype != self.state_dtype
+        ):
+            raise ValueError("speculative replay initial state is incompatible")
+        state = self.replay(initial, self.raw_inputs, consumed)
+        if tuple(state.shape) != self.state_shape or state.dtype != self.state_dtype:
+            raise ValueError("speculative replay produced an incompatible state")
+        return state
+
+
+SpeculativeStateHistory = Union[mx.array, SpeculativeReplayState]
 
 
 def make_prompt_cache(
@@ -660,8 +719,8 @@ class ArraysCache(_BaseCache):
         self._speculative_initial_state = list(self.cache)
         self._speculative_width = width
 
-    def capture_speculative(self, state_history: List[mx.array]):
-        """Attach time-major state histories produced by the active forward."""
+    def capture_speculative(self, state_history: List[SpeculativeStateHistory]):
+        """Attach full checkpoints or compact replay histories for a forward."""
 
         if self._speculative_width <= 1:
             raise ValueError("speculative checkpoint capture was not requested")
@@ -672,18 +731,21 @@ class ArraysCache(_BaseCache):
                 "speculative checkpoint state count does not match the cache"
             )
         for history, current in zip(state_history, self.cache, strict=True):
-            if history.shape[0] != self._speculative_width:
-                raise ValueError(
-                    "speculative checkpoint history width does not match the request"
-                )
-            if history.shape[1:] != current.shape:
-                raise ValueError(
-                    "speculative checkpoint state shape does not match the cache"
-                )
-            if history.dtype != current.dtype:
-                raise ValueError(
-                    "speculative checkpoint state dtype does not match the cache"
-                )
+            if isinstance(history, SpeculativeReplayState):
+                history.validate(self._speculative_width, current)
+            else:
+                if history.shape[0] != self._speculative_width:
+                    raise ValueError(
+                        "speculative checkpoint history width does not match the request"
+                    )
+                if history.shape[1:] != current.shape:
+                    raise ValueError(
+                        "speculative checkpoint state shape does not match the cache"
+                    )
+                if history.dtype != current.dtype:
+                    raise ValueError(
+                        "speculative checkpoint state dtype does not match the cache"
+                    )
         self._speculative_state_history = list(state_history)
 
     def prepare_speculative(self, consumed: int) -> List[mx.array]:
@@ -699,10 +761,21 @@ class ArraysCache(_BaseCache):
         # final cache arrays and histories are sibling outputs of lazy Metal
         # kernels; keeping the former without evaluating a detached state can
         # retain the complete wide graph.
-        return [
-            values[consumed - 1] + mx.zeros_like(values[consumed - 1])
-            for values in history
-        ]
+        initial = self._speculative_initial_state
+        if initial is None or len(initial) != len(history):
+            raise ValueError("speculative checkpoint initial state is unavailable")
+
+        prepared = []
+        for values, initial_state in zip(history, initial, strict=True):
+            state = (
+                values.prepare(initial_state, consumed)
+                if isinstance(values, SpeculativeReplayState)
+                else values[consumed - 1]
+            )
+            # Detach every candidate from its wide verification graph.  Replay
+            # candidates are also detached so commit never retains raw history.
+            prepared.append(state + mx.zeros_like(state))
+        return prepared
 
     def validate_speculative_commit(self, states: List[mx.array]):
         """Validate already-materialized states before the commit phase."""

@@ -6,9 +6,17 @@ from unittest import mock
 import mlx.core as mx
 
 from mlx_lm.generate import maybe_quantize_kv_cache
-from mlx_lm.models.cache import ArraysCache, BatchKVCache
+from mlx_lm.models.cache import ArraysCache, BatchKVCache, SpeculativeReplayState
 from mlx_lm.models.gated_delta import gated_delta_kernel
-from mlx_lm.models.kimi_k3 import KimiK3ShortConv, Model, ModelArgs
+from mlx_lm.models.kimi_k3 import (
+    REPLAYSSM_SPECULATIVE_ENV,
+    KimiK3DeltaAttention,
+    KimiK3ShortConv,
+    Model,
+    ModelArgs,
+    TextArgs,
+    replayssm_speculative_enabled,
+)
 
 
 def _tiny_k3_model_and_cache():
@@ -69,6 +77,25 @@ def _tiny_k3_model_and_cache():
             layer_cache.update_and_fetch(keys, values)
     mx.eval([layer_cache.state for layer_cache in prompt_cache])
     return model, prompt_cache
+
+
+def _tiny_delta_attention():
+    args = TextArgs(
+        hidden_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        linear_attn_config={
+            "num_heads": 2,
+            "head_dim": 32,
+            "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
+            "use_full_rank_gate": True,
+        },
+    )
+    attention = KimiK3DeltaAttention(args, layer_idx=0)
+    attention.eval()
+    mx.eval(attention.parameters())
+    return attention
 
 
 def _stage_transaction(transaction):
@@ -184,6 +211,113 @@ class ArraysCacheCheckpointTest(unittest.TestCase):
                 maybe_quantize_kv_cache([cache], 0, 64, 4)
         finally:
             cache.cancel_speculative()
+
+    def test_raw_replay_materializes_only_the_accepted_prefix(self):
+        cache = ArraysCache(size=1)
+        initial = mx.array([[1.0, 2.0]], dtype=mx.float32)
+        raw = mx.array([[[3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]])
+
+        def replay(initial_state, raw_inputs, consumed):
+            return initial_state + mx.sum(raw_inputs[0][:, :consumed], axis=1)
+
+        cache.cache = [initial]
+        cache.begin_speculative(3)
+        final = replay(initial, (raw,), 3)
+        cache.cache = [final]
+        cache.capture_speculative(
+            [
+                SpeculativeReplayState(
+                    width=3,
+                    raw_inputs=(raw,),
+                    history_axis=1,
+                    state_shape=tuple(final.shape),
+                    state_dtype=final.dtype,
+                    replay=replay,
+                )
+            ]
+        )
+
+        materialized = cache.resolve_speculative(2)
+        expected = initial + mx.sum(raw[:, :2], axis=1)
+        mx.eval(materialized, expected)
+
+        self.assertTrue(bool(mx.all(cache.cache[0] == expected).item()))
+        self.assertFalse(cache.speculative_ready)
+        self.assertIsNone(cache._speculative_initial_state)
+
+    def test_raw_replay_failure_restores_initial_state(self):
+        cache = ArraysCache(size=1)
+        initial = mx.array([[1.0]], dtype=mx.float32)
+        raw = mx.ones((1, 2, 1), dtype=mx.float32)
+
+        def fail_replay(_initial_state, _raw_inputs, _consumed):
+            raise RuntimeError("injected replay failure")
+
+        cache.cache = [initial]
+        cache.begin_speculative(2)
+        cache.cache = [initial + 2]
+        cache.capture_speculative(
+            [
+                SpeculativeReplayState(
+                    width=2,
+                    raw_inputs=(raw,),
+                    history_axis=1,
+                    state_shape=tuple(initial.shape),
+                    state_dtype=initial.dtype,
+                    replay=fail_replay,
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "injected replay failure"):
+            cache.resolve_speculative(1)
+
+        self.assertIs(cache.cache[0], initial)
+        self.assertFalse(cache.speculative_ready)
+
+    def test_raw_replay_rejects_an_incompatible_initial_state(self):
+        cache = ArraysCache(size=1)
+        initial = mx.ones((1, 1), dtype=mx.float32)
+        raw = mx.ones((1, 2, 1), dtype=mx.float32)
+
+        cache.cache = [initial]
+        cache.begin_speculative(2)
+        cache._speculative_initial_state = [mx.ones((1, 2), dtype=mx.float32)]
+        cache.cache = [initial + 2]
+        cache.capture_speculative(
+            [
+                SpeculativeReplayState(
+                    width=2,
+                    raw_inputs=(raw,),
+                    history_axis=1,
+                    state_shape=tuple(initial.shape),
+                    state_dtype=initial.dtype,
+                    replay=lambda state, _raw, _consumed: state,
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "initial state"):
+            cache.resolve_speculative(1)
+
+        self.assertFalse(cache.speculative_ready)
+
+    def test_replayssm_environment_is_strict_and_default_off(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(replayssm_speculative_enabled())
+        with mock.patch.dict(
+            "os.environ",
+            {REPLAYSSM_SPECULATIVE_ENV: "1"},
+            clear=True,
+        ):
+            self.assertTrue(replayssm_speculative_enabled())
+        with mock.patch.dict(
+            "os.environ",
+            {REPLAYSSM_SPECULATIVE_ENV: "true"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+                replayssm_speculative_enabled()
 
 
 class KimiK3CacheTransactionTest(unittest.TestCase):
@@ -340,6 +474,75 @@ class KimiK3CacheTransactionTest(unittest.TestCase):
 
 @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
 class MetalCheckpointKernelTest(unittest.TestCase):
+    def test_target_aux_hidden_taps_preserve_logits(self):
+        mx.set_default_device(mx.gpu)
+        mx.random.seed(71)
+        model, _ = _tiny_k3_model_and_cache()
+        model.eval()
+        inputs = mx.array([[1, 2, 3]])
+
+        expected_logits = model(inputs)
+        result = model.forward_with_aux_hidden_states(
+            inputs,
+            cache=None,
+            layer_ids=(0, 2),
+        )
+        mx.eval(expected_logits, result.logits, result.aux_hidden_states)
+
+        self.assertTrue(bool(mx.all(result.logits == expected_logits).item()))
+        self.assertEqual(len(result.aux_hidden_states), 2)
+        self.assertEqual(result.aux_hidden_states[0].shape, (1, 3, 64))
+        self.assertEqual(result.aux_hidden_states[1].shape, (1, 3, 64))
+
+    def test_k3_replayssm_width_three_matches_full_history_exactly(self):
+        mx.set_default_device(mx.gpu)
+        mx.random.seed(73)
+        attention = _tiny_delta_attention()
+        x = mx.random.normal((1, 3, 64), dtype=mx.float32)
+        initial_conv = mx.random.normal((1, 3, 192), dtype=mx.float32)
+        initial_ssm = mx.random.normal((1, 2, 32, 32), dtype=mx.float32)
+        mx.eval(x, initial_conv, initial_ssm)
+
+        def stage(replay_enabled):
+            cache = ArraysCache(size=2)
+            cache.cache = [initial_conv, initial_ssm]
+            cache.begin_speculative(3)
+            with mock.patch.dict(
+                "os.environ",
+                {REPLAYSSM_SPECULATIVE_ENV: "1" if replay_enabled else "0"},
+                clear=False,
+            ):
+                output = attention(x, cache=cache)
+            sources = list(cache._speculative_state_history)
+            states = [cache.prepare_speculative(consumed) for consumed in (1, 2, 3)]
+            source_arrays = []
+            for source in sources:
+                if isinstance(source, SpeculativeReplayState):
+                    source_arrays.extend(source.raw_inputs)
+                else:
+                    source_arrays.append(source)
+            mx.eval(output, source_arrays, states)
+            return cache, output, sources, states
+
+        baseline_cache, baseline_output, baseline_sources, baseline_states = stage(False)
+        replay_cache, replay_output, replay_sources, replay_states = stage(True)
+        try:
+            self.assertIsInstance(replay_sources[1], SpeculativeReplayState)
+            self.assertNotIsInstance(baseline_sources[1], SpeculativeReplayState)
+            self.assertEqual(len(replay_sources[1].raw_inputs), 4)
+            self.assertLess(replay_sources[1].nbytes, baseline_sources[1].nbytes)
+            self.assertTrue(bool(mx.all(replay_output == baseline_output).item()))
+            for expected, actual in zip(
+                baseline_states,
+                replay_states,
+                strict=True,
+            ):
+                self.assertTrue(bool(mx.all(actual[0] == expected[0]).item()))
+                self.assertTrue(bool(mx.all(actual[1] == expected[1]).item()))
+        finally:
+            baseline_cache.cancel_speculative()
+            replay_cache.cancel_speculative()
+
     def test_gated_delta_history_matches_sequential_steps(self):
         mx.random.seed(31)
         q = mx.random.normal((1, 3, 2, 32), dtype=mx.bfloat16)

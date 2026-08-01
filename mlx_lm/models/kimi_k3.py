@@ -16,16 +16,21 @@ from .base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import ArraysCache, BatchKVCache, KVCache
-from .gated_delta import gated_delta_update
+from .cache import ArraysCache, BatchKVCache, KVCache, SpeculativeReplayState
+from .gated_delta import (
+    compute_g,
+    compute_g_safe,
+    gated_delta_kernel,
+    gated_delta_update,
+)
 from .kimi_k3_attnres_rms import maybe_fused_attnres_rms
 from .kimi_k3_fused_expert import (
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
     maybe_fused_k3_switch_glu_reduce,
 )
-from .kimi_k3_fused_router import maybe_fused_k3_router
 from .kimi_k3_fused_routed_up_add import maybe_fused_k3_routed_up_add
+from .kimi_k3_fused_router import maybe_fused_k3_router
 from .kimi_k3_multibank_moe_front import maybe_multibank_k3_moe_front
 from .kimi_k3_packed_kda_projections import (
     invalidate_packed_k3_kda_skinny,
@@ -42,13 +47,41 @@ from .kimi_linear import ShortConv1d
 from .mla import MultiLinear
 from .switch_layers import SwitchGLU
 
-
 COMPILED_DECODE_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE"
 # Segment 0 is the KDA prefix, 1..N-1 are MLA-to-MLA transitions, and
 # segment N is the final MLA/output tail. The production K3 topology has N=24.
 COMPILED_DECODE_SEGMENTS_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE_SEGMENTS"
 ASYNC_DECODE_BOUNDARIES_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES"
 ASYNC_DECODE_STATE_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE"
+REPLAYSSM_SPECULATIVE_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
+
+
+def replayssm_speculative_enabled() -> bool:
+    """Parse the fail-closed Kimi K3 ReplaySSM opt-in."""
+
+    value = os.environ.get(REPLAYSSM_SPECULATIVE_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{REPLAYSSM_SPECULATIVE_ENV} must be 0 or 1")
+    return value == "1"
+
+
+def _validate_aux_hidden_state_layer_ids(
+    layer_ids: Optional[Tuple[int, ...]],
+    num_layers: int,
+) -> Tuple[int, ...]:
+    if layer_ids is None:
+        return ()
+    if not layer_ids:
+        raise ValueError("auxiliary hidden-state layer ids cannot be empty")
+    if any(type(layer_id) is not int for layer_id in layer_ids):
+        raise TypeError("auxiliary hidden-state layer ids must be integers")
+    if tuple(sorted(set(layer_ids))) != layer_ids:
+        raise ValueError(
+            "auxiliary hidden-state layer ids must be unique and increasing"
+        )
+    if layer_ids[0] < 0 or layer_ids[-1] >= num_layers:
+        raise ValueError("auxiliary hidden-state layer id is outside the target")
+    return layer_ids
 
 
 def _parse_compiled_decode_segments(
@@ -707,6 +740,41 @@ class KimiK3DeltaAttention(nn.Module):
         ).reshape(B, 1, -1)
         return self.o_proj(out), conv_state, ssm_state
 
+    def _replay_speculative_ssm(
+        self,
+        initial_state: mx.array,
+        raw_inputs: Tuple[mx.array, ...],
+        consumed: int,
+    ) -> mx.array:
+        """Fold an accepted raw-input prefix through the baseline recurrence."""
+
+        if len(raw_inputs) != 4:
+            raise ValueError("Kimi K3 ReplaySSM requires (v, k, gk, beta)")
+        raw_v, raw_k, gk, beta = raw_inputs
+        if consumed < 1 or consumed > raw_v.shape[1]:
+            raise ValueError("Kimi K3 ReplaySSM consumed width is invalid")
+
+        raw_v = raw_v[:, :consumed]
+        raw_k = raw_k[:, :consumed]
+        gk = gk[:, :consumed]
+        beta = beta[:, :consumed]
+
+        # Keep the same division-form RMS normalization used by the verifier.
+        # MLX's ``gk`` is already the post-exp multiplicative decay consumed by
+        # gated_delta_kernel; re-log/re-exp would break exact rollback.
+        eps = 1e-6 / self.head_dim
+        k = self.scale * mx.fast.rms_norm(raw_k, None, eps)
+        q = mx.zeros_like(k)
+        _, state = gated_delta_kernel(
+            q,
+            k,
+            raw_v,
+            gk,
+            beta,
+            initial_state,
+        )
+        return state
+
     def __call__(
         self,
         x: mx.array,
@@ -794,46 +862,86 @@ class KimiK3DeltaAttention(nn.Module):
             cache[0] = conv_state
 
         q = qkv[..., :P].reshape(B, T, self.num_heads, self.head_dim)
-        k = qkv[..., P : 2 * P].reshape(B, T, self.num_heads, self.head_dim)
+        raw_k = qkv[..., P : 2 * P].reshape(
+            B, T, self.num_heads, self.head_dim
+        )
         v = qkv[..., 2 * P :].reshape(B, T, self.num_heads, self.head_dim)
 
         inv_scale = self.scale
         eps = 1e-6 / self.head_dim
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
-        k = inv_scale * mx.fast.rms_norm(k, None, eps)
+        k = inv_scale * mx.fast.rms_norm(raw_k, None, eps)
 
         a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
             B, T, self.num_heads, self.head_dim
         )
         b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
 
-        gated_delta_result = gated_delta_update(
-            q,
-            k,
-            v,
-            a_logits,
-            b_logits,
-            self.A_log.reshape(self.num_heads, 1),
-            self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=ssm_state,
-            mask=mask,
-            use_kernel=not self.training,
-            lower_bound=self.lower_bound,
-            return_state_history=capture_speculative,
-        )
-        if capture_speculative:
-            out, ssm_state, ssm_state_history = gated_delta_result
+        replay_speculative = capture_speculative and replayssm_speculative_enabled()
+        if replay_speculative:
+            beta = mx.sigmoid(b_logits)
+            if self.lower_bound is None:
+                gk = compute_g(
+                    self.A_log.reshape(self.num_heads, 1),
+                    a_logits,
+                    self.dt_bias.reshape(self.num_heads, self.head_dim),
+                )
+            else:
+                gk = compute_g_safe(
+                    self.A_log.reshape(self.num_heads, 1),
+                    a_logits,
+                    self.dt_bias.reshape(self.num_heads, self.head_dim),
+                    self.lower_bound,
+                )
+            out, ssm_state = gated_delta_kernel(
+                q,
+                k,
+                v,
+                gk,
+                beta,
+                ssm_state,
+                mask,
+            )
         else:
-            out, ssm_state = gated_delta_result
+            gated_delta_result = gated_delta_update(
+                q,
+                k,
+                v,
+                a_logits,
+                b_logits,
+                self.A_log.reshape(self.num_heads, 1),
+                self.dt_bias.reshape(self.num_heads, self.head_dim),
+                state=ssm_state,
+                mask=mask,
+                use_kernel=not self.training,
+                lower_bound=self.lower_bound,
+                return_state_history=capture_speculative,
+            )
+            if capture_speculative:
+                out, ssm_state, ssm_state_history = gated_delta_result
+            else:
+                out, ssm_state = gated_delta_result
 
         if cache is not None:
             cache[1] = ssm_state
             cache.advance(T)
             if capture_speculative:
+                ssm_history: Union[mx.array, SpeculativeReplayState]
+                if replay_speculative:
+                    ssm_history = SpeculativeReplayState(
+                        width=T,
+                        raw_inputs=(v, raw_k, gk, beta),
+                        history_axis=1,
+                        state_shape=tuple(ssm_state.shape),
+                        state_dtype=ssm_state.dtype,
+                        replay=self._replay_speculative_ssm,
+                    )
+                else:
+                    ssm_history = ssm_state_history.transpose(2, 0, 1, 3, 4)
                 cache.capture_speculative(
                     [
                         conv_state_history.transpose(1, 0, 2, 3),
-                        ssm_state_history.transpose(2, 0, 1, 3, 4),
+                        ssm_history,
                     ]
                 )
 
@@ -1902,7 +2010,17 @@ class KimiK3TextModel(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[List[Any]] = None,
-    ) -> mx.array:
+        *,
+        aux_hidden_state_layer_ids: Optional[Tuple[int, ...]] = None,
+    ) -> Union[mx.array, Tuple[mx.array, Tuple[mx.array, ...]]]:
+        capture_layer_ids = _validate_aux_hidden_state_layer_ids(
+            aux_hidden_state_layer_ids,
+            len(self.layers),
+        )
+        if capture_layer_ids and self.pipeline_size != 1:
+            raise ValueError(
+                "Kimi K3 auxiliary hidden capture requires pipeline_size == 1"
+            )
         h = self.embed_tokens(inputs)
         boundary_dtype = h.dtype
         active_layers = self.layers[self.start_idx : self.end_idx]
@@ -1927,7 +2045,9 @@ class KimiK3TextModel(nn.Module):
 
         blocks = ResidualBlocks(self.args.rms_norm_eps) if self.use_attn_res else None
 
-        if self._compiled_decode_eligible(h, cache, ssm_mask, active_layers):
+        if not capture_layer_ids and self._compiled_decode_eligible(
+            h, cache, ssm_mask, active_layers
+        ):
             return self._run_compiled_decode(h, cache, attn_mask, active_layers)
 
         if pipeline_rank < pipeline_size - 1:
@@ -1951,12 +2071,17 @@ class KimiK3TextModel(nn.Module):
             ssm_mask,
             active_layers,
         )
+        aux_hidden_states = []
         for layer_idx, (layer, layer_cache) in enumerate(
             zip(active_layers, cache, strict=True),
             start=self.start_idx,
         ):
             mask = ssm_mask if layer.is_linear else attn_mask
             h, blocks = layer(h, mask=mask, cache=layer_cache, blocks=blocks)
+            if layer_idx in capture_layer_ids:
+                # DSpark/DFlash target ids use the Hugging Face convention:
+                # capture the residual stream after target layer ``layer_idx``.
+                aux_hidden_states.append(h)
             if (
                 submit_async_boundaries
                 and layer_idx in self._async_decode_boundaries
@@ -1992,7 +2117,12 @@ class KimiK3TextModel(nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h.astype(boundary_dtype))[: h.shape[0]]
 
-        return self.norm(h)
+        h = self.norm(h)
+        if capture_layer_ids:
+            if len(aux_hidden_states) != len(capture_layer_ids):
+                raise RuntimeError("Kimi K3 auxiliary hidden capture is incomplete")
+            return h, tuple(aux_hidden_states)
+        return h
 
 
 @dataclass
@@ -2013,6 +2143,14 @@ class KimiK3SpeculativeCacheTransaction:
         self.kv_states = []
 
 
+@dataclass(frozen=True)
+class KimiK3TargetForward:
+    """Target logits plus ordered post-layer hidden taps for a draft model."""
+
+    logits: mx.array
+    aux_hidden_states: Tuple[mx.array, ...]
+
+
 class LanguageModel(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -2029,9 +2167,35 @@ class LanguageModel(nn.Module):
         cache: Optional[List[Any]] = None,
     ) -> mx.array:
         out = self.model(inputs, cache)
+        if isinstance(out, tuple):
+            raise RuntimeError("unexpected auxiliary target output")
         if self.lm_head is None:
             return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)
+
+    def forward_with_aux_hidden_states(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]],
+        layer_ids: Tuple[int, ...],
+    ) -> KimiK3TargetForward:
+        result = self.model(
+            inputs,
+            cache,
+            aux_hidden_state_layer_ids=layer_ids,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError("Kimi K3 target did not return auxiliary states")
+        out, aux_hidden_states = result
+        logits = (
+            self.model.embed_tokens.as_linear(out)
+            if self.lm_head is None
+            else self.lm_head(out)
+        )
+        return KimiK3TargetForward(
+            logits=logits,
+            aux_hidden_states=aux_hidden_states,
+        )
 
     @property
     def layers(self):
@@ -2464,6 +2628,18 @@ class Model(nn.Module):
         cache: Optional[List[Any]] = None,
     ) -> mx.array:
         return self.language_model(inputs, cache)
+
+    def forward_with_aux_hidden_states(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]],
+        layer_ids: Tuple[int, ...],
+    ) -> KimiK3TargetForward:
+        return self.language_model.forward_with_aux_hidden_states(
+            inputs,
+            cache,
+            layer_ids,
+        )
 
     @property
     def model(self):
