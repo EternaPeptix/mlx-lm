@@ -15,6 +15,7 @@ from mlx_lm.models.kimi_k3 import (
     Model,
     ModelArgs,
     TextArgs,
+    VocabParallelHead,
     replayssm_speculative_enabled,
 )
 
@@ -493,6 +494,50 @@ class MetalCheckpointKernelTest(unittest.TestCase):
         self.assertEqual(len(result.aux_hidden_states), 2)
         self.assertEqual(result.aux_hidden_states[0].shape, (1, 3, 64))
         self.assertEqual(result.aux_hidden_states[1].shape, (1, 3, 64))
+
+    def test_compact_target_verifier_matches_masked_full_logits(self):
+        mx.set_default_device(mx.gpu)
+        mx.random.seed(72)
+        model, _ = _tiny_k3_model_and_cache()
+        model.eval()
+        inputs = mx.array([[1, 2, 3]])
+        assert model.language_model.lm_head is not None
+        model.language_model.lm_head.weight = mx.zeros_like(
+            model.language_model.lm_head.weight
+        )
+
+        full = model.forward_with_aux_hidden_states(
+            inputs,
+            cache=None,
+            layer_ids=(0, 2),
+        )
+        masked_logits = full.logits
+        masked_logits[..., 0] = float("-inf")
+        expected = mx.argmax(masked_logits, axis=-1).astype(mx.uint32)
+
+        group = mx.distributed.init()
+        self.assertEqual(group.size(), 1)
+        model.language_model.lm_head = VocabParallelHead(
+            model.language_model.lm_head,
+            group,
+        )
+        compact = model.forward_with_aux_hidden_states_greedy(
+            inputs,
+            cache=None,
+            layer_ids=(0, 2),
+            banned_token_ids=(0,),
+        )
+        mx.eval(expected, compact.tokens, compact.aux_hidden_states)
+
+        self.assertTrue(mx.array_equal(expected, compact.tokens))
+        self.assertEqual(compact.tokens.tolist(), [[1, 1, 1]])
+        self.assertEqual(len(compact.aux_hidden_states), 2)
+        for expected_hidden, actual_hidden in zip(
+            full.aux_hidden_states,
+            compact.aux_hidden_states,
+            strict=True,
+        ):
+            self.assertTrue(mx.array_equal(expected_hidden, actual_hidden))
 
     def test_k3_replayssm_width_three_matches_full_history_exactly(self):
         mx.set_default_device(mx.gpu)

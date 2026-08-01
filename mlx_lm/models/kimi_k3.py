@@ -2330,6 +2330,14 @@ class KimiK3TargetForward:
     aux_hidden_states: Tuple[mx.array, ...]
 
 
+@dataclass(frozen=True)
+class KimiK3TargetGreedyForward:
+    """Exact greedy target tokens plus ordered hidden taps for verification."""
+
+    tokens: mx.array
+    aux_hidden_states: Tuple[mx.array, ...]
+
+
 class LanguageModel(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -2373,6 +2381,36 @@ class LanguageModel(nn.Module):
         )
         return KimiK3TargetForward(
             logits=logits,
+            aux_hidden_states=aux_hidden_states,
+        )
+
+    def forward_with_aux_hidden_states_greedy(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]],
+        layer_ids: Tuple[int, ...],
+        banned_token_ids: Tuple[int, ...] = (),
+    ) -> KimiK3TargetGreedyForward:
+        """Verify a greedy block without reconstructing full-vocabulary logits."""
+
+        if not isinstance(self.lm_head, VocabParallelHead):
+            raise RuntimeError("Kimi K3 vocabulary-parallel head is not active")
+        result = self.model(
+            inputs,
+            cache,
+            aux_hidden_state_layer_ids=layer_ids,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError("Kimi K3 target did not return auxiliary states")
+        out, aux_hidden_states = result
+        if out.ndim != 3:
+            raise RuntimeError("Kimi K3 target hidden states must have rank three")
+        tokens = self.lm_head.greedy_token(
+            out.reshape(-1, out.shape[-1]),
+            banned_token_ids=banned_token_ids,
+        ).reshape(out.shape[:-1])
+        return KimiK3TargetGreedyForward(
+            tokens=tokens,
             aux_hidden_states=aux_hidden_states,
         )
 
@@ -2801,7 +2839,12 @@ class VocabParallelHead(nn.Module):
         )
         return mx.contiguous(mx.moveaxis(full_vocab_first, 0, -1))
 
-    def greedy_token(self, x: mx.array) -> mx.array:
+    def greedy_token(
+        self,
+        x: mx.array,
+        *,
+        banned_token_ids: Tuple[int, ...] = (),
+    ) -> mx.array:
         """Return the full-vocabulary argmax with deterministic lowest-id ties."""
 
         if x.ndim != 2:
@@ -2815,6 +2858,12 @@ class VocabParallelHead(nn.Module):
                 "vocabulary-parallel greedy sampling requires token ids "
                 "representable exactly as float32"
             )
+        rank_vocab_start = self.group.rank() * local_vocab_size
+        for token_id in banned_token_ids:
+            if type(token_id) is not int or not 0 <= token_id < full_vocab_size:
+                raise ValueError("banned vocabulary token id is out of range")
+            if rank_vocab_start <= token_id < rank_vocab_start + local_vocab_size:
+                local_logits[..., token_id - rank_vocab_start] = float("-inf")
 
         local_id = mx.argmax(local_logits, axis=-1)
         local_score = mx.take_along_axis(
@@ -2822,7 +2871,7 @@ class VocabParallelHead(nn.Module):
             local_id[..., None],
             axis=-1,
         ).squeeze(-1)
-        global_id = local_id + self.group.rank() * local_vocab_size
+        global_id = local_id + rank_vocab_start
 
         # A leading singleton lets all_gather concatenate candidates in rank
         # order. MLX argmax resolves equal scores to the first rank, while each
@@ -2869,6 +2918,20 @@ class Model(nn.Module):
             inputs,
             cache,
             layer_ids,
+        )
+
+    def forward_with_aux_hidden_states_greedy(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]],
+        layer_ids: Tuple[int, ...],
+        banned_token_ids: Tuple[int, ...] = (),
+    ) -> KimiK3TargetGreedyForward:
+        return self.language_model.forward_with_aux_hidden_states_greedy(
+            inputs,
+            cache,
+            layer_ids,
+            banned_token_ids,
         )
 
     def supports_vocab_parallel_greedy(self) -> bool:

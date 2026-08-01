@@ -176,17 +176,56 @@ class TestModelParallel(unittest.TestCase):
                     shape=(2, 4),
                 )
                 expected = model(x)
-                mx.eval(expected)
+                expected_verify = model.forward_with_aux_hidden_states(
+                    x,
+                    cache=None,
+                    layer_ids=(0, 2),
+                )
+                masked_verify_logits = expected_verify.logits
+                masked_verify_logits[..., 0] = float("-inf")
+                expected_verify_tokens = mx.argmax(
+                    masked_verify_logits,
+                    axis=-1,
+                ).astype(mx.uint32)
+                mx.eval(expected, expected_verify_tokens)
                 expected_tokens = mx.argmax(expected[:, -1, :], axis=-1)
 
                 model.shard_vocab_head(group)
                 actual = model(x)
                 actual_tokens = model.vocab_parallel_greedy(x)
-                mx.eval(actual, expected_tokens, actual_tokens)
+                actual_verify = model.forward_with_aux_hidden_states_greedy(
+                    x,
+                    cache=None,
+                    layer_ids=(0, 2),
+                    banned_token_ids=(0,),
+                )
+                mx.eval(
+                    actual,
+                    expected_tokens,
+                    actual_tokens,
+                    actual_verify.tokens,
+                    actual_verify.aux_hidden_states,
+                )
 
                 self.assertEqual(actual.shape, expected.shape)
                 self.assertTrue(mx.allclose(expected, actual, rtol=1e-3, atol=1e-3))
                 self.assertTrue(mx.array_equal(expected_tokens, actual_tokens))
+                self.assertTrue(
+                    mx.array_equal(expected_verify_tokens, actual_verify.tokens)
+                )
+                for expected_hidden, actual_hidden in zip(
+                    expected_verify.aux_hidden_states,
+                    actual_verify.aux_hidden_states,
+                    strict=True,
+                ):
+                    self.assertTrue(
+                        mx.allclose(
+                            expected_hidden,
+                            actual_hidden,
+                            rtol=1e-3,
+                            atol=1e-3,
+                        )
+                    )
 
                 wrapped = model.language_model.lm_head
                 model.shard_vocab_head(group)
