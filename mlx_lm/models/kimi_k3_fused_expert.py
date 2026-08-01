@@ -24,6 +24,7 @@ from .kimi_k3_tuned_gather_qmv import (
 
 FUSED_EXPERT_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERTS"
 FUSED_DOWN_REDUCE_ENV = "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE"
+FUSED_EXPERT_WIDTH2_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH2"
 
 
 @partial(mx.compile, shapeless=False)
@@ -101,6 +102,15 @@ def fused_k3_down_reduce_enabled() -> bool:
     return os.environ.get(FUSED_DOWN_REDUCE_ENV, "0") == "1"
 
 
+@lru_cache(maxsize=1)
+def fused_k3_expert_width2_enabled() -> bool:
+    return os.environ.get(FUSED_EXPERT_WIDTH2_ENV, "0") == "1"
+
+
+def _fused_expert_width_enabled(x: mx.array) -> bool:
+    return x.ndim != 3 or x.shape[-2] != 2 or fused_k3_expert_width2_enabled()
+
+
 def _quantized_projection(module: Any):
     if (
         getattr(module, "bits", None) != 2
@@ -126,7 +136,11 @@ def maybe_fused_k3_switch_glu(
 ) -> mx.array | None:
     """Return an exact fused decode/verification result, or ``None``."""
 
-    if not fused_k3_experts_enabled() or getattr(switch_mlp, "training", True):
+    if (
+        not fused_k3_experts_enabled()
+        or not _fused_expert_width_enabled(x)
+        or getattr(switch_mlp, "training", True)
+    ):
         return None
     activation = getattr(switch_mlp, "activation", None)
     if (
@@ -169,6 +183,7 @@ def maybe_fused_k3_switch_glu_reduce(
     if (
         not fused_k3_experts_enabled()
         or not fused_k3_down_reduce_enabled()
+        or not _fused_expert_width_enabled(x)
         or getattr(switch_mlp, "training", True)
     ):
         return None

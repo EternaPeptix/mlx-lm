@@ -58,10 +58,13 @@ single permissive `L <= 8` condition.
 
 ## Production gate
 
-The existing fused-expert environment flags remain default off.  Dispatch also
-requires the exact Kimi K3 TP2 shapes, BF16 activations, affine 2-bit weights,
-group size 128, batch size 1, top-k 16, and sequence width 1 or 2.  Unsupported
-inputs return to the stock MLX-LM path.
+The existing fused-expert environment flags continue to control ordinary
+decode.  Width-two dispatch additionally requires the independent default-off
+`MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH2=1` gate, so installing this source cannot
+silently broaden an already-enabled W1 optimization.  Dispatch also requires
+the exact Kimi K3 TP2 shapes, BF16 activations, affine 2-bit weights, group size
+128, batch size 1, top-k 16, and sequence width 1 or 2.  Unsupported inputs
+return to the stock MLX-LM path.
 
 Before promotion, repeat the benchmark on both M3 Ultra ranks and run an EXO
 width-2 target-verifier A/B with fixed prompt, checkpoint, cache state, and

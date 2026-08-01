@@ -8,7 +8,9 @@ import mlx.core as mx
 from mlx_lm.models.kimi_k3_fused_expert import (
     FUSED_DOWN_REDUCE_ENV,
     FUSED_EXPERT_ENV,
+    FUSED_EXPERT_WIDTH2_ENV,
     fused_k3_down_reduce_enabled,
+    fused_k3_expert_width2_enabled,
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
     maybe_fused_k3_switch_glu_reduce,
@@ -129,12 +131,15 @@ class IntegrationTest(unittest.TestCase):
         os.environ[FUSED_DOWN_REDUCE_ENV] = "1"
         fused_k3_experts_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
+        fused_k3_expert_width2_enabled.cache_clear()
 
     def tearDown(self):
         os.environ.pop(FUSED_EXPERT_ENV, None)
         os.environ.pop(FUSED_DOWN_REDUCE_ENV, None)
+        os.environ.pop(FUSED_EXPERT_WIDTH2_ENV, None)
         fused_k3_experts_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
+        fused_k3_expert_width2_enabled.cache_clear()
 
     def test_fused_switch_is_bit_exact_on_cached_second_call(self):
         mx.random.seed(19)
@@ -201,6 +206,8 @@ class IntegrationTest(unittest.TestCase):
         self.assertTrue(bool(mx.all(reference == candidate).item()))
 
     def test_width_two_full_fused_expert_is_bit_exact(self):
+        os.environ[FUSED_EXPERT_WIDTH2_ENV] = "1"
+        fused_k3_expert_width2_enabled.cache_clear()
         switch = _Switch.bounded_tp2_geometry()
         width = 2
         x = mx.random.normal((1, width, 3584), dtype=mx.bfloat16)
@@ -223,6 +230,24 @@ class IntegrationTest(unittest.TestCase):
         mx.eval(reference, candidate)
         self.assertEqual(candidate.shape, (1, width, 3584))
         self.assertTrue(bool(mx.all(reference == candidate).item()))
+
+    def test_width_two_has_an_independent_default_off_flag(self):
+        switch = _Switch.bounded_tp2_geometry()
+        x = mx.zeros((1, 2, 3584), dtype=mx.bfloat16)
+        indices = mx.broadcast_to(
+            mx.arange(16, dtype=mx.uint32).reshape(1, 1, 16),
+            (1, 2, 16),
+        )
+        router_weights = mx.zeros((1, 2, 16), dtype=mx.bfloat16)
+        self.assertIsNone(maybe_fused_k3_switch_glu(switch, x, indices))
+        self.assertIsNone(
+            maybe_fused_k3_switch_glu_reduce(
+                switch,
+                x,
+                indices,
+                router_weights,
+            )
+        )
 
     def test_down_route_reduce_has_an_independent_default_off_flag(self):
         os.environ.pop(FUSED_DOWN_REDUCE_ENV)
