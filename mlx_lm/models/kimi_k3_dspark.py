@@ -45,6 +45,16 @@ KIMI_K3_DSPARK_INITIAL_VERIFY_WIDTH = KIMI_K3_DSPARK_MODEL_VERIFY_WIDTH
 
 DSPARK_PROPOSER_ENV = "MLX_LM_KIMI_K3_DSPARK_PROPOSER"
 DSPARK_STACKED_CONTEXT_KV_ENV = "MLX_LM_KIMI_K3_DSPARK_STACKED_CONTEXT_KV"
+DSPARK_SEGMENTED_SDPA_ENV = "MLX_LM_KIMI_K3_DSPARK_SEGMENTED_SDPA"
+DSPARK_SEGMENTED_SDPA_REQUIRED_CAPABILITY = "bounded_memory_metal_v1"
+
+_DSPARK_SEGMENTED_BATCH_SIZE = 1
+_DSPARK_SEGMENTED_QUERY_HEADS = 64
+_DSPARK_SEGMENTED_KV_HEADS = 16
+_DSPARK_SEGMENTED_HEAD_DIM = 64
+_DSPARK_SEGMENTED_BLOCK_SIZE = RADIXARK_KIMI_K3_DSPARK_BLOCK_SIZE
+_DSPARK_SEGMENTED_MAX_POSITIONS = 1_048_576
+_DSPARK_SEGMENTED_SCALE = _DSPARK_SEGMENTED_HEAD_DIM**-0.5
 
 
 def _strict_environment_flag(name: str) -> bool:
@@ -64,6 +74,153 @@ def kimi_k3_dspark_stacked_context_kv_enabled() -> bool:
     """Return the strict, default-off stacked context-KV feature state."""
 
     return _strict_environment_flag(DSPARK_STACKED_CONTEXT_KV_ENV)
+
+
+def kimi_k3_dspark_segmented_sdpa_enabled() -> bool:
+    """Return the strict, default-off two-bank DSpark attention state."""
+
+    return _strict_environment_flag(DSPARK_SEGMENTED_SDPA_ENV)
+
+
+def _kimi_k3_dspark_segmented_sdpa_primitive():
+    """Feature-detect the optional MLX two-bank attention primitive."""
+
+    return getattr(mx.fast, "segmented_scaled_dot_product_attention", None)
+
+
+def _kimi_k3_dspark_segmented_sdpa_capabilities_primitive():
+    """Feature-detect the matching MLX capability-reporting primitive."""
+
+    return getattr(
+        mx.fast,
+        "segmented_scaled_dot_product_attention_capabilities",
+        None,
+    )
+
+
+def kimi_k3_dspark_segmented_sdpa_capabilities() -> tuple[str, ...]:
+    """Return a validated MLX segmented-attention capability tuple."""
+
+    capabilities_primitive = _kimi_k3_dspark_segmented_sdpa_capabilities_primitive()
+    if capabilities_primitive is None:
+        return ()
+    capabilities = capabilities_primitive()
+    if not isinstance(capabilities, tuple) or any(
+        not isinstance(capability, str) for capability in capabilities
+    ):
+        raise RuntimeError(
+            "mx.fast.segmented_scaled_dot_product_attention_capabilities "
+            "returned an invalid contract"
+        )
+    return capabilities
+
+
+def require_kimi_k3_dspark_segmented_sdpa():
+    """Return the primitive only when MLX advertises its bounded Metal path."""
+
+    primitive = _kimi_k3_dspark_segmented_sdpa_primitive()
+    if primitive is None:
+        raise RuntimeError(
+            f"{DSPARK_SEGMENTED_SDPA_ENV}=1 requires "
+            "mx.fast.segmented_scaled_dot_product_attention"
+        )
+    capabilities = kimi_k3_dspark_segmented_sdpa_capabilities()
+    if DSPARK_SEGMENTED_SDPA_REQUIRED_CAPABILITY not in capabilities:
+        raise RuntimeError(
+            f"{DSPARK_SEGMENTED_SDPA_ENV}=1 requires MLX capability "
+            f"{DSPARK_SEGMENTED_SDPA_REQUIRED_CAPABILITY!r}; "
+            f"advertised capabilities are {capabilities!r}"
+        )
+    return primitive
+
+
+def _validate_kimi_k3_dspark_segmented_sdpa(
+    queries: mx.array,
+    context_keys: mx.array,
+    context_values: mx.array,
+    noise_keys: mx.array,
+    noise_values: mx.array,
+    *,
+    scale: float,
+) -> None:
+    """Require the exact released K3 DSpark attention specialization.
+
+    The first primitive deliberately supports only the geometry exercised by
+    the pinned production checkpoint.  Keeping this model-side contract exact
+    prevents an opt-in from silently selecting a numerically or semantically
+    different path for tests, training, batching, or a future checkpoint.
+    """
+
+    arrays = (
+        queries,
+        context_keys,
+        context_values,
+        noise_keys,
+        noise_values,
+    )
+    if any(not isinstance(array, mx.array) or array.ndim != 4 for array in arrays):
+        raise ValueError(
+            "Kimi K3 DSpark segmented SDPA requires five rank-four MLX arrays"
+        )
+    if any(array.dtype != mx.bfloat16 for array in arrays):
+        raise ValueError("Kimi K3 DSpark segmented SDPA requires BF16 inputs")
+    if type(scale) is not float or scale != _DSPARK_SEGMENTED_SCALE:
+        raise ValueError(
+            "Kimi K3 DSpark segmented SDPA scale does not match head dimension 64"
+        )
+
+    batch = _DSPARK_SEGMENTED_BATCH_SIZE
+    query_heads = _DSPARK_SEGMENTED_QUERY_HEADS
+    kv_heads = _DSPARK_SEGMENTED_KV_HEADS
+    block = _DSPARK_SEGMENTED_BLOCK_SIZE
+    head_dim = _DSPARK_SEGMENTED_HEAD_DIM
+    context_length = int(context_keys.shape[2])
+    expected_queries = (batch, query_heads, block, head_dim)
+    expected_context = (batch, kv_heads, context_length, head_dim)
+    expected_noise = (batch, kv_heads, block, head_dim)
+    if (
+        tuple(queries.shape) != expected_queries
+        or context_length <= 0
+        or context_length + block > _DSPARK_SEGMENTED_MAX_POSITIONS
+        or tuple(context_keys.shape) != expected_context
+        or tuple(context_values.shape) != expected_context
+        or tuple(noise_keys.shape) != expected_noise
+        or tuple(noise_values.shape) != expected_noise
+    ):
+        raise ValueError(
+            "Kimi K3 DSpark segmented SDPA inputs do not match the released "
+            "batch-one 64x16-head, width-seven, head-dimension-64 geometry"
+        )
+
+
+def _kimi_k3_dspark_segmented_sdpa(
+    queries: mx.array,
+    context_keys: mx.array,
+    context_values: mx.array,
+    noise_keys: mx.array,
+    noise_values: mx.array,
+    *,
+    scale: float,
+) -> mx.array:
+    """Call the optional two-bank primitive without an unsafe fallback."""
+
+    _validate_kimi_k3_dspark_segmented_sdpa(
+        queries,
+        context_keys,
+        context_values,
+        noise_keys,
+        noise_values,
+        scale=scale,
+    )
+    primitive = require_kimi_k3_dspark_segmented_sdpa()
+    return primitive(
+        queries,
+        context_keys,
+        context_values,
+        noise_keys,
+        noise_values,
+        scale=scale,
+    )
 
 
 @dataclass(frozen=True)
@@ -561,7 +718,9 @@ class KimiK3DSparkAttention(nn.Module):
         block_offset: int,
         cache: KimiK3DSparkContextCache,
     ) -> mx.array:
-        if cache.keys is None or cache.values is None:
+        context_keys = cache.keys
+        context_values = cache.values
+        if context_keys is None or context_values is None:
             raise ValueError("Kimi K3 DSpark context cache is empty")
         batch, length, _ = hidden.shape
         queries = self.q_proj(hidden).reshape(
@@ -571,15 +730,27 @@ class KimiK3DSparkAttention(nn.Module):
         queries = self.rope(queries, offset=block_offset)
 
         noise_keys, noise_values = self.project_context(hidden, block_offset)
-        keys = mx.concatenate([cache.keys, noise_keys], axis=2)
-        values = mx.concatenate([cache.values, noise_values], axis=2)
-        output = mx.fast.scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale=self.scale,
-            mask=None,
-        )
+        if kimi_k3_dspark_segmented_sdpa_enabled():
+            output = _kimi_k3_dspark_segmented_sdpa(
+                queries,
+                context_keys,
+                context_values,
+                noise_keys,
+                noise_values,
+                scale=self.scale,
+            )
+        else:
+            # This is the accepted implementation.  Keep it bit-for-bit
+            # reachable whenever the experimental two-bank path is disabled.
+            keys = mx.concatenate([context_keys, noise_keys], axis=2)
+            values = mx.concatenate([context_values, noise_values], axis=2)
+            output = mx.fast.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale=self.scale,
+                mask=None,
+            )
         output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         return self.o_proj(output)
 
