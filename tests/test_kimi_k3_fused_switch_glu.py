@@ -4,6 +4,7 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_lm.models.kimi_k3_derived_bias import derived_affine2_biases
 from mlx_lm.models.kimi_k3_fused_switch_glu import (
     _metal_available,
     fused_switch_situ_decode,
@@ -33,6 +34,26 @@ def _reference(x, indices, up, gate):
     activation = 4.0 * mx.tanh(gate_value / 4.0) * mx.sigmoid(gate_value)
     up_value = 25.0 * mx.tanh(up_value / 25.0)
     return (activation * up_value).astype(mx.bfloat16)
+
+
+def _adversarial_projection(experts: int, output: int, input_width: int):
+    weight = mx.full(
+        (experts, output, input_width // 16),
+        0x24681357,
+        dtype=mx.uint32,
+    )
+    # Signed minimum/maximum finite normals plus representative interior values.
+    pattern = mx.array(
+        [0x0080, 0x8080, 0x3F80, 0xBF80, 0x7F7F, 0xFF7F, 0x3C00, 0xBC00],
+        dtype=mx.uint16,
+    ).view(mx.bfloat16)
+    size = experts * output * (input_width // 128)
+    scales = pattern[mx.arange(size, dtype=mx.uint32) % pattern.size].reshape(
+        experts,
+        output,
+        input_width // 128,
+    )
+    return weight, scales, derived_affine2_biases(scales)
 
 
 @unittest.skipUnless(_metal_available(), "requires Metal")
@@ -75,6 +96,46 @@ class FusedSwitchGLUTest(unittest.TestCase):
             indices = mx.broadcast_to(self.indices, (1, width, 4))
             self.assertFalse(
                 supports_fused_switch_situ(prefill, indices, self.up, self.gate)
+            )
+
+    def test_derived_bias_matches_incumbent_at_finite_normal_bf16_limits(self):
+        up = _adversarial_projection(8, 16, 512)
+        gate = _adversarial_projection(8, 16, 512)
+        incumbent = fused_switch_situ_decode(
+            self.x,
+            self.indices,
+            up,
+            gate,
+            results_per_simdgroup=4,
+            simdgroups=2,
+            derive_bias=False,
+        )
+        candidate = fused_switch_situ_decode(
+            self.x,
+            self.indices,
+            up,
+            gate,
+            results_per_simdgroup=4,
+            simdgroups=2,
+            derive_bias=True,
+        )
+        mx.eval(incumbent, candidate)
+        self.assertTrue(
+            bool(
+                mx.array_equal(
+                    incumbent.view(mx.uint8), candidate.view(mx.uint8)
+                ).item()
+            )
+        )
+
+    def test_derive_bias_argument_is_strictly_boolean(self):
+        with self.assertRaisesRegex(TypeError, "derive_bias must be a bool"):
+            fused_switch_situ_decode(
+                self.x,
+                self.indices,
+                self.up,
+                self.gate,
+                derive_bias=1,
             )
 
 

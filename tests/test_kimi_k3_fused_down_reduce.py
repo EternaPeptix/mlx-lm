@@ -4,6 +4,7 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_lm.models.kimi_k3_derived_bias import derived_affine2_biases
 from mlx_lm.models.kimi_k3_fused_down_reduce import (
     K3_DOWN_INPUT_WIDTH,
     K3_DOWN_OUTPUT_WIDTH,
@@ -54,9 +55,7 @@ class FusedDownReduceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.projection = _packed_projection()
-        cls.indices = mx.arange(K3_TOP_K, dtype=mx.uint32).reshape(
-            1, 1, K3_TOP_K
-        )
+        cls.indices = mx.arange(K3_TOP_K, dtype=mx.uint32).reshape(1, 1, K3_TOP_K)
         mx.eval(*cls.projection, cls.indices)
 
     def test_k3_geometry_is_bit_exact_for_all_supported_tiles(self):
@@ -162,6 +161,57 @@ class FusedDownReduceTest(unittest.TestCase):
         mx.eval(first, second, reference)
         self.assertTrue(bool(mx.all(reference == second).item()))
         self.assertTrue(bool(mx.any(first != second).item()))
+
+    def test_derived_bias_is_bit_exact_against_incumbent(self):
+        mx.random.seed(43)
+        weight, scales, _ = self.projection
+        projection = weight, scales, derived_affine2_biases(scales)
+        activated = mx.random.normal(
+            (1, 1, K3_TOP_K, 1, K3_DOWN_INPUT_WIDTH),
+            dtype=mx.bfloat16,
+        )
+        router_weights = mx.random.uniform(
+            shape=(1, 1, K3_TOP_K),
+            dtype=mx.bfloat16,
+        )
+        incumbent = fused_down_reduce_decode(
+            activated,
+            self.indices,
+            router_weights,
+            projection,
+            results_per_threadgroup=4,
+            simdgroups_per_threadgroup=16,
+            derive_bias=False,
+        )
+        candidate = fused_down_reduce_decode(
+            activated,
+            self.indices,
+            router_weights,
+            projection,
+            results_per_threadgroup=4,
+            simdgroups_per_threadgroup=16,
+            derive_bias=True,
+        )
+        mx.eval(incumbent, candidate)
+        self.assertTrue(bool(mx.array_equal(incumbent, candidate).item()))
+
+    def test_derive_bias_argument_is_strictly_boolean(self):
+        activated = mx.zeros(
+            (1, 1, K3_TOP_K, 1, K3_DOWN_INPUT_WIDTH),
+            dtype=mx.bfloat16,
+        )
+        router_weights = mx.zeros(
+            (1, 1, K3_TOP_K),
+            dtype=mx.bfloat16,
+        )
+        with self.assertRaisesRegex(TypeError, "derive_bias must be a bool"):
+            fused_down_reduce_decode(
+                activated,
+                self.indices,
+                router_weights,
+                self.projection,
+                derive_bias=1,
+            )
 
     def test_unsupported_shapes_and_dtypes_fail_closed(self):
         activated = mx.zeros(

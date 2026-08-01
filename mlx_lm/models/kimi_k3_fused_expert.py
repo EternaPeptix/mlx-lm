@@ -8,6 +8,10 @@ from typing import Any
 
 import mlx.core as mx
 
+from .kimi_k3_derived_bias import (
+    derive_affine2_bias_enabled,
+    projection_has_validated_derived_bias,
+)
 from .kimi_k3_fused_down_reduce import (
     fused_down_reduce_decode,
     supports_fused_down_reduce,
@@ -48,6 +52,31 @@ def _compiled_fused_switch_situ_decode(
         # The real-weight sweep selected this exact tile on M3 Ultra.
         results_per_simdgroup=2,
         simdgroups=4,
+        derive_bias=False,
+    )
+
+
+@partial(mx.compile, shapeless=False)
+def _compiled_fused_switch_situ_decode_derived_bias(
+    x: mx.array,
+    indices: mx.array,
+    up_weight: mx.array,
+    up_scales: mx.array,
+    up_biases: mx.array,
+    gate_weight: mx.array,
+    gate_scales: mx.array,
+    gate_biases: mx.array,
+) -> mx.array:
+    """Run the fused gate/up stage while deriving validated affine biases."""
+
+    return fused_switch_situ_decode(
+        x,
+        indices,
+        (up_weight, up_scales, up_biases),
+        (gate_weight, gate_scales, gate_biases),
+        results_per_simdgroup=2,
+        simdgroups=4,
+        derive_bias=True,
     )
 
 
@@ -68,6 +97,28 @@ def _compiled_tuned_gather_qmv(
         results_per_simdgroup=4,
         simdgroups=2,
         broadcast_x=False,
+        derive_bias=False,
+    )
+
+
+@partial(mx.compile, shapeless=False)
+def _compiled_tuned_gather_qmv_derived_bias(
+    x: mx.array,
+    indices: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+) -> mx.array:
+    """Run the tuned down stage while deriving validated affine biases."""
+
+    return tuned_gather_qmv(
+        x,
+        indices,
+        (weight, scales, biases),
+        results_per_simdgroup=4,
+        simdgroups=2,
+        broadcast_x=False,
+        derive_bias=True,
     )
 
 
@@ -89,6 +140,29 @@ def _compiled_fused_down_reduce(
         (weight, scales, biases),
         results_per_threadgroup=4,
         simdgroups_per_threadgroup=16,
+        derive_bias=False,
+    )
+
+
+@partial(mx.compile, shapeless=False)
+def _compiled_fused_down_reduce_derived_bias(
+    x: mx.array,
+    indices: mx.array,
+    router_weights: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+) -> mx.array:
+    """Run fused down/reduce while deriving validated affine biases."""
+
+    return fused_down_reduce_decode(
+        x,
+        indices,
+        router_weights,
+        (weight, scales, biases),
+        results_per_threadgroup=4,
+        simdgroups_per_threadgroup=16,
+        derive_bias=True,
     )
 
 
@@ -129,6 +203,17 @@ def _quantized_projection(module: Any):
     return weight, scales, biases
 
 
+def _all_projections_support_derived_bias(
+    modules_and_parts: tuple[tuple[Any, tuple[mx.array, mx.array, mx.array]], ...],
+) -> bool:
+    """Require every participating bank to pass the exact metadata contract."""
+
+    return all(
+        projection_has_validated_derived_bias(module, parts[1], parts[2])
+        for module, parts in modules_and_parts
+    )
+
+
 def maybe_fused_k3_switch_glu(
     switch_mlp: Any,
     x: mx.array,
@@ -157,8 +242,22 @@ def maybe_fused_k3_switch_glu(
         return None
     if not supports_fused_switch_situ(x, indices, up, gate):
         return None
+    derive_bias = derive_affine2_bias_enabled()
+    if derive_bias and not _all_projections_support_derived_bias(
+        (
+            (switch_mlp.up_proj, up),
+            (switch_mlp.gate_proj, gate),
+            (switch_mlp.down_proj, down),
+        )
+    ):
+        return None
 
-    activated = _compiled_fused_switch_situ_decode(x, indices, *up, *gate)
+    fused_front = (
+        _compiled_fused_switch_situ_decode_derived_bias
+        if derive_bias
+        else _compiled_fused_switch_situ_decode
+    )
+    activated = fused_front(x, indices, *up, *gate)
     if not supports_tuned_gather_qmv(
         activated,
         indices,
@@ -168,7 +267,12 @@ def maybe_fused_k3_switch_glu(
         broadcast_x=False,
     ):
         return None
-    output = _compiled_tuned_gather_qmv(activated, indices, *down)
+    tuned_down = (
+        _compiled_tuned_gather_qmv_derived_bias
+        if derive_bias
+        else _compiled_tuned_gather_qmv
+    )
+    output = tuned_down(activated, indices, *down)
     return output.squeeze(-2)
 
 
@@ -210,8 +314,22 @@ def maybe_fused_k3_switch_glu_reduce(
         simdgroups_per_threadgroup=16,
     ):
         return None
+    derive_bias = derive_affine2_bias_enabled()
+    if derive_bias and not _all_projections_support_derived_bias(
+        (
+            (switch_mlp.up_proj, up),
+            (switch_mlp.gate_proj, gate),
+            (switch_mlp.down_proj, down),
+        )
+    ):
+        return None
 
-    activated = _compiled_fused_switch_situ_decode(x, indices, *up, *gate)
+    fused_front = (
+        _compiled_fused_switch_situ_decode_derived_bias
+        if derive_bias
+        else _compiled_fused_switch_situ_decode
+    )
+    activated = fused_front(x, indices, *up, *gate)
     if not supports_fused_down_reduce(
         activated,
         indices,
@@ -221,7 +339,12 @@ def maybe_fused_k3_switch_glu_reduce(
         simdgroups_per_threadgroup=16,
     ):
         return None
-    return _compiled_fused_down_reduce(
+    fused_down = (
+        _compiled_fused_down_reduce_derived_bias
+        if derive_bias
+        else _compiled_fused_down_reduce
+    )
+    return fused_down(
         activated,
         indices,
         router_weights,

@@ -64,6 +64,13 @@ inline float k3_sigmoid(float value) {
   float z = 1.0f / (1.0f + metal::exp(metal::abs(value)));
   return value < 0.0f ? z : 1.0f - z;
 }
+
+template <typename T>
+inline float k3_derive_affine2_bias(T scale) {
+  // Full-array validation admits finite-normal BF16 scales only. Multiplying
+  // such a value by a power of two is exact before the existing FP32 QMV.
+  return -2.0f * static_cast<float>(scale);
+}
 """
 
 
@@ -128,17 +135,30 @@ for (uint k = 0; k < input_width; k += BLOCK_SIZE) {
     const device T* up_bias_row = up_bias_ptr + row * scale_width;
     const device T* gate_scale_row = gate_scale_ptr + row * scale_width;
     const device T* gate_bias_row = gate_bias_ptr + row * scale_width;
+    T up_scale_value = up_scale_row[0];
+    T gate_scale_value = gate_scale_row[0];
+    float up_scale = static_cast<float>(up_scale_value);
+    float gate_scale = static_cast<float>(gate_scale_value);
+    float up_bias;
+    float gate_bias;
+    if constexpr (DERIVE_BIAS) {
+      up_bias = k3_derive_affine2_bias<T>(up_scale_value);
+      gate_bias = k3_derive_affine2_bias<T>(gate_scale_value);
+    } else {
+      up_bias = static_cast<float>(up_bias_row[0]);
+      gate_bias = static_cast<float>(gate_bias_row[0]);
+    }
     up_acc[row] += k3_qdot_2bit(
         up_row,
         x_thread,
-        static_cast<float>(up_scale_row[0]),
-        static_cast<float>(up_bias_row[0]),
+        up_scale,
+        up_bias,
         sum);
     gate_acc[row] += k3_qdot_2bit(
         gate_row,
         x_thread,
-        static_cast<float>(gate_scale_row[0]),
-        static_cast<float>(gate_bias_row[0]),
+        gate_scale,
+        gate_bias,
         sum);
   }
 
@@ -245,6 +265,7 @@ def fused_switch_situ_decode(
     *,
     results_per_simdgroup: int = 4,
     simdgroups: int = 2,
+    derive_bias: bool = False,
 ) -> mx.array:
     """Compute K3's gate/up gather-QMVs and SiTU in one Metal dispatch."""
 
@@ -254,6 +275,8 @@ def fused_switch_situ_decode(
         raise ValueError("results_per_simdgroup must be 2, 4, 8, or 16")
     if simdgroups not in (1, 2, 4):
         raise ValueError("simdgroups must be 1, 2, or 4")
+    if not isinstance(derive_bias, bool):
+        raise TypeError("derive_bias must be a bool")
     kernel = _kernel()
     assert kernel is not None
     output_width = up[1].shape[-2]
@@ -267,6 +290,7 @@ def fused_switch_situ_decode(
             ("T", x.dtype),
             ("RESULTS", results_per_simdgroup),
             ("SIMDS", simdgroups),
+            ("DERIVE_BIAS", derive_bias),
         ],
         grid=(32, (output_width // tile) * simdgroups, routed_slots),
         threadgroup=(32, simdgroups, 1),

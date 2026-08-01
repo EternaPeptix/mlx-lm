@@ -5,6 +5,11 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_lm.models.kimi_k3_derived_bias import (
+    DERIVE_AFFINE2_BIAS_ENV,
+    derive_affine2_bias_enabled,
+    derived_affine2_biases,
+)
 from mlx_lm.models.kimi_k3_fused_expert import (
     FUSED_DOWN_REDUCE_ENV,
     FUSED_EXPERT_ENV,
@@ -199,22 +204,35 @@ class _Switch:
         return self.down_proj(activated, indices).squeeze(-2)
 
 
+def _install_derived_biases(switch: _Switch) -> None:
+    for projection in (
+        switch.gate_proj,
+        switch.up_proj,
+        switch.down_proj,
+    ):
+        projection.biases = derived_affine2_biases(projection.scales)
+
+
 @unittest.skipUnless(_metal_available(), "requires Metal")
 class IntegrationTest(unittest.TestCase):
     def setUp(self):
         os.environ[FUSED_EXPERT_ENV] = "1"
         os.environ[FUSED_DOWN_REDUCE_ENV] = "1"
+        os.environ.pop(DERIVE_AFFINE2_BIAS_ENV, None)
         fused_k3_experts_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_expert_width2_enabled.cache_clear()
+        derive_affine2_bias_enabled.cache_clear()
 
     def tearDown(self):
         os.environ.pop(FUSED_EXPERT_ENV, None)
         os.environ.pop(FUSED_DOWN_REDUCE_ENV, None)
         os.environ.pop(FUSED_EXPERT_WIDTH2_ENV, None)
+        os.environ.pop(DERIVE_AFFINE2_BIAS_ENV, None)
         fused_k3_experts_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_expert_width2_enabled.cache_clear()
+        derive_affine2_bias_enabled.cache_clear()
 
     def test_fused_switch_is_bit_exact_on_cached_second_call(self):
         mx.random.seed(19)
@@ -266,9 +284,7 @@ class IntegrationTest(unittest.TestCase):
             shape=(1, 1, 16),
             dtype=mx.bfloat16,
         )
-        reference = (
-            switch.stock(x, indices) * router_weights[..., None]
-        ).sum(axis=-2)
+        reference = (switch.stock(x, indices) * router_weights[..., None]).sum(axis=-2)
         candidate = maybe_fused_k3_switch_glu_reduce(
             switch,
             x,
@@ -335,6 +351,30 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(candidate.shape, (1, width, 3584))
         self.assertTrue(bool(mx.array_equal(reference, candidate).item()))
 
+    def test_derived_bias_full_tp2_path_is_bit_exact(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        switch = _Switch.bounded_tp2_geometry_nonuniform()
+        _install_derived_biases(switch)
+        x = mx.random.normal((1, 1, 3584), dtype=mx.bfloat16)
+        indices = mx.arange(16, dtype=mx.uint32).reshape(1, 1, 16)
+        router_weights = mx.random.uniform(
+            shape=(1, 1, 16),
+            dtype=mx.bfloat16,
+        )
+        reference = (
+            switch.stock(x, indices) * router_weights[..., None]
+        ).sum(axis=-2)
+        candidate = maybe_fused_k3_switch_glu_reduce(
+            switch,
+            x,
+            indices,
+            router_weights,
+        )
+        self.assertIsNotNone(candidate)
+        mx.eval(reference, candidate)
+        self.assertTrue(bool(mx.array_equal(reference, candidate).item()))
+
     def test_width_two_has_an_independent_default_off_flag(self):
         switch = _Switch.bounded_tp2_geometry()
         x = mx.zeros((1, 2, 3584), dtype=mx.bfloat16)
@@ -343,6 +383,23 @@ class IntegrationTest(unittest.TestCase):
             (1, 2, 16),
         )
         router_weights = mx.zeros((1, 2, 16), dtype=mx.bfloat16)
+        self.assertIsNone(maybe_fused_k3_switch_glu(switch, x, indices))
+        self.assertIsNone(
+            maybe_fused_k3_switch_glu_reduce(
+                switch,
+                x,
+                indices,
+                router_weights,
+            )
+        )
+
+    def test_derived_bias_violation_falls_back_before_dispatch(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        switch = _Switch.bounded_tp2_geometry()
+        x = mx.zeros((1, 1, 3584), dtype=mx.bfloat16)
+        indices = mx.arange(16, dtype=mx.uint32).reshape(1, 1, 16)
+        router_weights = mx.zeros((1, 1, 16), dtype=mx.bfloat16)
         self.assertIsNone(maybe_fused_k3_switch_glu(switch, x, indices))
         self.assertIsNone(
             maybe_fused_k3_switch_glu_reduce(
