@@ -3,7 +3,7 @@
 import os
 import re
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -54,6 +54,8 @@ COMPILED_DECODE_SEGMENTS_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE_SEGMENTS"
 ASYNC_DECODE_BOUNDARIES_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES"
 ASYNC_DECODE_STATE_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE"
 REPLAYSSM_SPECULATIVE_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
+EXACT_WIDE_SHORT_CONV_ENV = "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV"
+_EXACT_WIDE_SHORT_CONV_MAX_WIDTH = 8
 
 
 def replayssm_speculative_enabled() -> bool:
@@ -82,6 +84,20 @@ def _validate_aux_hidden_state_layer_ids(
     if layer_ids[0] < 0 or layer_ids[-1] >= num_layers:
         raise ValueError("auxiliary hidden-state layer id is outside the target")
     return layer_ids
+
+
+@lru_cache(maxsize=1)
+def exact_wide_short_conv_enabled() -> bool:
+    """Return whether exact recurrent short-convolution was requested.
+
+    This flag guards a correctness path, so malformed values fail closed
+    instead of silently selecting the generic wide ``Conv1d`` fallback.
+    """
+
+    value = os.environ.get(EXACT_WIDE_SHORT_CONV_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{EXACT_WIDE_SHORT_CONV_ENV} must be exactly '0' or '1'")
+    return value == "1"
 
 
 def _parse_compiled_decode_segments(
@@ -520,6 +536,49 @@ _short_conv_kernel = (
     else None
 )
 
+_SHORT_CONV_WIDE_SOURCE = """
+    auto c = thread_position_in_grid.x;
+    auto b = thread_position_in_grid.y;
+
+    const device T* initial_state = state + b * (KS - 1) * C;
+    float local_state[KS - 1];
+    for (int j = 0; j < KS - 1; ++j) {
+      local_state[j] = static_cast<float>(initial_state[j * C + c]);
+    }
+
+    for (int t = 0; t < L; ++t) {
+      auto input = static_cast<float>(x[(b * L + t) * C + c]);
+      float v = 0.0f;
+      for (int j = 0; j < KS - 1; ++j) {
+        v += static_cast<float>(w[c * KS + j]) * local_state[j];
+      }
+      v += static_cast<float>(w[c * KS + KS - 1]) * input;
+      y[(b * L + t) * C + c] =
+          static_cast<T>(v / (1.0f + metal::exp(-v)));
+
+      for (int j = 0; j < KS - 2; ++j) {
+        local_state[j] = local_state[j + 1];
+      }
+      local_state[KS - 2] = input;
+    }
+
+    device T* final_state = new_state + b * (KS - 1) * C;
+    for (int j = 0; j < KS - 1; ++j) {
+      final_state[j * C + c] = static_cast<T>(local_state[j]);
+    }
+"""
+
+_short_conv_wide_kernel = (
+    mx.fast.metal_kernel(
+        name="k3_short_conv_exact_wide",
+        input_names=["x", "state", "w"],
+        output_names=["y", "new_state"],
+        source=_SHORT_CONV_WIDE_SOURCE,
+    )
+    if mx.metal.is_available()
+    else None
+)
+
 _SHORT_CONV_HISTORY_SOURCE = """
     auto c = thread_position_in_grid.x;
     auto b = thread_position_in_grid.y;
@@ -579,6 +638,7 @@ class KimiK3ShortConv(ShortConv1d):
         lengths=None,
         return_state_history=False,
     ):
+        exact_wide = exact_wide_short_conv_enabled()
         if return_state_history:
             if (
                 _short_conv_history_kernel is None
@@ -611,6 +671,35 @@ class KimiK3ShortConv(ShortConv1d):
                     (B, L, self.kernel_size - 1, C),
                 ],
                 output_dtypes=[x.dtype, x.dtype, x.dtype],
+            )
+        if exact_wide and 1 < x.shape[1] <= _EXACT_WIDE_SHORT_CONV_MAX_WIDTH:
+            if (
+                _short_conv_wide_kernel is None
+                or self.training
+                or state is None
+                or mask is not None
+                or lengths is not None
+                or x.dtype != state.dtype
+                or x.dtype != self.conv.weight.dtype
+                or mx.default_device() != mx.gpu
+            ):
+                raise ValueError(
+                    "Exact Kimi K3 wide short-convolution requires populated, "
+                    "unpadded, matching-dtype Metal state and width in [2, 8]"
+                )
+            B, L, C = x.shape
+            return _short_conv_wide_kernel(
+                inputs=[x, state, self.conv.weight],
+                template=[
+                    ("T", x.dtype),
+                    ("C", C),
+                    ("KS", self.kernel_size),
+                    ("L", L),
+                ],
+                grid=(C, B, 1),
+                threadgroup=(min(1024, C), 1, 1),
+                output_shapes=[x.shape, state.shape],
+                output_dtypes=[x.dtype, x.dtype],
             )
         if (
             _short_conv_kernel is None
