@@ -249,7 +249,7 @@ class TestModelParallel(unittest.TestCase):
                         )
                     )
 
-    def test_kimi_k3_speculative_cache_tp2_width_two_and_eight(self):
+    def test_kimi_k3_speculative_cache_tp2_width_variants(self):
         group = mx.distributed.init()
         if group.size() != 2:
             self.skipTest("requires mlx.launch with exactly two ranks")
@@ -306,7 +306,7 @@ class TestModelParallel(unittest.TestCase):
                             )
                         )
 
-        for width, consumed in ((2, 1), (8, 8)):
+        for width, consumed in ((2, 1), (3, 1), (3, 2), (8, 8)):
             with self.subTest(width=width, consumed=consumed):
                 wide_cache = populated_cache()
                 sequential_cache = populated_cache()
