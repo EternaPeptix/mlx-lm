@@ -5,13 +5,16 @@ import os
 import tempfile
 import unittest
 import warnings
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
 from mlx import nn
 from mlx.utils import tree_flatten
 
+from mlx_lm.models.kimi_k3 import VocabParallelHead
 from mlx_lm.models.kimi_k3_dspark import (
     DSPARK_PROPOSER_ENV,
     DSPARK_STACKED_CONTEXT_KV_ENV,
@@ -55,6 +58,16 @@ def _tiny_args(*, block_size: int = 2) -> KimiK3DSparkArgs:
         target_layer_ids=(0, 1),
         markov_rank=4,
         weight_dtype=mx.float32,
+    )
+
+
+def _quantized_tiny_args() -> KimiK3DSparkArgs:
+    return replace(
+        _tiny_args(),
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=8,
+        num_key_value_heads=2,
     )
 
 
@@ -330,6 +343,95 @@ class KimiK3DSparkModelTest(unittest.TestCase):
             {name: id(value) for name, value in before.items()},
         )
         self.assertFalse(any(name.startswith("_target") for name in after))
+
+    def test_quantized_target_embedding_uses_logical_shape(self):
+        args = _quantized_tiny_args()
+        model = KimiK3DSparkModel(args)
+        embedding = nn.QuantizedEmbedding(
+            args.vocab_size,
+            args.hidden_size,
+            group_size=32,
+            bits=2,
+        )
+        vocab_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+        self.assertEqual(tuple(embedding.weight.shape), (args.vocab_size, 2))
+        self.assertEqual(
+            (embedding.num_embeddings, embedding.dims),
+            (args.vocab_size, args.hidden_size),
+        )
+        self.assertIs(model.bind_target_modules(embedding, vocab_head), model)
+
+    def test_quantized_target_embedding_binds_with_vocab_parallel_head(self):
+        args = _quantized_tiny_args()
+        embedding = nn.QuantizedEmbedding(
+            args.vocab_size,
+            args.hidden_size,
+            group_size=32,
+            bits=2,
+        )
+        vocab_head = VocabParallelHead(
+            nn.Linear(args.hidden_size, args.vocab_size, bias=False),
+            mx.distributed.init(),
+        )
+        model = KimiK3DSparkModel(args)
+        target = SimpleNamespace(
+            language_model=SimpleNamespace(
+                args=SimpleNamespace(tie_word_embeddings=False),
+                model=SimpleNamespace(embed_tokens=embedding),
+                lm_head=vocab_head,
+            )
+        )
+
+        self.assertFalse(hasattr(vocab_head, "weight"))
+        self.assertIs(model.bind_target(target), model)
+        self.assertIs(model.target_embedding, embedding)
+        self.assertIs(model.target_vocab_head, vocab_head)
+
+    def test_target_embedding_shape_validation_rejects_dense_and_quantized(self):
+        args = _quantized_tiny_args()
+        vocab_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        invalid_embeddings = (
+            nn.Embedding(args.vocab_size + 1, args.hidden_size),
+            nn.Embedding(args.vocab_size, args.hidden_size + 1),
+            nn.QuantizedEmbedding(
+                args.vocab_size + 1,
+                args.hidden_size,
+                group_size=32,
+                bits=2,
+            ),
+            nn.QuantizedEmbedding(
+                args.vocab_size,
+                args.hidden_size + 32,
+                group_size=32,
+                bits=2,
+            ),
+        )
+
+        for embedding in invalid_embeddings:
+            with self.subTest(embedding=type(embedding).__name__):
+                with self.assertRaisesRegex(ValueError, "embedding shape"):
+                    KimiK3DSparkModel(args).bind_target_modules(
+                        embedding,
+                        vocab_head,
+                    )
+
+    def test_target_head_shape_validation_is_unchanged(self):
+        args = _quantized_tiny_args()
+        embedding = nn.QuantizedEmbedding(
+            args.vocab_size,
+            args.hidden_size,
+            group_size=32,
+            bits=2,
+        )
+        wrong_head = nn.Linear(
+            args.hidden_size,
+            args.vocab_size + 1,
+            bias=False,
+        )
+
+        with self.assertRaisesRegex(ValueError, "vocabulary head"):
+            KimiK3DSparkModel(args).bind_target_modules(embedding, wrong_head)
 
     def test_reference_and_opt_in_stacked_context_projection_match(self):
         model = KimiK3DSparkModel(_tiny_args())

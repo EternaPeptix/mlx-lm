@@ -844,8 +844,12 @@ class KimiK3DSparkModel(nn.Module):
         return self._target_vocab_head
 
     def bind_target_modules(self, embedding: nn.Module, vocab_head=None):
-        weight = getattr(embedding, "weight", None)
-        if weight is None or tuple(weight.shape) != (
+        if isinstance(embedding, nn.QuantizedEmbedding):
+            embedding_shape = (embedding.num_embeddings, embedding.dims)
+        else:
+            weight = getattr(embedding, "weight", None)
+            embedding_shape = None if weight is None else tuple(weight.shape)
+        if embedding_shape != (
             self.args.vocab_size,
             self.args.hidden_size,
         ):
