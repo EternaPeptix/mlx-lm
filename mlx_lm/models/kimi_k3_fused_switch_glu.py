@@ -3,7 +3,7 @@
 This is an inference prototype for Metal decode and target verification:
 
 * affine 2-bit weights with group size 128;
-* one decode token or an exact width-two target-verification block;
+* one decode token or an exact width-two/three target-verification block;
 * input width divisible by 512 and rank-local intermediate width by 8;
 * BF16 activations; and
 * Kimi K3's SiTU(beta=4, linear_beta=25).
@@ -229,7 +229,7 @@ def supports_fused_switch_situ(
     if (
         x.ndim != 3
         or x.shape[0] != 1
-        or x.shape[-2] not in (1, 2)
+        or x.shape[-2] not in (1, 2, 3)
         or indices.ndim != 3
     ):
         return False

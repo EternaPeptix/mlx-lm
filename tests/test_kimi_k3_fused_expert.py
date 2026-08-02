@@ -15,8 +15,10 @@ from mlx_lm.models.kimi_k3_fused_expert import (
     FUSED_DOWN_REDUCE_ENV,
     FUSED_EXPERT_ENV,
     FUSED_EXPERT_WIDTH2_ENV,
+    FUSED_EXPERT_WIDTH3_ENV,
     fused_k3_down_reduce_enabled,
     fused_k3_expert_width2_enabled,
+    fused_k3_expert_width3_enabled,
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
     maybe_fused_k3_switch_glu_reduce,
@@ -225,20 +227,25 @@ class IntegrationTest(unittest.TestCase):
     def setUp(self):
         os.environ[FUSED_EXPERT_ENV] = "1"
         os.environ[FUSED_DOWN_REDUCE_ENV] = "1"
+        os.environ.pop(FUSED_EXPERT_WIDTH2_ENV, None)
+        os.environ.pop(FUSED_EXPERT_WIDTH3_ENV, None)
         os.environ.pop(DERIVE_AFFINE2_BIAS_ENV, None)
         fused_k3_experts_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_expert_width2_enabled.cache_clear()
+        fused_k3_expert_width3_enabled.cache_clear()
         derive_affine2_bias_enabled.cache_clear()
 
     def tearDown(self):
         os.environ.pop(FUSED_EXPERT_ENV, None)
         os.environ.pop(FUSED_DOWN_REDUCE_ENV, None)
         os.environ.pop(FUSED_EXPERT_WIDTH2_ENV, None)
+        os.environ.pop(FUSED_EXPERT_WIDTH3_ENV, None)
         os.environ.pop(DERIVE_AFFINE2_BIAS_ENV, None)
         fused_k3_experts_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_expert_width2_enabled.cache_clear()
+        fused_k3_expert_width3_enabled.cache_clear()
         derive_affine2_bias_enabled.cache_clear()
 
     def test_fused_switch_is_bit_exact_on_cached_second_call(self):
@@ -356,6 +363,30 @@ class IntegrationTest(unittest.TestCase):
         self.assertIsNotNone(candidate)
         mx.eval(reference, candidate)
         self.assertEqual(candidate.shape, (1, width, 3584))
+        self.assertTrue(bool(mx.array_equal(reference, candidate).item()))
+
+    def test_width_three_fused_front_is_opt_in_and_bit_exact(self):
+        mx.random.seed(20260802)
+        switch = _Switch.bounded_tp2_geometry_nonuniform()
+        _install_derived_biases(switch, include_down=True)
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        width = 3
+        x = mx.random.normal((1, width, 3584), dtype=mx.bfloat16)
+        base = mx.arange(16, dtype=mx.uint32)
+        indices = mx.stack(
+            [(base * 5 + shift * 3) % 16 for shift in range(width)]
+        )[None]
+        reference = switch.stock(x, indices)
+
+        self.assertIsNone(maybe_fused_k3_switch_glu(switch, x, indices))
+        os.environ[FUSED_EXPERT_WIDTH3_ENV] = "1"
+        fused_k3_expert_width3_enabled.cache_clear()
+        candidate = maybe_fused_k3_switch_glu(switch, x, indices)
+
+        self.assertIsNotNone(candidate)
+        mx.eval(reference, candidate)
+        self.assertEqual(candidate.shape, (1, width, 16, 3584))
         self.assertTrue(bool(mx.array_equal(reference, candidate).item()))
 
     def test_derived_bias_keeps_mismatched_down_on_stored_path(self):

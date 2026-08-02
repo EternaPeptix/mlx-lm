@@ -29,6 +29,7 @@ from .kimi_k3_tuned_gather_qmv import (
 FUSED_EXPERT_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERTS"
 FUSED_DOWN_REDUCE_ENV = "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE"
 FUSED_EXPERT_WIDTH2_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH2"
+FUSED_EXPERT_WIDTH3_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH3"
 
 
 @partial(mx.compile, shapeless=False)
@@ -181,8 +182,19 @@ def fused_k3_expert_width2_enabled() -> bool:
     return os.environ.get(FUSED_EXPERT_WIDTH2_ENV, "0") == "1"
 
 
+@lru_cache(maxsize=1)
+def fused_k3_expert_width3_enabled() -> bool:
+    return os.environ.get(FUSED_EXPERT_WIDTH3_ENV, "0") == "1"
+
+
 def _fused_expert_width_enabled(x: mx.array) -> bool:
-    return x.ndim != 3 or x.shape[-2] != 2 or fused_k3_expert_width2_enabled()
+    if x.ndim != 3:
+        return True
+    if x.shape[-2] == 2:
+        return fused_k3_expert_width2_enabled()
+    if x.shape[-2] == 3:
+        return fused_k3_expert_width3_enabled()
+    return True
 
 
 def _quantized_projection(module: Any):

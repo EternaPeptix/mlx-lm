@@ -67,7 +67,7 @@ class FusedSwitchGLUTest(unittest.TestCase):
         mx.eval(self.x, self.indices, *self.up, *self.gate)
 
     def test_matches_native_quantized_path(self):
-        for width in (1, 2):
+        for width in (1, 2, 3):
             x = mx.random.normal((1, width, 512), dtype=mx.bfloat16)
             indices = mx.concatenate(
                 [mx.roll(self.indices, shift, axis=-1) for shift in range(width)],
@@ -91,7 +91,7 @@ class FusedSwitchGLUTest(unittest.TestCase):
                 )
 
     def test_contract_rejects_unproven_verification_widths(self):
-        for width in (3, 8):
+        for width in (4, 8):
             prefill = mx.broadcast_to(self.x, (1, width, 512))
             indices = mx.broadcast_to(self.indices, (1, width, 4))
             self.assertFalse(
