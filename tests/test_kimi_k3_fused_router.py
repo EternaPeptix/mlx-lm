@@ -102,10 +102,33 @@ class FusedRouterTest(unittest.TestCase):
         bias = 0.25 * mx.random.normal((896,), dtype=mx.float32)
         self.assertExact(gates, bias)
 
+    def test_q3_verifier_rows_are_bit_exact(self):
+        for seed in range(32):
+            with self.subTest(seed=seed):
+                mx.random.seed(10_000 + seed)
+                gates = mx.random.normal((1, 3, 896), dtype=mx.bfloat16)
+                bias = 0.25 * mx.random.normal((896,), dtype=mx.float32)
+                self.assertExact(gates, bias)
+
     def test_sparse_moe_integration_is_bit_exact(self):
         mx.random.seed(211)
         module = _released_router_sparse_moe()
         gates = mx.random.normal((1, 1, 64), dtype=mx.bfloat16)
+
+        os.environ.pop(FUSED_ROUTER_ENV)
+        fused_k3_router_enabled.cache_clear()
+        reference = module(gates)
+
+        os.environ[FUSED_ROUTER_ENV] = "1"
+        fused_k3_router_enabled.cache_clear()
+        candidate = module(gates)
+        mx.eval(reference, candidate)
+        self.assertTrue(bool(mx.all(reference == candidate).item()))
+
+    def test_q3_sparse_moe_integration_is_bit_exact(self):
+        mx.random.seed(212)
+        module = _released_router_sparse_moe()
+        gates = mx.random.normal((1, 3, 64), dtype=mx.bfloat16)
 
         os.environ.pop(FUSED_ROUTER_ENV)
         fused_k3_router_enabled.cache_clear()
@@ -186,6 +209,7 @@ class FusedRouterTest(unittest.TestCase):
         bias = mx.zeros((896,), dtype=mx.float32)
         cases = (
             (mx.zeros((1, 2, 896), dtype=mx.bfloat16), bias, {}),
+            (mx.zeros((2, 3, 896), dtype=mx.bfloat16), bias, {}),
             (mx.zeros((1, 1, 895), dtype=mx.bfloat16), bias[:-1], {}),
             (gates.astype(mx.float32), bias, {}),
             (gates, bias.astype(mx.bfloat16), {}),

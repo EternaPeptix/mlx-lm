@@ -1,4 +1,4 @@
-"""Exact, decode-only router selection for the released Kimi K3 geometry.
+"""Exact router selection for released Kimi K3 decode and Q3 verification.
 
 The stock router materializes a corrected score array and routes it through a
 general-purpose ``argpartition`` before gathering and normalizing the original
@@ -258,7 +258,11 @@ def supports_fused_k3_router(
         and mx.default_device() == mx.gpu
         and gates.dtype == mx.bfloat16
         and gates.ndim == 3
-        and gates.shape[-2:] == (1, _EXPERTS)
+        and gates.shape[-1] == _EXPERTS
+        and (
+            gates.shape[-2] == 1
+            or (gates.shape[0] == 1 and gates.shape[-2] == 3)
+        )
         and gates.size > 0
         and bias is not None
         and bias.dtype == mx.float32
