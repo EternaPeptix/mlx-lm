@@ -60,6 +60,7 @@ ASYNC_DECODE_BOUNDARIES_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES"
 ASYNC_DECODE_STATE_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE"
 REPLAYSSM_SPECULATIVE_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
 EXACT_WIDE_SHORT_CONV_ENV = "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV"
+MOK_ROUTED_SHARED_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_ROUTED_SHARED_OVERLAP"
 _EXACT_WIDE_SHORT_CONV_MAX_WIDTH = 8
 
 
@@ -69,6 +70,22 @@ def replayssm_speculative_enabled() -> bool:
     value = os.environ.get(REPLAYSSM_SPECULATIVE_ENV, "0")
     if value not in {"0", "1"}:
         raise ValueError(f"{REPLAYSSM_SPECULATIVE_ENV} must be 0 or 1")
+    return value == "1"
+
+
+def mok_routed_shared_overlap_enabled() -> bool:
+    """Parse the default-off TP2 routed/shared collective split.
+
+    The split gives MLX's scheduler independent routed and shared branches so
+    JACCL communication may overlap the shared-expert and routed-up compute.
+    It is restricted at dispatch to the three-token target-verification shape
+    where collective startup can be hidden; ordinary decode and prefill retain
+    one combined reduction.
+    """
+
+    value = os.environ.get(MOK_ROUTED_SHARED_OVERLAP_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{MOK_ROUTED_SHARED_OVERLAP_ENV} must be 0 or 1")
     return value == "1"
 
 
@@ -1307,6 +1324,7 @@ class KimiK3SparseMoE(nn.Module):
             self.shared_experts = None
 
         self.sharding_group = None
+        self.mok_routed_shared_overlap = mok_routed_shared_overlap_enabled()
 
     def _call_with_optional_residual(
         self,
@@ -1362,6 +1380,20 @@ class KimiK3SparseMoE(nn.Module):
             y = (y * weights[..., None]).sum(axis=-2)
         else:
             y = fused_reduced_y
+        overlap_routed_shared = (
+            self.mok_routed_shared_overlap
+            and not self.training
+            and self.sharding_group is not None
+            and self.shared_experts is not None
+            and optimized_front is None
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and x.shape[1] == 3
+        )
+        if overlap_routed_shared:
+            # Keep this lazy: the independent collective branch is visible to
+            # MLX's scheduler without adding a per-layer host synchronization.
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
         if self.shared_experts is None:
             shared = None
         elif optimized_front is None:
@@ -1376,7 +1408,10 @@ class KimiK3SparseMoE(nn.Module):
                 )
             )
         if self.sharding_group is not None:
-            if shared is not None:
+            if overlap_routed_shared:
+                assert shared is not None
+                shared = mx.distributed.all_sum(shared, group=self.sharding_group)
+            elif shared is not None:
                 split = y.shape[-1]
                 combined = mx.distributed.all_sum(
                     mx.concatenate([y, shared], axis=-1), group=self.sharding_group
