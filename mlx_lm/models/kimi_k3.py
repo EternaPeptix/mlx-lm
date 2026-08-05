@@ -2406,6 +2406,14 @@ class KimiK3TargetGreedyForward:
     aux_hidden_states: Tuple[mx.array, ...]
 
 
+@dataclass(frozen=True)
+class KimiK3AuxPrefill:
+    """Completion root and ordered taps from a cache-producing prefill."""
+
+    final_hidden_state: mx.array
+    aux_hidden_states: Tuple[mx.array, ...]
+
+
 class LanguageModel(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -2449,6 +2457,38 @@ class LanguageModel(nn.Module):
         )
         return KimiK3TargetForward(
             logits=logits,
+            aux_hidden_states=aux_hidden_states,
+        )
+
+    def forward_aux_hidden_states_for_cache(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]],
+        layer_ids: Tuple[int, ...],
+    ) -> KimiK3AuxPrefill:
+        """Build ordered hidden taps and cache updates without an LM-head graph.
+
+        This is a prompt-prefill primitive for consumers that need target hidden
+        taps and the target cache, but no vocabulary result.  MLX is lazy, so a
+        caller with a cache must evaluate ``final_hidden_state``, every entry in
+        ``aux_hidden_states``, and every cache ``state``.  The final hidden state
+        is the explicit completion root for layers after the final requested tap;
+        the cache roots remain necessary to force all cache-producing writes.
+
+        Auxiliary capture deliberately follows the same eager path and input
+        validation as :meth:`forward_with_aux_hidden_states`.
+        """
+
+        result = self.model(
+            inputs,
+            cache,
+            aux_hidden_state_layer_ids=layer_ids,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError("Kimi K3 target did not return auxiliary states")
+        out, aux_hidden_states = result
+        return KimiK3AuxPrefill(
+            final_hidden_state=out,
             aux_hidden_states=aux_hidden_states,
         )
 
@@ -2991,6 +3031,18 @@ class Model(nn.Module):
         layer_ids: Tuple[int, ...],
     ) -> KimiK3TargetForward:
         return self.language_model.forward_with_aux_hidden_states(
+            inputs,
+            cache,
+            layer_ids,
+        )
+
+    def forward_aux_hidden_states_for_cache(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]],
+        layer_ids: Tuple[int, ...],
+    ) -> KimiK3AuxPrefill:
+        return self.language_model.forward_aux_hidden_states_for_cache(
             inputs,
             cache,
             layer_ids,
