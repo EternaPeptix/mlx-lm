@@ -7,9 +7,11 @@ from unittest import mock
 import mlx.core as mx
 
 from mlx_lm.models.kimi_k3 import (
+    MOK_PREFILL_OVERLAP_ENV,
     MOK_ROUTED_SHARED_OVERLAP_ENV,
     KimiK3SparseMoE,
     TextArgs,
+    mok_prefill_overlap_enabled,
     mok_routed_shared_overlap_enabled,
 )
 
@@ -35,7 +37,13 @@ def _small_sparse_moe() -> KimiK3SparseMoE:
     return module
 
 
-def _run(module: KimiK3SparseMoE, x: mx.array, *, overlap: bool):
+def _run(
+    module: KimiK3SparseMoE,
+    x: mx.array,
+    *,
+    overlap: bool,
+    prefill_overlap: bool = False,
+):
     reduction_widths = []
 
     def identity_all_sum(value, *, group):
@@ -44,6 +52,7 @@ def _run(module: KimiK3SparseMoE, x: mx.array, *, overlap: bool):
         return value
 
     module.mok_routed_shared_overlap = overlap
+    module.mok_prefill_overlap = prefill_overlap
     with (
         mock.patch(
             "mlx_lm.models.kimi_k3.sum_gradients",
@@ -61,6 +70,7 @@ def _run(module: KimiK3SparseMoE, x: mx.array, *, overlap: bool):
 
 class KimiK3MoKOverlapTests(unittest.TestCase):
     def tearDown(self):
+        os.environ.pop(MOK_PREFILL_OVERLAP_ENV, None)
         os.environ.pop(MOK_ROUTED_SHARED_OVERLAP_ENV, None)
 
     def test_environment_is_strict_and_default_off(self):
@@ -74,6 +84,14 @@ class KimiK3MoKOverlapTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
             mok_routed_shared_overlap_enabled()
 
+        os.environ.pop(MOK_PREFILL_OVERLAP_ENV, None)
+        self.assertFalse(mok_prefill_overlap_enabled())
+        os.environ[MOK_PREFILL_OVERLAP_ENV] = "1"
+        self.assertTrue(mok_prefill_overlap_enabled())
+        os.environ[MOK_PREFILL_OVERLAP_ENV] = "yes"
+        with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+            mok_prefill_overlap_enabled()
+
     def test_q3_split_is_exact_and_uses_two_reductions(self):
         mx.random.seed(923)
         module = _small_sparse_moe()
@@ -86,12 +104,33 @@ class KimiK3MoKOverlapTests(unittest.TestCase):
         self.assertEqual(candidate_widths, [64, 128])
         self.assertTrue(bool(mx.all(reference == candidate).item()))
 
-    def test_prefill_width_keeps_one_combined_reduction(self):
+    def test_prefill_width_splits_only_with_independent_opt_in(self):
         mx.random.seed(929)
+        module = _small_sparse_moe()
+        x = mx.random.normal((1, 128, 128), dtype=mx.bfloat16)
+
+        reference, reference_widths = _run(module, x, overlap=True)
+        candidate, candidate_widths = _run(
+            module,
+            x,
+            overlap=True,
+            prefill_overlap=True,
+        )
+        self.assertEqual(reference_widths, [192])
+        self.assertEqual(candidate_widths, [64, 128])
+        self.assertTrue(bool(mx.all(reference == candidate).item()))
+
+    def test_short_non_q3_width_keeps_one_combined_reduction(self):
+        mx.random.seed(931)
         module = _small_sparse_moe()
         x = mx.random.normal((1, 4, 128), dtype=mx.bfloat16)
 
-        _, reduction_widths = _run(module, x, overlap=True)
+        _, reduction_widths = _run(
+            module,
+            x,
+            overlap=True,
+            prefill_overlap=True,
+        )
         self.assertEqual(reduction_widths, [192])
 
     def test_ordinary_decode_keeps_one_combined_reduction(self):

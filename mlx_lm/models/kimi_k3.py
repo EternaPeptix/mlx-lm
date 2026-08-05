@@ -61,6 +61,7 @@ ASYNC_DECODE_STATE_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE"
 REPLAYSSM_SPECULATIVE_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
 EXACT_WIDE_SHORT_CONV_ENV = "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV"
 MOK_ROUTED_SHARED_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_ROUTED_SHARED_OVERLAP"
+MOK_PREFILL_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_PREFILL_OVERLAP"
 _EXACT_WIDE_SHORT_CONV_MAX_WIDTH = 8
 
 
@@ -86,6 +87,15 @@ def mok_routed_shared_overlap_enabled() -> bool:
     value = os.environ.get(MOK_ROUTED_SHARED_OVERLAP_ENV, "0")
     if value not in {"0", "1"}:
         raise ValueError(f"{MOK_ROUTED_SHARED_OVERLAP_ENV} must be 0 or 1")
+    return value == "1"
+
+
+def mok_prefill_overlap_enabled() -> bool:
+    """Parse the default-off TP2 prefill collective-overlap experiment."""
+
+    value = os.environ.get(MOK_PREFILL_OVERLAP_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{MOK_PREFILL_OVERLAP_ENV} must be 0 or 1")
     return value == "1"
 
 
@@ -1325,6 +1335,7 @@ class KimiK3SparseMoE(nn.Module):
 
         self.sharding_group = None
         self.mok_routed_shared_overlap = mok_routed_shared_overlap_enabled()
+        self.mok_prefill_overlap = mok_prefill_overlap_enabled()
 
     def _call_with_optional_residual(
         self,
@@ -1380,15 +1391,22 @@ class KimiK3SparseMoE(nn.Module):
             y = (y * weights[..., None]).sum(axis=-2)
         else:
             y = fused_reduced_y
+        overlap_shape = (
+            x.ndim == 3
+            and x.shape[0] == 1
+            and (
+                (self.mok_routed_shared_overlap and x.shape[1] == 3)
+                or (self.mok_prefill_overlap and x.shape[1] >= 128)
+            )
+        )
         overlap_routed_shared = (
-            self.mok_routed_shared_overlap
+            overlap_shape
             and not self.training
             and self.sharding_group is not None
             and self.shared_experts is not None
             and optimized_front is None
             and x.ndim == 3
             and x.shape[0] == 1
-            and x.shape[1] == 3
         )
         if overlap_routed_shared:
             # Keep this lazy: the independent collective branch is visible to
