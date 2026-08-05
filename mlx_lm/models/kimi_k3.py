@@ -48,6 +48,9 @@ from .kimi_k3_packed_moe_front import (
     maybe_authoritative_packed_k3_moe_front,
     maybe_packed_k3_moe_front,
 )
+from .kimi_k3_prefill_route_combine import (
+    maybe_fused_k3_prefill_switch_glu_reduce,
+)
 from .kimi_linear import ShortConv1d
 from .mla import MultiLinear
 from .switch_layers import SwitchGLU
@@ -1385,6 +1388,13 @@ class KimiK3SparseMoE(nn.Module):
             inds,
             weights,
         )
+        if fused_reduced_y is None:
+            fused_reduced_y = maybe_fused_k3_prefill_switch_glu_reduce(
+                self.switch_mlp,
+                y,
+                inds,
+                weights,
+            )
         if fused_reduced_y is None:
             fused_y = maybe_fused_k3_switch_glu(self.switch_mlp, y, inds)
             y = self.switch_mlp(y, inds) if fused_y is None else fused_y
