@@ -2,7 +2,7 @@
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple, Union
 
@@ -52,7 +52,7 @@ from .kimi_k3_prefill_route_combine import (
     maybe_fused_k3_prefill_switch_glu_reduce,
 )
 from .kimi_linear import ShortConv1d
-from .mla import MultiLinear
+from .mla import MultiLinear, QuantizedMultiLinear
 from .switch_layers import SwitchGLU
 
 COMPILED_DECODE_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE"
@@ -136,12 +136,305 @@ def exact_wide_short_conv_enabled() -> bool:
 
 
 FACTORIZED_SDPA_PREFILL_ENV = "MLX_LM_KIMI_K3_FACTORIZED_SDPA_PREFILL"
+PROJECTED_KV_CACHE_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE"
+PROJECTED_KV_CACHE_MAX_TOKENS_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE_MAX_TOKENS"
+_PROJECTED_KV_CACHE_APPEND_ROWS = 32
+_PROJECTED_KV_CACHE_MIN_PREFIX = 32
+_PROJECTED_KV_CACHE_MAX_SAFE_TOKENS = 131072
 
 
 def _factorized_sdpa_prefill_requested() -> bool:
     """Return whether the strict, default-off K3 prefill path was requested."""
 
     return os.environ.get(FACTORIZED_SDPA_PREFILL_ENV, "0") == "1"
+
+
+def _projected_kv_cache_requested() -> bool:
+    """Parse the strict, default-off expanded-MLA cache selector."""
+
+    value = os.environ.get(PROJECTED_KV_CACHE_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{PROJECTED_KV_CACHE_ENV} must be exactly '0' or '1'")
+    return value == "1"
+
+
+def _projected_kv_cache_max_tokens() -> int:
+    """Return the explicit safety cap for the large expanded cache.
+
+    The cache adds 576 KiB per context token per released TP2 rank across K3's
+    24 MLA layers.  Refuse values above 128K to bound steady-state and
+    reallocation memory; 128K still requires an explicit fleet headroom gate
+    before use.
+    """
+
+    raw = os.environ.get(PROJECTED_KV_CACHE_MAX_TOKENS_ENV, "32768")
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"{PROJECTED_KV_CACHE_MAX_TOKENS_ENV} must be an integer"
+        ) from error
+    if (
+        not _PROJECTED_KV_CACHE_MIN_PREFIX
+        <= value
+        <= _PROJECTED_KV_CACHE_MAX_SAFE_TOKENS
+    ):
+        raise ValueError(
+            f"{PROJECTED_KV_CACHE_MAX_TOKENS_ENV} must be in "
+            f"[{_PROJECTED_KV_CACHE_MIN_PREFIX}, "
+            f"{_PROJECTED_KV_CACHE_MAX_SAFE_TOKENS}]"
+        )
+    return value
+
+
+class KimiK3ProjectedKVCache(KVCache):
+    """Ordinary latent MLA cache plus a request-local expanded BF16 cache.
+
+    The expanded arrays are deliberately excluded from ``state`` so prompt
+    cache serialization remains compatible.  Restoring state clears them;
+    the first width-three verifier call rebuilds them from the authoritative
+    latent cache.  Their bytes are included in ``nbytes`` for capacity checks.
+    """
+
+    # Only the ordinary latent K/V state is serialized.  Naming its on-disk
+    # representation as KVCache keeps prompt caches portable and ensures that
+    # loading them does not depend on importing this model module first.
+    prompt_cache_class_name = "KVCache"
+
+    def __init__(self):
+        super().__init__()
+        self.clear_projected()
+
+    def clear_projected_arrays(self):
+        self.projected_keys = None
+        self.projected_values = None
+        self.projected_capacity = 0
+        self.projected_valid_offset = 0
+        self.projected_owner_id = None
+
+    def clear_projected_transaction(self):
+        self._projected_transaction_token = None
+        self._projected_transaction_width = 0
+
+    def clear_projected(self):
+        self.clear_projected_arrays()
+        self.clear_projected_transaction()
+
+    def validate_begin_projected_transaction(self):
+        if (
+            self._projected_transaction_token is not None
+            or self._projected_transaction_width != 0
+        ):
+            raise ValueError(
+                "a projected K3 speculative transaction is already active"
+            )
+
+    def begin_projected_transaction(self, token: object, width: int):
+        self.validate_begin_projected_transaction()
+        if token is None:
+            raise ValueError("projected K3 speculative transaction requires a token")
+        if width <= 1:
+            raise ValueError("projected K3 speculative width must be greater than one")
+        self._projected_transaction_token = token
+        self._projected_transaction_width = width
+
+    def matches_projected_transaction(self, token: object, width: int) -> bool:
+        return (
+            token is not None
+            and self._projected_transaction_token is token
+            and self._projected_transaction_width == width
+        )
+
+    def snapshot_projected(self):
+        return (
+            self.projected_keys,
+            self.projected_values,
+            self.projected_capacity,
+            self.projected_valid_offset,
+            self.projected_owner_id,
+        )
+
+    def restore_projected(self, state):
+        (
+            self.projected_keys,
+            self.projected_values,
+            self.projected_capacity,
+            self.projected_valid_offset,
+            self.projected_owner_id,
+        ) = state
+
+    @property
+    def state(self):
+        return KVCache.state.fget(self)
+
+    @state.setter
+    def state(self, value):
+        KVCache.state.fset(self, value)
+        self.clear_projected()
+
+    @property
+    def nbytes(self):
+        total = KVCache.nbytes.fget(self)
+        for array in (self.projected_keys, self.projected_values):
+            if isinstance(array, mx.array):
+                total += array.nbytes
+        return total
+
+
+def _released_affine6_multilinear(module: Any) -> bool:
+    return (
+        isinstance(module, QuantizedMultiLinear)
+        and module.group_size == 64
+        and module.bits == 6
+        and module.mode == "affine"
+        and isinstance(module.weight, mx.array)
+        and isinstance(module.scales, mx.array)
+        and isinstance(module.biases, mx.array)
+    )
+
+
+def _can_use_projected_kv_cache(
+    attention: Any,
+    cache: Optional[KVCache],
+    kv_latent: mx.array,
+    *,
+    batch_size: int,
+    query_length: int,
+    previous_offset: int,
+) -> bool:
+    """Match only the released TP2 K3 width-three expanded verifier."""
+
+    if (
+        not _projected_kv_cache_requested()
+        or attention.training
+        or not isinstance(cache, KimiK3ProjectedKVCache)
+        or cache._projected_transaction_token is None
+        or cache._projected_transaction_width != query_length
+        or batch_size != 1
+        or query_length != 3
+        or previous_offset < _PROJECTED_KV_CACHE_MIN_PREFIX
+        or cache.offset != previous_offset + query_length
+        or cache.offset > _projected_kv_cache_max_tokens()
+        or attention.num_heads != 48
+        or attention.qk_nope_head_dim != 128
+        or attention.kv_lora_rank != 512
+        or attention.v_head_dim != 128
+        or kv_latent.dtype != mx.bfloat16
+        or kv_latent.shape != (1, 1, cache.offset, 512)
+        or not _released_affine6_multilinear(attention.embed_q)
+        or not _released_affine6_multilinear(attention.unembed_out)
+    ):
+        return False
+    return mx.metal.is_available() and mx.default_device() == mx.gpu
+
+
+def _projected_cache_capacity(tokens: int) -> int:
+    step = KVCache.step
+    return ((tokens + step - 1) // step) * step
+
+
+def _allocate_projected_cache(
+    cache: KimiK3ProjectedKVCache,
+    capacity: int,
+    *,
+    num_heads: int,
+    prefix_tokens: int,
+):
+    shape = (1, num_heads, capacity, 128)
+    keys = mx.zeros(shape, dtype=mx.bfloat16)
+    values = mx.zeros(shape, dtype=mx.bfloat16)
+    if prefix_tokens and cache.projected_keys is not None:
+        keys[..., :prefix_tokens, :] = cache.projected_keys[..., :prefix_tokens, :]
+        values[..., :prefix_tokens, :] = cache.projected_values[..., :prefix_tokens, :]
+    cache.projected_keys = keys
+    cache.projected_values = values
+    cache.projected_capacity = capacity
+
+
+def _maybe_projected_kv(
+    attention: Any,
+    cache: Optional[KVCache],
+    kv_latent: mx.array,
+    *,
+    batch_size: int,
+    query_length: int,
+    previous_offset: int,
+) -> Optional[Tuple[mx.array, mx.array]]:
+    """Return an exact persistent expanded K/V view, or ``None``.
+
+    Tiny M=1..3 affine projections select a QMV reduction that differs from
+    the full-context QMM.  New rows are therefore zero-padded to M=32 before
+    projection, reproducing the incumbent generic QMM BF16 bits exactly.
+    """
+
+    if not _can_use_projected_kv_cache(
+        attention,
+        cache,
+        kv_latent,
+        batch_size=batch_size,
+        query_length=query_length,
+        previous_offset=previous_offset,
+    ):
+        if isinstance(cache, KimiK3ProjectedKVCache):
+            cache.clear_projected_arrays()
+        return None
+    assert isinstance(cache, KimiK3ProjectedKVCache)
+
+    current_offset = cache.offset
+    owner_matches = cache.projected_owner_id == id(attention)
+    prefix_is_valid = (
+        owner_matches
+        and cache.projected_keys is not None
+        and cache.projected_values is not None
+        and cache.projected_valid_offset >= previous_offset
+    )
+
+    if not prefix_is_valid:
+        cache.clear_projected_arrays()
+        capacity = _projected_cache_capacity(current_offset)
+        _allocate_projected_cache(
+            cache,
+            capacity,
+            num_heads=attention.num_heads,
+            prefix_tokens=0,
+        )
+        projected_keys = attention.embed_q(kv_latent, transpose=False)
+        projected_values = attention.unembed_out(kv_latent)
+        cache.projected_keys[..., :current_offset, :] = projected_keys
+        cache.projected_values[..., :current_offset, :] = projected_values
+    else:
+        if current_offset > cache.projected_capacity:
+            _allocate_projected_cache(
+                cache,
+                _projected_cache_capacity(current_offset),
+                num_heads=attention.num_heads,
+                prefix_tokens=previous_offset,
+            )
+        suffix = kv_latent[..., previous_offset:current_offset, :]
+        padded_suffix = mx.pad(
+            suffix,
+            (
+                (0, 0),
+                (0, 0),
+                (0, _PROJECTED_KV_CACHE_APPEND_ROWS - query_length),
+                (0, 0),
+            ),
+        )
+        projected_keys = attention.embed_q(padded_suffix, transpose=False)[
+            ..., :query_length, :
+        ]
+        projected_values = attention.unembed_out(padded_suffix)[..., :query_length, :]
+        cache.projected_keys[..., previous_offset:current_offset, :] = projected_keys
+        cache.projected_values[..., previous_offset:current_offset, :] = (
+            projected_values
+        )
+
+    cache.projected_owner_id = id(attention)
+    cache.projected_valid_offset = current_offset
+    return (
+        cache.projected_keys[..., :current_offset, :],
+        cache.projected_values[..., :current_offset, :],
+    )
 
 
 def _factorized_sdpa_prefill_primitive() -> Optional[Callable]:
@@ -312,7 +605,7 @@ def _parse_async_decode_boundaries(
         item = item.strip()
         if not item:
             raise ValueError(
-                f"Invalid empty item in " f"{ASYNC_DECODE_BOUNDARIES_ENV}={selector!r}"
+                f"Invalid empty item in {ASYNC_DECODE_BOUNDARIES_ENV}={selector!r}"
             )
 
         bounds = [part.strip() for part in item.split("-")]
@@ -322,7 +615,7 @@ def _parse_async_decode_boundaries(
             start, end = (int(bound) for bound in bounds)
             if start > end:
                 raise ValueError(
-                    f"Reversed range {item!r} in " f"{ASYNC_DECODE_BOUNDARIES_ENV}"
+                    f"Reversed range {item!r} in {ASYNC_DECODE_BOUNDARIES_ENV}"
                 )
         else:
             raise ValueError(f"Invalid item {item!r} in {ASYNC_DECODE_BOUNDARIES_ENV}")
@@ -1217,6 +1510,13 @@ class KimiK3MLAAttention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
+        previous_cache_offset = int(getattr(cache, "offset", 0))
+        if isinstance(cache, KimiK3ProjectedKVCache) and L != 3:
+            # An ordinary decode or another query shape may append rows using a
+            # different projection schedule.  Rebuild on the next Q3 verifier
+            # instead of retaining an ambiguous projected prefix.
+            cache.clear_projected_arrays()
+
         if self.q_lora_rank is not None:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
         else:
@@ -1245,9 +1545,19 @@ class KimiK3MLAAttention(nn.Module):
         if cache is not None:
             kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
+        projected_kv = _maybe_projected_kv(
+            self,
+            cache,
+            kv_latent,
+            batch_size=B,
+            query_length=L,
+            previous_offset=previous_cache_offset,
+        )
         if L == 1:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
+        elif projected_kv is not None:
+            k, v = projected_kv
         else:
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
@@ -1792,7 +2102,7 @@ class KimiK3TextModel(nn.Module):
         async_decode_state = os.environ.get(ASYNC_DECODE_STATE_ENV)
         if not self._async_decode_boundaries and async_decode_state is not None:
             raise ValueError(
-                f"{ASYNC_DECODE_STATE_ENV} requires " f"{ASYNC_DECODE_BOUNDARIES_ENV}"
+                f"{ASYNC_DECODE_STATE_ENV} requires {ASYNC_DECODE_BOUNDARIES_ENV}"
             )
         self._async_decode_state = async_decode_state or "residual"
         if self._async_decode_state not in {"hidden", "residual"}:
@@ -1945,7 +2255,7 @@ class KimiK3TextModel(nn.Module):
                 if (
                     type(attn) is not KimiK3MLAAttention
                     or layer.is_block_start
-                    or type(layer_cache) not in (KVCache, BatchKVCache)
+                    or not isinstance(layer_cache, (KVCache, BatchKVCache))
                     or layer_cache.keys is None
                     or layer_cache.values is None
                     or layer_cache.keys.ndim != 4
@@ -1961,7 +2271,7 @@ class KimiK3TextModel(nn.Module):
                     or layer_cache.values.dtype != h.dtype
                 ):
                     return False
-                if type(layer_cache) is KVCache:
+                if isinstance(layer_cache, KVCache):
                     if (
                         layer_cache.offset <= 0
                         or layer_cache.offset > layer_cache.keys.shape[2]
@@ -2381,6 +2691,10 @@ class KimiK3SpeculativeCacheTransaction:
     width: int
     array_states: List[Tuple[int, ArraysCache, List[Any]]]
     kv_states: List[Tuple[int, KVCache, Any, Any, int]]
+    projected_kv_states: List[Tuple[int, KimiK3ProjectedKVCache, Any]] = field(
+        default_factory=list
+    )
+    projected_transaction_token: Optional[object] = field(default=None, repr=False)
     active: bool = True
 
     def release(self):
@@ -2388,6 +2702,8 @@ class KimiK3SpeculativeCacheTransaction:
 
         self.array_states = []
         self.kv_states = []
+        self.projected_kv_states = []
+        self.projected_transaction_token = None
 
 
 @dataclass(frozen=True)
@@ -2543,11 +2859,14 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         caches: List[Any] = []
+        projected_kv_cache = _projected_kv_cache_requested()
         for layer in self.layers:
             if layer.is_linear:
                 caches.append(ArraysCache(size=2))
             else:
-                caches.append(KVCache())
+                caches.append(
+                    KimiK3ProjectedKVCache() if projected_kv_cache else KVCache()
+                )
         return caches
 
     def begin_speculative_cache(
@@ -2567,6 +2886,7 @@ class LanguageModel(nn.Module):
 
         array_states: List[Tuple[int, ArraysCache, List[Any]]] = []
         kv_states: List[Tuple[int, KVCache, Any, Any, int]] = []
+        projected_kv_states: List[Tuple[int, KimiK3ProjectedKVCache, Any]] = []
         kv_offsets = set()
         for index, (layer, layer_cache) in enumerate(zip(layers, cache, strict=True)):
             if layer.is_linear:
@@ -2591,10 +2911,20 @@ class LanguageModel(nn.Module):
                         int(layer_cache.offset),
                     )
                 )
+                if isinstance(layer_cache, KimiK3ProjectedKVCache):
+                    projected_kv_states.append(
+                        (index, layer_cache, layer_cache.snapshot_projected())
+                    )
         if not array_states:
             raise ValueError("Kimi K3 speculative cache contains no KDA state")
         if len(kv_offsets) > 1:
             raise ValueError("Kimi K3 speculative MLA cache offsets disagree")
+
+        # Reject nested projected-cache transactions before activating any KDA
+        # cache.  The opaque marker makes a width-three model call insufficient
+        # on its own to select the expanded-cache path.
+        for _, layer_cache, _ in projected_kv_states:
+            layer_cache.validate_begin_projected_transaction()
 
         try:
             for _, layer_cache, _ in array_states:
@@ -2605,13 +2935,39 @@ class LanguageModel(nn.Module):
                 layer_cache.restore_speculative(states)
             raise
 
-        return KimiK3SpeculativeCacheTransaction(
+        projected_transaction_token = (
+            object() if projected_kv_states and width == 3 else None
+        )
+        transaction = KimiK3SpeculativeCacheTransaction(
             owner_id=id(self),
             cache=cache,
             width=width,
             array_states=array_states,
             kv_states=kv_states,
+            projected_kv_states=projected_kv_states,
+            projected_transaction_token=projected_transaction_token,
         )
+        try:
+            if projected_transaction_token is not None:
+                for _, layer_cache, _ in projected_kv_states:
+                    layer_cache.begin_projected_transaction(
+                        projected_transaction_token,
+                        width,
+                    )
+        except BaseException:
+            for _, layer_cache, _ in projected_kv_states:
+                if layer_cache.matches_projected_transaction(
+                    projected_transaction_token,
+                    width,
+                ):
+                    layer_cache.clear_projected_transaction()
+            for index, layer_cache, states in array_states:
+                cache[index] = layer_cache
+                layer_cache.restore_speculative(states)
+            transaction.active = False
+            transaction.release()
+            raise
+        return transaction
 
     def _validate_speculative_transaction(
         self,
@@ -2634,6 +2990,21 @@ class LanguageModel(nn.Module):
             if transaction.cache[index] is not layer_cache:
                 raise ValueError(
                     "Kimi K3 speculative MLA cache was replaced during the transaction"
+                )
+        for index, layer_cache, _ in transaction.projected_kv_states:
+            if transaction.cache[index] is not layer_cache:
+                raise ValueError(
+                    "Kimi K3 projected MLA cache was replaced during the transaction"
+                )
+            if (
+                transaction.projected_transaction_token is not None
+                and not layer_cache.matches_projected_transaction(
+                    transaction.projected_transaction_token,
+                    transaction.width,
+                )
+            ):
+                raise ValueError(
+                    "Kimi K3 projected MLA transaction marker changed"
                 )
 
     def resolve_speculative_cache(
@@ -2675,6 +3046,12 @@ class LanguageModel(nn.Module):
                     layer_cache.state
                     for _, layer_cache, _, _, _ in transaction.kv_states
                 ],
+                [
+                    (layer_cache.projected_keys, layer_cache.projected_values)
+                    for _, layer_cache, _ in transaction.projected_kv_states
+                    if layer_cache.projected_keys is not None
+                    and layer_cache.projected_values is not None
+                ],
             )
 
             for layer_cache, states in prepared:
@@ -2683,6 +3060,12 @@ class LanguageModel(nn.Module):
                 layer_cache.commit_speculative(states)
             for _, layer_cache, _, _, initial_offset in transaction.kv_states:
                 layer_cache.offset = initial_offset + consumed
+            for _, layer_cache, _ in transaction.projected_kv_states:
+                layer_cache.projected_valid_offset = min(
+                    layer_cache.projected_valid_offset,
+                    layer_cache.offset,
+                )
+                layer_cache.clear_projected_transaction()
         except BaseException:
             if (
                 isinstance(transaction, KimiK3SpeculativeCacheTransaction)
@@ -2720,6 +3103,10 @@ class LanguageModel(nn.Module):
             layer_cache.keys = keys
             layer_cache.values = values
             layer_cache.offset = initial_offset
+        for index, layer_cache, projected_state in transaction.projected_kv_states:
+            transaction.cache[index] = layer_cache
+            layer_cache.restore_projected(projected_state)
+            layer_cache.clear_projected_transaction()
         transaction.active = False
         transaction.release()
 

@@ -1245,7 +1245,7 @@ def _make_cache(model, left_padding, max_kv_size):
     """
 
     def to_batch_cache(c):
-        if type(c) is KVCache:
+        if isinstance(c, KVCache):
             return BatchKVCache(left_padding)
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)

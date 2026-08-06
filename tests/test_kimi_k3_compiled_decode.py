@@ -113,7 +113,7 @@ def _assert_cache_equal(test, left, right):
             _assert_tree_equal(test, lhs.cache, rhs.cache)
             _assert_optional_array_equal(test, lhs.lengths, rhs.lengths)
             _assert_optional_array_equal(test, lhs.left_padding, rhs.left_padding)
-        elif type(lhs) is kimi_k3.KVCache:
+        elif isinstance(lhs, kimi_k3.KVCache):
             test.assertEqual(lhs.offset, rhs.offset)
             _assert_optional_array_equal(test, lhs.keys, rhs.keys)
             _assert_optional_array_equal(test, lhs.values, rhs.values)
@@ -293,6 +293,22 @@ class TestKimiK3CompiledDecode(unittest.TestCase):
         self.assertTrue(
             text_model._compiled_decode_eligible(h, cache, None, layers)
         )
+        projected_cache = []
+        for layer, layer_cache in zip(layers, cache, strict=True):
+            if layer.is_linear:
+                projected_cache.append(layer_cache)
+            else:
+                projected = kimi_k3.KimiK3ProjectedKVCache()
+                projected.state = layer_cache.state
+                projected_cache.append(projected)
+        self.assertTrue(
+            text_model._compiled_decode_eligible(
+                h,
+                projected_cache,
+                None,
+                layers,
+            )
+        )
         self.assertFalse(
             text_model._compiled_decode_eligible(
                 mx.broadcast_to(h, (1, 2, h.shape[-1])),
@@ -382,6 +398,64 @@ class TestKimiK3CompiledDecode(unittest.TestCase):
         self.assertEqual(schedule.mla_indices, (3, 7))
         self.assertEqual(len(schedule.transitions), 1)
         self.assertEqual(schedule.transitions[0].kda_indices, (4, 5, 6))
+
+    def test_projected_cache_preserves_compiled_q1_and_is_invalidated(self):
+        model = _make_model()
+        base_cache = _warm_cache(model)
+        projected_cache = []
+        for layer, layer_cache in zip(
+            model.model.layers,
+            base_cache,
+            strict=True,
+        ):
+            if layer.is_linear:
+                projected_cache.append(layer_cache)
+                continue
+            attention = layer.self_attn
+            projected = kimi_k3.KimiK3ProjectedKVCache()
+            projected.state = layer_cache.state
+            projected.projected_keys = mx.zeros(
+                (
+                    1,
+                    attention.num_heads,
+                    projected.offset,
+                    attention.qk_nope_head_dim,
+                ),
+                dtype=projected.keys.dtype,
+            )
+            projected.projected_values = mx.zeros(
+                (
+                    1,
+                    attention.num_heads,
+                    projected.offset,
+                    attention.v_head_dim,
+                ),
+                dtype=projected.values.dtype,
+            )
+            projected.projected_capacity = projected.offset
+            projected.projected_valid_offset = projected.offset
+            projected.projected_owner_id = id(attention)
+            projected_cache.append(projected)
+
+        eager_cache = copy.deepcopy(projected_cache)
+        compiled_cache = copy.deepcopy(projected_cache)
+        inputs = mx.array([[17]], dtype=mx.int32)
+
+        model.model._compiled_decode_enabled = False
+        eager = model(inputs, cache=eager_cache)
+        mx.eval(eager, [cache.state for cache in eager_cache])
+
+        model.model._compiled_decode_enabled = True
+        compiled = model(inputs, cache=compiled_cache)
+        mx.eval(compiled, [cache.state for cache in compiled_cache])
+
+        self.assertTrue(mx.array_equal(eager, compiled).item())
+        _assert_cache_equal(self, eager_cache, compiled_cache)
+        self.assertIsNotNone(model.model._compiled_decode_schedule)
+        for cache in (*eager_cache, *compiled_cache):
+            if isinstance(cache, kimi_k3.KimiK3ProjectedKVCache):
+                self.assertIsNone(cache.projected_keys)
+                self.assertIsNone(cache.projected_values)
 
     def test_mixed_compiled_and_eager_segment_schedules_match_eager(self):
         selectors = ("0", "1", "2", "0,2", "0-1", "1-2")
