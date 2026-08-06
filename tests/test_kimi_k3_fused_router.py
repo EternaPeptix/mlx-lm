@@ -18,8 +18,8 @@ from mlx_lm.models.kimi_k3_fused_router import (
 )
 
 
-def _reference(gates, bias):
-    return _group_expert_select(gates, bias, 16, 1, 1, 1.0, True)
+def _reference(gates, bias, top_k=16):
+    return _group_expert_select(gates, bias, top_k, 1, 1, 1.0, True)
 
 
 def _candidate(gates, bias, **overrides):
@@ -71,9 +71,9 @@ class FusedRouterTest(unittest.TestCase):
         os.environ.pop(FUSED_ROUTER_ENV, None)
         fused_k3_router_enabled.cache_clear()
 
-    def assertExact(self, gates, bias):
-        reference_indices, reference_weights = _reference(gates, bias)
-        candidate = _candidate(gates, bias)
+    def assertExact(self, gates, bias, top_k=16):
+        reference_indices, reference_weights = _reference(gates, bias, top_k)
+        candidate = _candidate(gates, bias, top_k=top_k)
         self.assertIsNotNone(candidate)
         candidate_indices, candidate_weights = candidate
         mx.eval(
@@ -109,6 +109,14 @@ class FusedRouterTest(unittest.TestCase):
                 gates = mx.random.normal((1, 3, 896), dtype=mx.bfloat16)
                 bias = 0.25 * mx.random.normal((896,), dtype=mx.float32)
                 self.assertExact(gates, bias)
+
+    def test_top8_decode_prefill_and_q3_are_bit_exact(self):
+        bias = 0.25 * mx.random.normal((896,), dtype=mx.float32)
+        for width in (1, 3, 512):
+            with self.subTest(width=width):
+                mx.random.seed(20_000 + width)
+                gates = mx.random.normal((1, width, 896), dtype=mx.bfloat16)
+                self.assertExact(gates, bias, top_k=8)
 
     def test_sparse_moe_integration_is_bit_exact(self):
         mx.random.seed(211)
@@ -214,7 +222,7 @@ class FusedRouterTest(unittest.TestCase):
             (gates.astype(mx.float32), bias, {}),
             (gates, bias.astype(mx.bfloat16), {}),
             (gates, None, {}),
-            (gates, bias, {"top_k": 8}),
+            (gates, bias, {"top_k": 7}),
             (gates, bias, {"n_group": 8}),
             (gates, bias, {"topk_group": 2}),
             (gates, bias, {"routed_scaling_factor": 2.5}),

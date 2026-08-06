@@ -77,9 +77,7 @@ class _Projection:
 
         projection = cls.__new__(cls)
         expert = mx.arange(experts, dtype=mx.uint32).reshape(experts, 1, 1)
-        output = mx.arange(output_width, dtype=mx.uint32).reshape(
-            1, output_width, 1
-        )
+        output = mx.arange(output_width, dtype=mx.uint32).reshape(1, output_width, 1)
         packed_k = mx.arange(input_width // 16, dtype=mx.uint32).reshape(
             1, 1, input_width // 16
         )
@@ -290,6 +288,34 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(candidate.shape, (1, 1, 16, 3584))
         self.assertTrue(bool(mx.all(reference == candidate).item()))
 
+    def test_top8_q3_uses_route_dynamic_gate_up_and_down_bit_exactly(self):
+        os.environ[FUSED_EXPERT_WIDTH3_ENV] = "1"
+        fused_k3_expert_width3_enabled.cache_clear()
+        switch = _Switch.bounded_tp2_geometry_nonuniform()
+        width = 3
+        x = mx.random.normal((1, width, 3584), dtype=mx.bfloat16)
+        base = mx.arange(8, dtype=mx.uint32)
+        indices = mx.stack([mx.roll(base, shift) for shift in range(width)])[None]
+        reference = switch.stock(x, indices)
+        candidate = maybe_fused_k3_switch_glu(switch, x, indices)
+        self.assertIsNotNone(candidate)
+        mx.eval(reference, candidate)
+        self.assertEqual(candidate.shape, (1, width, 8, 3584))
+        self.assertTrue(bool(mx.all(reference == candidate).item()))
+
+        # The currently disabled fused down/reduce kernel is deliberately
+        # top-16-only.  K8 retains the route-dynamic fused expert path above
+        # and falls back only for the final weighted reduction.
+        router_weights = mx.full((1, width, 8), 0.125, dtype=mx.bfloat16)
+        self.assertIsNone(
+            maybe_fused_k3_switch_glu_reduce(
+                switch,
+                x,
+                indices,
+                router_weights,
+            )
+        )
+
     def test_bounded_tp2_down_route_reduce_is_bit_exact(self):
         switch = _Switch.bounded_tp2_geometry()
         x = mx.random.normal((1, 1, 3584), dtype=mx.bfloat16)
@@ -322,9 +348,7 @@ class IntegrationTest(unittest.TestCase):
             shape=(1, width, 16),
             dtype=mx.bfloat16,
         )
-        reference = (
-            switch.stock(x, indices) * router_weights[..., None]
-        ).sum(axis=-2)
+        reference = (switch.stock(x, indices) * router_weights[..., None]).sum(axis=-2)
         candidate = maybe_fused_k3_switch_glu_reduce(
             switch,
             x,
@@ -344,16 +368,14 @@ class IntegrationTest(unittest.TestCase):
         width = 2
         x = mx.random.normal((1, width, 3584), dtype=mx.bfloat16)
         base = mx.arange(16, dtype=mx.uint32)
-        indices = mx.stack(
-            [(base * 5 + shift * 3) % 16 for shift in range(width)]
-        )[None]
+        indices = mx.stack([(base * 5 + shift * 3) % 16 for shift in range(width)])[
+            None
+        ]
         router_weights = mx.random.uniform(
             shape=(1, width, 16),
             dtype=mx.bfloat16,
         )
-        reference = (
-            switch.stock(x, indices) * router_weights[..., None]
-        ).sum(axis=-2)
+        reference = (switch.stock(x, indices) * router_weights[..., None]).sum(axis=-2)
         candidate = maybe_fused_k3_switch_glu_reduce(
             switch,
             x,
@@ -374,9 +396,9 @@ class IntegrationTest(unittest.TestCase):
         width = 3
         x = mx.random.normal((1, width, 3584), dtype=mx.bfloat16)
         base = mx.arange(16, dtype=mx.uint32)
-        indices = mx.stack(
-            [(base * 5 + shift * 3) % 16 for shift in range(width)]
-        )[None]
+        indices = mx.stack([(base * 5 + shift * 3) % 16 for shift in range(width)])[
+            None
+        ]
         reference = switch.stock(x, indices)
 
         self.assertIsNone(maybe_fused_k3_switch_glu(switch, x, indices))

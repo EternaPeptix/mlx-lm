@@ -26,32 +26,34 @@ class TestKimiK3PrefillRouteCombine(unittest.TestCase):
             prefill_route_combine_enabled()
 
     @unittest.skipUnless(mx.metal.is_available(), "Metal is required")
-    def test_fused_combine_matches_bfloat16_top16_reduction(self):
+    def test_fused_combine_matches_bfloat16_top8_and_top16_reduction(self):
         tokens = 2
-        routes = tokens * 16
         width = 3584
-        mx.random.seed(20260805)
-        unsorted = mx.random.uniform(
-            low=-1.0,
-            high=1.0,
-            shape=(tokens, 16, width),
-        ).astype(mx.bfloat16)
-        weights = mx.random.uniform(
-            low=0.0,
-            high=1.0,
-            shape=(tokens, 16),
-        ).astype(mx.bfloat16)
-        weights = (
-            weights / weights.astype(mx.float32).sum(axis=-1, keepdims=True)
-        ).astype(mx.bfloat16)
-        order = (mx.arange(routes, dtype=mx.uint32) * 17 + 13) % routes
-        inverse = mx.argsort(order)
-        sorted_routes = unsorted.reshape(routes, width)[order]
+        for top_k in (8, 16):
+            with self.subTest(top_k=top_k):
+                routes = tokens * top_k
+                mx.random.seed(20260805 + top_k)
+                unsorted = mx.random.uniform(
+                    low=-1.0,
+                    high=1.0,
+                    shape=(tokens, top_k, width),
+                ).astype(mx.bfloat16)
+                weights = mx.random.uniform(
+                    low=0.0,
+                    high=1.0,
+                    shape=(tokens, top_k),
+                ).astype(mx.bfloat16)
+                weights = (
+                    weights / weights.astype(mx.float32).sum(axis=-1, keepdims=True)
+                ).astype(mx.bfloat16)
+                order = (mx.arange(routes, dtype=mx.uint32) * 17 + 13) % routes
+                inverse = mx.argsort(order)
+                sorted_routes = unsorted.reshape(routes, width)[order]
 
-        expected = (unsorted * weights[..., None]).sum(axis=-2)[None]
-        actual = fused_sorted_route_combine(sorted_routes, inverse, weights)
-        mx.eval(expected, actual)
-        self.assertTrue(mx.array_equal(expected, actual).item())
+                expected = (unsorted * weights[..., None]).sum(axis=-2)[None]
+                actual = fused_sorted_route_combine(sorted_routes, inverse, weights)
+                mx.eval(expected, actual)
+                self.assertTrue(mx.array_equal(expected, actual).item())
 
     @unittest.skipUnless(mx.metal.is_available(), "Metal is required")
     def test_fused_combine_rejects_non_bfloat16_weights(self):

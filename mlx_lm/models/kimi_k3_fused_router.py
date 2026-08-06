@@ -2,10 +2,11 @@
 
 The stock router materializes a corrected score array and routes it through a
 general-purpose ``argpartition`` before gathering and normalizing the original
-sigmoid scores.  Kimi K3 always selects 16 of 896 experts from one group, so
-one eight-SIMD Metal dispatch can perform the FP32 sigmoid, corrected
-selection, and final BF16 weight emission directly.  The sigmoid expression is
-copied from MLX's authoritative Metal unary implementation.
+sigmoid scores.  Released Kimi K3 selects 16 of 896 experts from one group; the
+strict K-cut experiment selects 8.  One eight-SIMD Metal dispatch can perform
+the FP32 sigmoid, corrected selection, and final BF16 weight emission directly
+for either explicitly supported width.  The sigmoid expression is copied from
+MLX's authoritative Metal unary implementation.
 
 Unsupported shapes, dtypes, configurations, devices, and training calls retain
 the stock path.
@@ -19,11 +20,10 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 
-
 FUSED_ROUTER_ENV = "MLX_LM_KIMI_K3_FUSED_ROUTER"
 
 _EXPERTS = 896
-_TOP_K = 16
+_SUPPORTED_TOP_K = frozenset((8, 16))
 _THREADS = 256
 _SIMDGROUPS = _THREADS // 32
 _EXPERTS_PER_THREAD = (_EXPERTS + _THREADS - 1) // _THREADS
@@ -198,8 +198,8 @@ for (uint rank = 0u; rank < TOP_K; ++rank) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// MLX's small-row reduction handles this 16-element row in one thread and
-// folds the values from slot 0 through slot 15.  Preserve that exact
+// MLX's small-row reduction handles each supported row in one thread and
+// folds the values from slot 0 through slot TOP_K-1.  Preserve that exact
 // association: a SIMD reduction can differ by one FP32 ULP, which is enough
 // to cross a BF16 rounding midpoint after normalization.
 if (thread_id == 0u) {
@@ -221,11 +221,13 @@ if (thread_id < TOP_K) {
 
 
 @lru_cache(maxsize=None)
-def _kernel():
+def _kernel(top_k: int):
+    if top_k not in _SUPPORTED_TOP_K:
+        return None
     if not _metal_available():
         return None
     return mx.fast.metal_kernel(
-        name="k3_fused_router_top16_v5",
+        name=f"k3_fused_router_top{top_k}_v5",
         input_names=["gates", "bias"],
         output_names=["indices", "weights"],
         header=_HEADER,
@@ -254,20 +256,23 @@ def supports_fused_k3_router(
     """Check the deliberately narrow released-K3 decode contract."""
 
     return (
-        _kernel() is not None
+        _kernel(top_k) is not None
         and mx.default_device() == mx.gpu
         and gates.dtype == mx.bfloat16
         and gates.ndim == 3
         and gates.shape[-1] == _EXPERTS
         and (
             gates.shape[-2] == 1
-            or (gates.shape[0] == 1 and gates.shape[-2] == 3)
+            or (
+                gates.shape[0] == 1
+                and (gates.shape[-2] == 3 or (top_k == 8 and gates.shape[-2] <= 4096))
+            )
         )
         and gates.size > 0
         and bias is not None
         and bias.dtype == mx.float32
         and bias.shape == (_EXPERTS,)
-        and top_k == _TOP_K
+        and top_k in _SUPPORTED_TOP_K
         and n_group == 1
         and topk_group == 1
         and routed_scaling_factor == 1.0
@@ -279,11 +284,12 @@ def _fused_k3_router(
     gates: mx.array,
     bias: mx.array,
     output_dtype: mx.Dtype,
+    top_k: int,
 ) -> Tuple[mx.array, mx.array]:
-    kernel = _kernel()
+    kernel = _kernel(top_k)
     if kernel is None:
         raise RuntimeError("The fused Kimi K3 router requires Metal")
-    output_shape = (*gates.shape[:-1], _TOP_K)
+    output_shape = (*gates.shape[:-1], top_k)
     rows = gates.size // _EXPERTS
     return kernel(
         inputs=[gates, bias],
@@ -291,7 +297,7 @@ def _fused_k3_router(
             ("GateT", gates.dtype),
             ("WeightT", output_dtype),
             ("EXPERTS", _EXPERTS),
-            ("TOP_K", _TOP_K),
+            ("TOP_K", top_k),
             ("THREADS", _THREADS),
             ("SIMDGROUPS", _SIMDGROUPS),
             ("EXPERTS_PER_THREAD", _EXPERTS_PER_THREAD),
@@ -304,11 +310,19 @@ def _fused_k3_router(
 
 
 @partial(mx.compile, shapeless=False)
-def _compiled_fused_k3_router(
+def _compiled_fused_k3_router_top16(
     gates: mx.array,
     bias: mx.array,
 ) -> Tuple[mx.array, mx.array]:
-    return _fused_k3_router(gates, bias, gates.dtype)
+    return _fused_k3_router(gates, bias, gates.dtype, 16)
+
+
+@partial(mx.compile, shapeless=False)
+def _compiled_fused_k3_router_top8(
+    gates: mx.array,
+    bias: mx.array,
+) -> Tuple[mx.array, mx.array]:
+    return _fused_k3_router(gates, bias, gates.dtype, 8)
 
 
 def maybe_fused_k3_router(
@@ -338,4 +352,9 @@ def maybe_fused_k3_router(
         )
     ):
         return None
-    return _compiled_fused_k3_router(gates, bias)
+    compiled = (
+        _compiled_fused_k3_router_top16
+        if top_k == 16
+        else _compiled_fused_k3_router_top8
+    )
+    return compiled(gates, bias)

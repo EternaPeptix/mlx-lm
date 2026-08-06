@@ -65,7 +65,29 @@ REPLAYSSM_SPECULATIVE_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
 EXACT_WIDE_SHORT_CONV_ENV = "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV"
 MOK_ROUTED_SHARED_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_ROUTED_SHARED_OVERLAP"
 MOK_PREFILL_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_PREFILL_OVERLAP"
+EXPERT_TOP_K_ENV = "MLX_LM_KIMI_K3_EXPERT_TOP_K"
 _EXACT_WIDE_SHORT_CONV_MAX_WIDTH = 8
+
+
+def _selected_expert_top_k(native_top_k: int) -> int:
+    """Select the strict, default-off Kimi K3 expert K-cut.
+
+    An absent selector preserves the checkpoint configuration verbatim so
+    small test models and future non-released configurations keep their stock
+    behavior.  An explicit selector is deliberately restricted to released
+    Kimi K3's native top-16 routing and the lossy top-8 experiment.
+    """
+
+    value = os.environ.get(EXPERT_TOP_K_ENV)
+    if value is None:
+        return native_top_k
+    if value not in {"16", "8"}:
+        raise ValueError(f"{EXPERT_TOP_K_ENV} must be exactly '16' or '8'")
+    if native_top_k != 16:
+        raise ValueError(
+            f"{EXPERT_TOP_K_ENV} requires a native num_experts_per_token of 16"
+        )
+    return int(value)
 
 
 def replayssm_speculative_enabled() -> bool:
@@ -225,9 +247,7 @@ class KimiK3ProjectedKVCache(KVCache):
             self._projected_transaction_token is not None
             or self._projected_transaction_width != 0
         ):
-            raise ValueError(
-                "a projected K3 speculative transaction is already active"
-            )
+            raise ValueError("a projected K3 speculative transaction is already active")
 
     def begin_projected_transaction(self, token: object, width: int):
         self.validate_begin_projected_transaction()
@@ -1649,6 +1669,7 @@ class KimiK3SparseMoE(nn.Module):
         self.sharding_group = None
         self.mok_routed_shared_overlap = mok_routed_shared_overlap_enabled()
         self.mok_prefill_overlap = mok_prefill_overlap_enabled()
+        self.expert_top_k = _selected_expert_top_k(args.num_experts_per_token)
 
     def _call_with_optional_residual(
         self,
@@ -1673,7 +1694,7 @@ class KimiK3SparseMoE(nn.Module):
         routed = maybe_fused_k3_router(
             scores,
             self.e_score_correction_bias,
-            top_k=self.args.num_experts_per_token,
+            top_k=self.expert_top_k,
             n_group=self.args.num_expert_group,
             topk_group=self.args.topk_group,
             routed_scaling_factor=self.args.routed_scaling_factor,
@@ -1684,7 +1705,7 @@ class KimiK3SparseMoE(nn.Module):
             inds, weights = _group_expert_select(
                 scores,
                 self.e_score_correction_bias,
-                self.args.num_experts_per_token,
+                self.expert_top_k,
                 self.args.num_expert_group,
                 self.args.topk_group,
                 self.args.routed_scaling_factor,
@@ -3003,9 +3024,7 @@ class LanguageModel(nn.Module):
                     transaction.width,
                 )
             ):
-                raise ValueError(
-                    "Kimi K3 projected MLA transaction marker changed"
-                )
+                raise ValueError("Kimi K3 projected MLA transaction marker changed")
 
     def resolve_speculative_cache(
         self,

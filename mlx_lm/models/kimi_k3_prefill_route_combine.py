@@ -8,17 +8,15 @@ from typing import Any
 
 import mlx.core as mx
 
-
 PREFILL_ROUTE_COMBINE_ENV = "MLX_LM_KIMI_K3_PREFILL_ROUTE_COMBINE"
 _EXPERTS = 896
-_TOP_K = 16
+_SUPPORTED_TOP_K = frozenset((8, 16))
 _INPUT_DIMS = 3584
 _INTERMEDIATE_DIMS = 1536
 _MIN_TOKENS = 512
 _MAX_TOKENS_EXCLUSIVE = 8192
 
 _COMBINE_SOURCE = r"""
-constexpr uint TOP_K = 16;
 constexpr uint COLS = 3584;
 constexpr uint WIDTH = 4;
 constexpr uint COL_TILES = COLS / WIDTH;
@@ -87,14 +85,17 @@ def fused_sorted_route_combine(
     inverse: mx.array,
     weights: mx.array,
 ) -> mx.array:
-    """Restore token order, apply BF16 route weights, and reduce top-16.
+    """Restore token order, apply BF16 route weights, and reduce routes.
 
-    The reduction deliberately matches MLX's fixed BF16 size-16 tree: eight
-    ``(slot, slot + 8)`` partials followed by an ordered fold of partials one
-    through seven into partial zero.
+    The reduction deliberately matches MLX's fixed BF16 size-8/16 tree: eight
+    partials followed by an ordered fold of partials one through seven into
+    partial zero.
     """
 
-    tokens = inverse.size // _TOP_K
+    if weights.ndim < 1 or weights.shape[-1] not in _SUPPORTED_TOP_K:
+        raise ValueError("invalid K3 BF16 sorted-route combine contract")
+    top_k = weights.shape[-1]
+    tokens = inverse.size // top_k
     if (
         sorted_routes.dtype != mx.bfloat16
         or weights.dtype != mx.bfloat16
@@ -104,7 +105,7 @@ def fused_sorted_route_combine(
         raise ValueError("invalid K3 BF16 sorted-route combine contract")
     return _combine_kernel()(
         inputs=[sorted_routes, inverse, weights],
-        template=[("T", sorted_routes.dtype)],
+        template=[("T", sorted_routes.dtype), ("TOP_K", top_k)],
         grid=(tokens * (_INPUT_DIMS // 4), 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(1, tokens, _INPUT_DIMS)],
@@ -148,7 +149,8 @@ def _supports_prefill_route_combine(
         or x.shape[0] != 1
         or x.shape[-1] != _INPUT_DIMS
         or not (_MIN_TOKENS <= x.shape[1] < _MAX_TOKENS_EXCLUSIVE)
-        or indices.shape != (*x.shape[:-1], _TOP_K)
+        or indices.shape[:-1] != x.shape[:-1]
+        or indices.shape[-1] not in _SUPPORTED_TOP_K
         or weights.shape != indices.shape
         or x.dtype != mx.bfloat16
         or weights.dtype != mx.bfloat16
@@ -195,7 +197,7 @@ def maybe_fused_k3_prefill_switch_glu_reduce(
     inverse = mx.argsort(order)
     sorted_indices = flat_indices[order]
     expanded = mx.expand_dims(x, (-2, -3))
-    sorted_x = expanded.flatten(0, -3)[order // _TOP_K]
+    sorted_x = expanded.flatten(0, -3)[order // indices.shape[-1]]
 
     up = switch_mlp.up_proj(sorted_x, sorted_indices, sorted_indices=True)
     gate = switch_mlp.gate_proj(sorted_x, sorted_indices, sorted_indices=True)
