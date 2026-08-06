@@ -160,6 +160,7 @@ def exact_wide_short_conv_enabled() -> bool:
 FACTORIZED_SDPA_PREFILL_ENV = "MLX_LM_KIMI_K3_FACTORIZED_SDPA_PREFILL"
 PROJECTED_KV_CACHE_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE"
 PROJECTED_KV_CACHE_MAX_TOKENS_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE_MAX_TOKENS"
+K3_TP2_SEQUENTIAL_ABSORBED_Q3_ENV = "MLX_LM_KIMI_K3_TP2_SEQUENTIAL_ABSORBED_Q3_VERIFY"
 _PROJECTED_KV_CACHE_APPEND_ROWS = 32
 _PROJECTED_KV_CACHE_MIN_PREFIX = 32
 _PROJECTED_KV_CACHE_MAX_SAFE_TOKENS = 131072
@@ -207,6 +208,17 @@ def _projected_kv_cache_max_tokens() -> int:
             f"{_PROJECTED_KV_CACHE_MAX_SAFE_TOKENS}]"
         )
     return value
+
+
+def _k3_tp2_sequential_absorbed_q3_requested() -> bool:
+    """Parse the strict, default-off sequential Q3 MLA verifier opt-in."""
+
+    value = os.environ.get(K3_TP2_SEQUENTIAL_ABSORBED_Q3_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(
+            f"{K3_TP2_SEQUENTIAL_ABSORBED_Q3_ENV} must be exactly '0' or '1'"
+        )
+    return value == "1"
 
 
 class KimiK3ProjectedKVCache(KVCache):
@@ -299,6 +311,65 @@ class KimiK3ProjectedKVCache(KVCache):
             if isinstance(array, mx.array):
                 total += array.nbytes
         return total
+
+
+def _can_use_k3_tp2_sequential_absorbed_q3(
+    attention: Any,
+    x: mx.array,
+    mask: Optional[mx.array],
+    cache: Optional[KVCache],
+    *,
+    requested: bool,
+    previous_offset: int,
+) -> bool:
+    """Accept only a cached released-TP2 width-three verification call.
+
+    A projected cache is an authoritative latent ``KVCache`` plus derived
+    expanded arrays.  It is safe here only inside its existing width-three
+    speculative transaction; the verifier deliberately leaves that opaque
+    transaction marker alone.
+    """
+
+    if (
+        not requested
+        or attention.training
+        or type(cache) not in (KVCache, KimiK3ProjectedKVCache)
+        or not isinstance(x, mx.array)
+        or x.ndim != 3
+        or x.shape[:2] != (1, 3)
+        or x.dtype != mx.bfloat16
+        or previous_offset <= 0
+        or cache.offset != previous_offset
+        or attention.num_heads != 48
+        or attention.q_lora_rank != 1536
+        or attention.qk_nope_head_dim != 128
+        or attention.qk_rope_head_dim != 64
+        or attention.kv_lora_rank != 512
+        or attention.v_head_dim != 128
+        or not attention.use_gate
+        or not isinstance(mask, mx.array)
+        or mask.dtype != mx.bool_
+        or mask.shape != (3, previous_offset + 3)
+        or not isinstance(cache.keys, mx.array)
+        or not isinstance(cache.values, mx.array)
+        or cache.keys.dtype != mx.bfloat16
+        or cache.values.dtype != mx.bfloat16
+        or cache.keys.ndim != 4
+        or cache.values.ndim != 4
+        or cache.keys.shape[:2] != (1, 1)
+        or cache.values.shape[:2] != (1, 1)
+        or cache.keys.shape[-1] != 512
+        or cache.values.shape[-1] != 64
+        or cache.keys.shape[-2] < previous_offset
+        or cache.values.shape[-2] < previous_offset
+    ):
+        return False
+    if type(cache) is KimiK3ProjectedKVCache:
+        return (
+            cache._projected_transaction_token is not None
+            and cache._projected_transaction_width == 3
+        )
+    return True
 
 
 def _released_affine6_multilinear(module: Any) -> bool:
@@ -1521,6 +1592,99 @@ class KimiK3MLAAttention(nn.Module):
             self.g_proj = nn.Linear(
                 hidden, self.num_heads * self.v_head_dim, bias=False
             )
+        self.use_sequential_absorbed_q3 = _k3_tp2_sequential_absorbed_q3_requested()
+
+    def _sequential_absorbed_q3(
+        self,
+        x: mx.array,
+        mask: mx.array,
+        cache: KVCache,
+    ) -> mx.array:
+        """Evaluate W=3 as three ordinary latent T=1 rows after one append."""
+
+        if isinstance(cache, KimiK3ProjectedKVCache):
+            # Ordinary T=1 never consumes the expanded K/V derivative.  Drop
+            # it without touching the speculative transaction marker so both
+            # commit and cancellation retain their existing ownership rules.
+            cache.clear_projected_arrays()
+
+        q_nope_rows = []
+        q_pe_rows = []
+        latent_rows = []
+        k_pe_rows = []
+        for row in range(3):
+            row_x = x[:, row : row + 1, :]
+            if self.q_lora_rank is not None:
+                row_q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(row_x)))
+            else:
+                row_q = self.q_proj(row_x)
+            row_q = row_q.reshape(
+                1,
+                1,
+                self.num_heads,
+                self.q_head_dim,
+            ).transpose(0, 2, 1, 3)
+            row_q_nope, row_q_pe = mx.split(
+                row_q,
+                [self.qk_nope_head_dim],
+                axis=-1,
+            )
+            q_nope_rows.append(row_q_nope)
+            q_pe_rows.append(row_q_pe)
+
+            row_compressed = self.kv_a_proj_with_mqa(row_x)
+            row_compressed, row_k_pe = mx.split(
+                row_compressed,
+                [self.kv_lora_rank],
+                axis=-1,
+            )
+            row_k_pe = row_k_pe.reshape(
+                1,
+                1,
+                1,
+                self.qk_rope_head_dim,
+            ).transpose(0, 2, 1, 3)
+            latent_rows.append(
+                mx.expand_dims(self.kv_a_layernorm(row_compressed), axis=1)
+            )
+            k_pe_rows.append(row_k_pe)
+
+        kv_latent, k_pe = cache.update_and_fetch(
+            mx.concatenate(latent_rows, axis=-2),
+            mx.concatenate(k_pe_rows, axis=-2),
+        )
+
+        outputs = []
+        first_stop = cache.offset - 2
+        for row in range(3):
+            stop = first_stop + row
+            row_query = self.embed_q(q_nope_rows[row])
+            row_kv = kv_latent[..., :stop, :]
+            row_pe_scores = (q_pe_rows[row] * self.scale) @ k_pe[
+                ..., :stop, :
+            ].swapaxes(-1, -2)
+            row_pe_scores = mx.where(
+                mask[row : row + 1, :stop],
+                row_pe_scores,
+                mx.array(
+                    mx.finfo(row_pe_scores.dtype).min,
+                    row_pe_scores.dtype,
+                ),
+            )
+            row_output = scaled_dot_product_attention(
+                row_query,
+                row_kv,
+                row_kv,
+                cache=cache,
+                scale=self.scale,
+                mask=row_pe_scores,
+            )
+            row_output = self.unembed_out(row_output)
+            row_output = row_output.transpose(0, 2, 1, 3).reshape(1, 1, -1)
+            row_x = x[:, row : row + 1, :]
+            row_output = row_output * mx.sigmoid(self.g_proj(row_x))
+            outputs.append(self.o_proj(row_output))
+        return mx.concatenate(outputs, axis=1)
 
     def __call__(
         self,
@@ -1536,6 +1700,18 @@ class KimiK3MLAAttention(nn.Module):
             # different projection schedule.  Rebuild on the next Q3 verifier
             # instead of retaining an ambiguous projected prefix.
             cache.clear_projected_arrays()
+
+        if _can_use_k3_tp2_sequential_absorbed_q3(
+            self,
+            x,
+            mask,
+            cache,
+            requested=self.use_sequential_absorbed_q3,
+            previous_offset=previous_cache_offset,
+        ):
+            assert isinstance(mask, mx.array)
+            assert isinstance(cache, KVCache)
+            return self._sequential_absorbed_q3(x, mask, cache)
 
         if self.q_lora_rank is not None:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
