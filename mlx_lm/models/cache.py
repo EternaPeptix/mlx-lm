@@ -753,6 +753,32 @@ class ArraysCache(_BaseCache):
     def prepare_speculative(self, consumed: int) -> List[mx.array]:
         """Build detached candidate states without committing the transaction."""
 
+        history, initial = self.speculative_prepare_snapshot(consumed)
+
+        prepared = []
+        for values, initial_state in zip(history, initial, strict=True):
+            state = (
+                values.prepare(initial_state, consumed)
+                if isinstance(values, SpeculativeReplayState)
+                else values[consumed - 1]
+            )
+            # Detach every candidate from its wide verification graph.  Replay
+            # candidates are also detached so commit never retains raw history.
+            prepared.append(state + mx.zeros_like(state))
+        return prepared
+
+    def speculative_prepare_snapshot(
+        self,
+        consumed: int,
+    ) -> Tuple[Tuple[SpeculativeStateHistory, ...], Tuple[mx.array, ...]]:
+        """Return a validated, immutable view of one pending transaction.
+
+        The stock preparation path and model-level compatible batching use the
+        same validation boundary.  No cache state is changed and no replay
+        graph is built here, so a batching mismatch can safely retain the stock
+        path without partially preparing a commit.
+        """
+
         width = self._speculative_width
         history = self._speculative_state_history
         if width <= 1 or history is None:
@@ -766,18 +792,7 @@ class ArraysCache(_BaseCache):
         initial = self._speculative_initial_state
         if initial is None or len(initial) != len(history):
             raise ValueError("speculative checkpoint initial state is unavailable")
-
-        prepared = []
-        for values, initial_state in zip(history, initial, strict=True):
-            state = (
-                values.prepare(initial_state, consumed)
-                if isinstance(values, SpeculativeReplayState)
-                else values[consumed - 1]
-            )
-            # Detach every candidate from its wide verification graph.  Replay
-            # candidates are also detached so commit never retains raw history.
-            prepared.append(state + mx.zeros_like(state))
-        return prepared
+        return tuple(history), tuple(initial)
 
     def validate_speculative_commit(self, states: List[mx.array]):
         """Validate already-materialized states before the commit phase."""

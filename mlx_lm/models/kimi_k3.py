@@ -2,8 +2,10 @@
 
 import os
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
+from threading import Lock
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -62,11 +64,29 @@ COMPILED_DECODE_SEGMENTS_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE_SEGMENTS"
 ASYNC_DECODE_BOUNDARIES_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES"
 ASYNC_DECODE_STATE_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE"
 REPLAYSSM_SPECULATIVE_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
+BATCHED_REPLAYSSM_COMMIT_ENV = "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_COMMIT"
+BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV = (
+    "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_EXPECTED_LAYERS"
+)
 EXACT_WIDE_SHORT_CONV_ENV = "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV"
 MOK_ROUTED_SHARED_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_ROUTED_SHARED_OVERLAP"
 MOK_PREFILL_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_PREFILL_OVERLAP"
 EXPERT_TOP_K_ENV = "MLX_LM_KIMI_K3_EXPERT_TOP_K"
 _EXACT_WIDE_SHORT_CONV_MAX_WIDTH = 8
+_BATCHED_REPLAYSSM_COUNTER_LOCK = Lock()
+_BATCHED_REPLAYSSM_COUNTERS: Dict[str, int] = {
+    "attempted_prepares": 0,
+    "batched_prepares": 0,
+    "batched_commits": 0,
+    "fallback_prepares": 0,
+    "fallback_commits": 0,
+    "batched_errors": 0,
+    "layers_batched": 0,
+}
+_BATCHED_REPLAYSSM_TELEMETRY_SCHEMA = "kimi-k3-batched-replayssm-telemetry-v1"
+_BATCHED_REPLAYSSM_TELEMETRY_REVISION = 0
+_BATCHED_REPLAYSSM_LATEST_ATTESTATION: Optional[Dict[str, Any]] = None
+_BATCHED_REPLAYSSM_NO_ATTESTATION = object()
 
 
 def _selected_expert_top_k(native_top_k: int) -> int:
@@ -97,6 +117,99 @@ def replayssm_speculative_enabled() -> bool:
     if value not in {"0", "1"}:
         raise ValueError(f"{REPLAYSSM_SPECULATIVE_ENV} must be 0 or 1")
     return value == "1"
+
+
+def batched_replayssm_commit_enabled() -> bool:
+    """Parse the default-off compatible ReplaySSM commit batcher."""
+
+    value = os.environ.get(BATCHED_REPLAYSSM_COMMIT_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{BATCHED_REPLAYSSM_COMMIT_ENV} must be 0 or 1")
+    return value == "1"
+
+
+def _batched_replayssm_expected_layers() -> int:
+    """Return the exact KDA layer count required by the opt-in path."""
+
+    value = os.environ.get(BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV, "69")
+    try:
+        expected = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV} must be a positive integer"
+        ) from error
+    if expected < 2:
+        raise ValueError(
+            f"{BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV} must be at least 2"
+        )
+    return expected
+
+
+def _update_batched_replayssm_telemetry(
+    counter_deltas: Optional[Dict[str, int]] = None,
+    attestation: Any = _BATCHED_REPLAYSSM_NO_ATTESTATION,
+) -> None:
+    """Atomically publish counter deltas and an optional attestation."""
+
+    global _BATCHED_REPLAYSSM_LATEST_ATTESTATION
+    global _BATCHED_REPLAYSSM_TELEMETRY_REVISION
+
+    with _BATCHED_REPLAYSSM_COUNTER_LOCK:
+        for name, amount in (counter_deltas or {}).items():
+            if name not in _BATCHED_REPLAYSSM_COUNTERS:
+                raise KeyError(f"unknown batched ReplaySSM counter: {name}")
+            if not isinstance(amount, int) or amount < 0:
+                raise ValueError(
+                    "batched ReplaySSM counter deltas must be nonnegative"
+                )
+            _BATCHED_REPLAYSSM_COUNTERS[name] += amount
+        if attestation is not _BATCHED_REPLAYSSM_NO_ATTESTATION:
+            if attestation is not None and not isinstance(attestation, dict):
+                raise TypeError("batched ReplaySSM attestation must be a dictionary")
+            _BATCHED_REPLAYSSM_LATEST_ATTESTATION = deepcopy(attestation)
+        _BATCHED_REPLAYSSM_TELEMETRY_REVISION += 1
+
+
+def _increment_batched_replayssm_counter(name: str, amount: int = 1) -> None:
+    _update_batched_replayssm_telemetry({name: amount})
+
+
+def batched_replayssm_commit_telemetry() -> Dict[str, Any]:
+    """Return one JSON-safe, thread-safe counter and attestation snapshot.
+
+    The returned dictionaries and lists are detached copies.  Callers may
+    serialize or annotate them without mutating the process-global telemetry.
+    ``revision`` changes after every published transition, including reset.
+    """
+
+    with _BATCHED_REPLAYSSM_COUNTER_LOCK:
+        return {
+            "schema": _BATCHED_REPLAYSSM_TELEMETRY_SCHEMA,
+            "revision": _BATCHED_REPLAYSSM_TELEMETRY_REVISION,
+            "counters": dict(_BATCHED_REPLAYSSM_COUNTERS),
+            "latest_attestation": deepcopy(
+                _BATCHED_REPLAYSSM_LATEST_ATTESTATION
+            ),
+        }
+
+
+def batched_replayssm_commit_counters() -> Dict[str, int]:
+    """Return the counter portion of the stable public telemetry snapshot."""
+
+    return batched_replayssm_commit_telemetry()["counters"]
+
+
+def reset_batched_replayssm_commit_counters() -> None:
+    """Reset bounded-run telemetry for a benchmark or focused test."""
+
+    global _BATCHED_REPLAYSSM_LATEST_ATTESTATION
+    global _BATCHED_REPLAYSSM_TELEMETRY_REVISION
+
+    with _BATCHED_REPLAYSSM_COUNTER_LOCK:
+        for name in _BATCHED_REPLAYSSM_COUNTERS:
+            _BATCHED_REPLAYSSM_COUNTERS[name] = 0
+        _BATCHED_REPLAYSSM_LATEST_ATTESTATION = None
+        _BATCHED_REPLAYSSM_TELEMETRY_REVISION += 1
 
 
 def mok_routed_shared_overlap_enabled() -> bool:
@@ -2879,6 +2992,248 @@ class KimiK3TextModel(nn.Module):
         return h
 
 
+def _batched_replayssm_fallback_attestation(
+    base: Dict[str, Any],
+    reason: str,
+) -> Dict[str, Any]:
+    return {
+        **base,
+        "used_batched_path": False,
+        "status": "fallback_prepared",
+        "fallback_reason": reason,
+    }
+
+
+def _prepare_batched_replayssm_commit(
+    array_states: List[Tuple[int, ArraysCache, List[Any]]],
+    width: int,
+    consumed: int,
+) -> Tuple[
+    Optional[List[Tuple[ArraysCache, List[mx.array]]]],
+    Dict[str, Any],
+]:
+    """Batch compatible KDA replay and detachment without changing caches.
+
+    Every KDA layer must expose the exact production two-state contract: a
+    full short-convolution history and a compact ``SpeculativeReplayState``
+    produced by ``KimiK3DeltaAttention._replay_speculative_ssm``.  Any
+    disagreement returns a stock-path attestation before a commit is prepared.
+    The recurrence itself remains the original replay method; only its batch
+    dimension changes from 1 to the number of compatible KDA layers.
+    """
+
+    expected_layers = _batched_replayssm_expected_layers()
+    layer_count = len(array_states)
+    base: Dict[str, Any] = {
+        "schema": "kimi-k3-batched-replayssm-commit-v1",
+        "requested": True,
+        "width": int(width),
+        "consumed": int(consumed),
+        "expected_layers": expected_layers,
+        "observed_layers": layer_count,
+    }
+    if layer_count != expected_layers:
+        return None, _batched_replayssm_fallback_attestation(
+            base, "unexpected_kda_layer_count"
+        )
+    if consumed < 1 or consumed > width:
+        return None, _batched_replayssm_fallback_attestation(
+            base, "invalid_consumed_width"
+        )
+
+    snapshots = []
+    reference = None
+    for layer_index, layer_cache, _ in array_states:
+        try:
+            history, initial = layer_cache.speculative_prepare_snapshot(consumed)
+        except (TypeError, ValueError):
+            return None, _batched_replayssm_fallback_attestation(
+                base, "cache_snapshot_contract"
+            )
+        if len(history) != 2 or len(initial) != 2 or len(layer_cache.cache) != 2:
+            return None, _batched_replayssm_fallback_attestation(
+                base, "two_state_cache_contract"
+            )
+
+        conv_history, replay = history
+        initial_conv, initial_ssm = initial
+        if isinstance(conv_history, SpeculativeReplayState) or not isinstance(
+            replay, SpeculativeReplayState
+        ):
+            return None, _batched_replayssm_fallback_attestation(
+                base, "history_kind_contract"
+            )
+        if replay.history_axis != 1 or len(replay.raw_inputs) != 4:
+            return None, _batched_replayssm_fallback_attestation(
+                base, "raw_replay_contract"
+            )
+        if (
+            getattr(replay.replay, "__func__", None)
+            is not KimiK3DeltaAttention._replay_speculative_ssm
+        ):
+            return None, _batched_replayssm_fallback_attestation(
+                base, "replay_callable_contract"
+            )
+        owner = getattr(replay.replay, "__self__", None)
+        if not isinstance(owner, KimiK3DeltaAttention):
+            return None, _batched_replayssm_fallback_attestation(
+                base, "replay_owner_contract"
+            )
+        try:
+            replay.validate(width, layer_cache.cache[1])
+        except (TypeError, ValueError):
+            return None, _batched_replayssm_fallback_attestation(
+                base, "replay_state_contract"
+            )
+
+        raw_v, raw_k, post_exp_gk, beta = replay.raw_inputs
+        heads = int(owner.num_heads)
+        dimension = int(owner.head_dim)
+        raw_shapes = (
+            tuple(raw_v.shape),
+            tuple(raw_k.shape),
+            tuple(post_exp_gk.shape),
+            tuple(beta.shape),
+        )
+        expected_raw_shapes = (
+            (1, width, heads, dimension),
+            (1, width, heads, dimension),
+            (1, width, heads, dimension),
+            (1, width, heads),
+        )
+        if raw_shapes != expected_raw_shapes:
+            return None, _batched_replayssm_fallback_attestation(
+                base, "raw_shape_contract"
+            )
+        if tuple(initial_ssm.shape) != (1, heads, dimension, dimension):
+            return None, _batched_replayssm_fallback_attestation(
+                base, "initial_state_shape_contract"
+            )
+        if (
+            tuple(conv_history.shape[1:]) != tuple(initial_conv.shape)
+            or conv_history.shape[0] != width
+            or conv_history.dtype != initial_conv.dtype
+        ):
+            return None, _batched_replayssm_fallback_attestation(
+                base, "conv_history_contract"
+            )
+        selected_conv = conv_history[consumed - 1]
+        if (
+            tuple(selected_conv.shape) != tuple(initial_conv.shape)
+            or selected_conv.shape[0] != 1
+        ):
+            return None, _batched_replayssm_fallback_attestation(
+                base, "conv_selected_shape_contract"
+            )
+
+        signature = (
+            heads,
+            dimension,
+            float(owner.scale).hex(),
+            tuple(initial_conv.shape),
+            initial_conv.dtype,
+            initial_ssm.dtype,
+            tuple(value.dtype for value in replay.raw_inputs),
+        )
+        if reference is None:
+            reference = signature
+        elif signature != reference:
+            return None, _batched_replayssm_fallback_attestation(
+                base, "cross_layer_geometry_or_dtype_mismatch"
+            )
+        snapshots.append(
+            (
+                layer_index,
+                layer_cache,
+                owner,
+                selected_conv,
+                initial_ssm,
+                replay.raw_inputs,
+            )
+        )
+
+    if not snapshots or reference is None:
+        return None, _batched_replayssm_fallback_attestation(
+            base, "empty_compatible_batch"
+        )
+
+    try:
+        conv_batch = mx.concatenate(
+            [snapshot[3] for snapshot in snapshots], axis=0
+        )
+        initial_ssm_batch = mx.concatenate(
+            [snapshot[4] for snapshot in snapshots], axis=0
+        )
+        raw_batches = tuple(
+            mx.concatenate(
+                [snapshot[5][raw_index][:, :consumed] for snapshot in snapshots],
+                axis=0,
+            )
+            for raw_index in range(4)
+        )
+        owner = snapshots[0][2]
+        ssm_batch = owner._replay_speculative_ssm(
+            initial_ssm_batch,
+            raw_batches,
+            consumed,
+        )
+        expected_ssm_batch_shape = (
+            layer_count,
+            reference[0],
+            reference[1],
+            reference[1],
+        )
+        if (
+            tuple(ssm_batch.shape) != expected_ssm_batch_shape
+            or ssm_batch.dtype != reference[5]
+            or conv_batch.shape[0] != layer_count
+            or conv_batch.dtype != reference[4]
+        ):
+            return None, _batched_replayssm_fallback_attestation(
+                base, "batched_output_contract"
+            )
+
+        # One materialization boundary per state kind replaces two detach nodes
+        # per layer.  Slices retain the materialized parent; no per-layer copy
+        # or recurrence is introduced after this point.
+        detached_conv_batch = conv_batch + mx.zeros_like(conv_batch)
+        detached_ssm_batch = ssm_batch + mx.zeros_like(ssm_batch)
+        prepared = [
+            (
+                snapshot[1],
+                [
+                    detached_conv_batch[position : position + 1],
+                    detached_ssm_batch[position : position + 1],
+                ],
+            )
+            for position, snapshot in enumerate(snapshots)
+        ]
+    except (RuntimeError, TypeError, ValueError):
+        return None, _batched_replayssm_fallback_attestation(
+            base, "batched_graph_build"
+        )
+
+    attestation = {
+        **base,
+        "used_batched_path": True,
+        "status": "batched_prepared",
+        "fallback_reason": None,
+        "heads_per_rank": reference[0],
+        "state_dimension": reference[1],
+        "state_dtype": str(reference[5]),
+        "raw_dtypes": [str(value) for value in reference[6]],
+        "state_shape_per_layer": [1, reference[0], reference[1], reference[1]],
+        "stacked_state_shape": list(detached_ssm_batch.shape),
+        "stock_replay_launches": layer_count,
+        "batched_replay_launches": 1,
+        "stock_detach_nodes": 2 * layer_count,
+        "batched_detach_nodes": 2,
+        "concatenate_nodes": 6,
+        "recurrence": "original_post_exp_gk_gated_delta_kernel",
+    }
+    return prepared, attestation
+
+
 @dataclass
 class KimiK3SpeculativeCacheTransaction:
     """Fail-closed rollback state for one Kimi K3 target verification."""
@@ -2892,6 +3247,7 @@ class KimiK3SpeculativeCacheTransaction:
         default_factory=list
     )
     projected_transaction_token: Optional[object] = field(default=None, repr=False)
+    batched_replayssm_attestation: Optional[Dict[str, Any]] = None
     active: bool = True
 
     def release(self):
@@ -3207,13 +3563,14 @@ class LanguageModel(nn.Module):
         transaction: KimiK3SpeculativeCacheTransaction,
         consumed: int,
     ):
+        batched_used = False
+        fallback_used = False
         try:
             self._validate_speculative_transaction(transaction)
             width = transaction.width
             if consumed < 1 or consumed > width:
                 raise ValueError("invalid Kimi K3 speculative cache resolution")
 
-            prepared = []
             for _, layer_cache, _ in transaction.array_states:
                 if (
                     layer_cache.speculative_width != width
@@ -3222,9 +3579,54 @@ class LanguageModel(nn.Module):
                     raise ValueError(
                         "Kimi K3 speculative KDA checkpoints are incomplete"
                     )
-                prepared.append(
-                    (layer_cache, layer_cache.prepare_speculative(consumed))
+
+            if batched_replayssm_commit_enabled():
+                prepared, attestation = _prepare_batched_replayssm_commit(
+                    transaction.array_states,
+                    width,
+                    consumed,
                 )
+                transaction.batched_replayssm_attestation = attestation
+                if prepared is None:
+                    fallback_used = True
+                    _update_batched_replayssm_telemetry(
+                        {
+                            "attempted_prepares": 1,
+                            "fallback_prepares": 1,
+                        },
+                        attestation,
+                    )
+                    prepared = [
+                        (layer_cache, layer_cache.prepare_speculative(consumed))
+                        for _, layer_cache, _ in transaction.array_states
+                    ]
+                else:
+                    batched_used = True
+                    _update_batched_replayssm_telemetry(
+                        {
+                            "attempted_prepares": 1,
+                            "batched_prepares": 1,
+                        },
+                        attestation,
+                    )
+            else:
+                transaction.batched_replayssm_attestation = {
+                    "schema": "kimi-k3-batched-replayssm-commit-v1",
+                    "requested": False,
+                    "used_batched_path": False,
+                    "status": "disabled",
+                    "fallback_reason": None,
+                    "width": int(width),
+                    "consumed": int(consumed),
+                    "observed_layers": len(transaction.array_states),
+                }
+                _update_batched_replayssm_telemetry(
+                    attestation=transaction.batched_replayssm_attestation
+                )
+                prepared = [
+                    (layer_cache, layer_cache.prepare_speculative(consumed))
+                    for _, layer_cache, _ in transaction.array_states
+                ]
 
             for _, layer_cache, _, _, initial_offset in transaction.kv_states:
                 if layer_cache.offset != initial_offset + width:
@@ -3262,6 +3664,24 @@ class LanguageModel(nn.Module):
                 )
                 layer_cache.clear_projected_transaction()
         except BaseException:
+            if transaction.batched_replayssm_attestation is not None:
+                if batched_used:
+                    error_status = "batched_error_rolled_back"
+                    error_counters = {"batched_errors": 1}
+                elif fallback_used:
+                    error_status = "fallback_error_rolled_back"
+                    error_counters = None
+                else:
+                    error_status = "disabled_error_rolled_back"
+                    error_counters = None
+                transaction.batched_replayssm_attestation = {
+                    **transaction.batched_replayssm_attestation,
+                    "status": error_status,
+                }
+                _update_batched_replayssm_telemetry(
+                    error_counters,
+                    transaction.batched_replayssm_attestation,
+                )
             if (
                 isinstance(transaction, KimiK3SpeculativeCacheTransaction)
                 and transaction.owner_id == id(self)
@@ -3270,6 +3690,27 @@ class LanguageModel(nn.Module):
                 self.cancel_speculative_cache(transaction)
             raise
 
+        if batched_used:
+            transaction.batched_replayssm_attestation = {
+                **transaction.batched_replayssm_attestation,
+                "status": "batched_committed",
+            }
+            _update_batched_replayssm_telemetry(
+                {
+                    "batched_commits": 1,
+                    "layers_batched": len(transaction.array_states),
+                },
+                transaction.batched_replayssm_attestation,
+            )
+        elif fallback_used:
+            transaction.batched_replayssm_attestation = {
+                **transaction.batched_replayssm_attestation,
+                "status": "fallback_committed",
+            }
+            _update_batched_replayssm_telemetry(
+                {"fallback_commits": 1},
+                transaction.batched_replayssm_attestation,
+            )
         transaction.active = False
         transaction.release()
 
