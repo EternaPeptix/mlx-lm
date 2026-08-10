@@ -170,24 +170,56 @@ class TestKimiK3ProjectedKVCache(unittest.TestCase):
         self.assertIsNone(cache._projected_transaction_token)
         self.assertEqual(cache._projected_transaction_width, 0)
 
-    def test_actual_begin_activates_q3_and_cancel_clears_marker(self):
-        owner, array_cache, projected_cache, cache = self._transaction_fixture()
-        transaction = owner.begin_speculative_cache(cache, width=3)
-        token = transaction.projected_transaction_token
+    def test_actual_begin_activates_screened_widths_and_cancel_clears_marker(self):
+        for width in (3, 4):
+            with self.subTest(width=width):
+                owner, array_cache, projected_cache, cache = self._transaction_fixture()
+                transaction = owner.begin_speculative_cache(cache, width=width)
+                token = transaction.projected_transaction_token
 
-        self.assertIsNotNone(token)
-        self.assertTrue(projected_cache.matches_projected_transaction(token, 3))
-        latent, (keys, values) = self._append(projected_cache, 3)
-        expected_keys = self.attention.embed_q(latent, transpose=False)
-        expected_values = self.attention.unembed_out(latent)
-        mx.eval(keys, values, expected_keys, expected_values)
-        self.assertTrue(mx.array_equal(keys, expected_keys).item())
-        self.assertTrue(mx.array_equal(values, expected_values).item())
+                self.assertIsNotNone(token)
+                self.assertTrue(
+                    projected_cache.matches_projected_transaction(token, width)
+                )
+                latent, (keys, values) = self._append(projected_cache, width)
+                expected_keys = self.attention.embed_q(latent, transpose=False)
+                expected_values = self.attention.unembed_out(latent)
+                mx.eval(keys, values, expected_keys, expected_values)
+                self.assertTrue(mx.array_equal(keys, expected_keys).item())
+                self.assertTrue(mx.array_equal(values, expected_values).item())
 
-        owner.cancel_speculative_cache(transaction)
-        self.assertIsNone(projected_cache._projected_transaction_token)
-        self.assertEqual(projected_cache._projected_transaction_width, 0)
-        self.assertEqual(array_cache.speculative_width, 0)
+                owner.cancel_speculative_cache(transaction)
+                self.assertIsNone(projected_cache._projected_transaction_token)
+                self.assertEqual(projected_cache._projected_transaction_width, 0)
+                self.assertEqual(array_cache.speculative_width, 0)
+
+    def test_screened_width_resolution_is_exact_for_every_commit_count(self):
+        for width in (3, 4):
+            for consumed in range(1, width + 1):
+                with self.subTest(width=width, consumed=consumed):
+                    owner, array_cache, projected_cache, cache = (
+                        self._transaction_fixture()
+                    )
+                    initial_array = array_cache.cache[0]
+                    initial_offset = projected_cache.offset
+                    transaction = owner.begin_speculative_cache(cache, width=width)
+                    history = mx.stack(
+                        [initial_array + index for index in range(1, width + 1)]
+                    )
+                    array_cache.cache = [history[-1]]
+                    array_cache.capture_speculative([history])
+                    self._append(projected_cache, width)
+                    owner.resolve_speculative_cache(transaction, consumed=consumed)
+
+                    mx.eval(array_cache.cache[0])
+                    self.assertTrue(
+                        mx.array_equal(
+                            array_cache.cache[0], history[consumed - 1]
+                        ).item()
+                    )
+                    self.assertEqual(projected_cache.offset, initial_offset + consumed)
+                    self.assertIsNone(projected_cache._projected_transaction_token)
+                    self.assertEqual(projected_cache._projected_transaction_width, 0)
 
     def test_nested_begin_fails_closed_without_replacing_marker(self):
         owner, array_cache, projected_cache, cache = self._transaction_fixture()
@@ -251,6 +283,16 @@ class TestKimiK3ProjectedKVCache(unittest.TestCase):
         self.assertEqual(projected_cache.offset, initial_offset + 1)
         self.assertEqual(array_cache.speculative_width, 0)
         self.assertIsNone(projected_cache._projected_transaction_token)
+
+    def test_width_five_remains_unmarked(self):
+        owner, array_cache, projected_cache, cache = self._transaction_fixture()
+        transaction = owner.begin_speculative_cache(cache, width=5)
+
+        self.assertIsNone(transaction.projected_transaction_token)
+        self.assertIsNone(projected_cache._projected_transaction_token)
+        self.assertEqual(array_cache.speculative_width, 5)
+        owner.cancel_speculative_cache(transaction)
+        self.assertEqual(array_cache.speculative_width, 0)
 
     def test_unsupported_q3_geometry_preserves_marker_until_resolve(self):
         owner, array_cache, projected_cache, cache = self._transaction_fixture()
@@ -489,6 +531,23 @@ class TestKimiK3ProjectedKVCache(unittest.TestCase):
         mx.eval(keys, values, expected_keys, expected_values)
         self.assertTrue(mx.array_equal(keys, expected_keys).item())
         self.assertTrue(mx.array_equal(values, expected_values).item())
+
+    def test_padded_q4_append_is_exact_across_stale_tails_and_capacity_edges(self):
+        for prefix in (32, 252, 253, 254, 255, 256, 257):
+            for consumed in range(1, 5):
+                with self.subTest(prefix=prefix, consumed=consumed):
+                    cache = kimi_k3.KimiK3ProjectedKVCache()
+                    cache.update_and_fetch(self._latent(prefix), self._rope(prefix))
+                    _, _ = self._append(cache, 4)
+
+                    cache.offset = prefix + consumed
+                    latent, (keys, values) = self._append(cache, 4)
+                    expected_keys = self.attention.embed_q(latent, transpose=False)
+                    expected_values = self.attention.unembed_out(latent)
+                    mx.eval(keys, values, expected_keys, expected_values)
+                    self.assertTrue(mx.array_equal(keys, expected_keys).item())
+                    self.assertTrue(mx.array_equal(values, expected_values).item())
+                    self.assertGreaterEqual(cache.projected_capacity, cache.offset)
 
     def test_state_restore_clears_nonserialized_projection_and_counts_bytes(self):
         cache = kimi_k3.KimiK3ProjectedKVCache()

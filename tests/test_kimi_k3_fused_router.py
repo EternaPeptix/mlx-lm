@@ -112,7 +112,7 @@ class FusedRouterTest(unittest.TestCase):
 
     def test_top8_decode_prefill_and_q3_are_bit_exact(self):
         bias = 0.25 * mx.random.normal((896,), dtype=mx.float32)
-        for width in (1, 3, 512):
+        for width in (1, 3, 4, 512):
             with self.subTest(width=width):
                 mx.random.seed(20_000 + width)
                 gates = mx.random.normal((1, width, 896), dtype=mx.bfloat16)

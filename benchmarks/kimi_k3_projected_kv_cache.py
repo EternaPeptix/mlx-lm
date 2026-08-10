@@ -47,7 +47,7 @@ def _time(callable_):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prefix-tokens", type=int, default=574)
-    parser.add_argument("--suffix-tokens", type=int, default=3, choices=(1, 2, 3))
+    parser.add_argument("--suffix-tokens", type=int, default=3, choices=(1, 2, 3, 4))
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--trials", type=int, default=21)
     parser.add_argument("--num-heads", type=int, default=48, choices=(48, 96))

@@ -92,17 +92,19 @@ class KimiK3MoKOverlapTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
             mok_prefill_overlap_enabled()
 
-    def test_q3_split_is_exact_and_uses_two_reductions(self):
-        mx.random.seed(923)
-        module = _small_sparse_moe()
-        x = mx.random.normal((1, 3, 128), dtype=mx.bfloat16)
+    def test_screened_short_widths_split_exactly_into_two_reductions(self):
+        for width in (3, 4):
+            with self.subTest(width=width):
+                mx.random.seed(920 + width)
+                module = _small_sparse_moe()
+                x = mx.random.normal((1, width, 128), dtype=mx.bfloat16)
 
-        reference, reference_widths = _run(module, x, overlap=False)
-        candidate, candidate_widths = _run(module, x, overlap=True)
+                reference, reference_widths = _run(module, x, overlap=False)
+                candidate, candidate_widths = _run(module, x, overlap=True)
 
-        self.assertEqual(reference_widths, [192])
-        self.assertEqual(candidate_widths, [64, 128])
-        self.assertTrue(bool(mx.all(reference == candidate).item()))
+                self.assertEqual(reference_widths, [192])
+                self.assertEqual(candidate_widths, [64, 128])
+                self.assertTrue(bool(mx.all(reference == candidate).item()))
 
     def test_prefill_width_splits_only_with_independent_opt_in(self):
         mx.random.seed(929)
@@ -120,10 +122,10 @@ class KimiK3MoKOverlapTests(unittest.TestCase):
         self.assertEqual(candidate_widths, [64, 128])
         self.assertTrue(bool(mx.all(reference == candidate).item()))
 
-    def test_short_non_q3_width_keeps_one_combined_reduction(self):
+    def test_other_short_width_keeps_one_combined_reduction(self):
         mx.random.seed(931)
         module = _small_sparse_moe()
-        x = mx.random.normal((1, 4, 128), dtype=mx.bfloat16)
+        x = mx.random.normal((1, 5, 128), dtype=mx.bfloat16)
 
         _, reduction_widths = _run(
             module,

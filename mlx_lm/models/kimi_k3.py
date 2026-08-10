@@ -217,9 +217,9 @@ def mok_routed_shared_overlap_enabled() -> bool:
 
     The split gives MLX's scheduler independent routed and shared branches so
     JACCL communication may overlap the shared-expert and routed-up compute.
-    It is restricted at dispatch to the three-token target-verification shape
-    where collective startup can be hidden; ordinary decode and prefill retain
-    one combined reduction.
+    It is restricted at dispatch to the screened three- and four-token target
+    verification shapes where collective startup can be hidden; ordinary
+    decode and prefill retain one combined reduction.
     """
 
     value = os.environ.get(MOK_ROUTED_SHARED_OVERLAP_ENV, "0")
@@ -274,6 +274,7 @@ FACTORIZED_SDPA_PREFILL_ENV = "MLX_LM_KIMI_K3_FACTORIZED_SDPA_PREFILL"
 PROJECTED_KV_CACHE_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE"
 PROJECTED_KV_CACHE_MAX_TOKENS_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE_MAX_TOKENS"
 K3_TP2_SEQUENTIAL_ABSORBED_Q3_ENV = "MLX_LM_KIMI_K3_TP2_SEQUENTIAL_ABSORBED_Q3_VERIFY"
+_PROJECTED_KV_VERIFY_WIDTHS = (3, 4)
 _PROJECTED_KV_CACHE_APPEND_ROWS = 32
 _PROJECTED_KV_CACHE_MIN_PREFIX = 32
 _PROJECTED_KV_CACHE_MAX_SAFE_TOKENS = 131072
@@ -506,7 +507,7 @@ def _can_use_projected_kv_cache(
     query_length: int,
     previous_offset: int,
 ) -> bool:
-    """Match only the released TP2 K3 width-three expanded verifier."""
+    """Match only the screened TP2 K3 short-width expanded verifiers."""
 
     if (
         not _projected_kv_cache_requested()
@@ -515,7 +516,7 @@ def _can_use_projected_kv_cache(
         or cache._projected_transaction_token is None
         or cache._projected_transaction_width != query_length
         or batch_size != 1
-        or query_length != 3
+        or query_length not in _PROJECTED_KV_VERIFY_WIDTHS
         or previous_offset < _PROJECTED_KV_CACHE_MIN_PREFIX
         or cache.offset != previous_offset + query_length
         or cache.offset > _projected_kv_cache_max_tokens()
@@ -1808,10 +1809,13 @@ class KimiK3MLAAttention(nn.Module):
         B, L, _ = x.shape
 
         previous_cache_offset = int(getattr(cache, "offset", 0))
-        if isinstance(cache, KimiK3ProjectedKVCache) and L != 3:
+        if (
+            isinstance(cache, KimiK3ProjectedKVCache)
+            and L not in _PROJECTED_KV_VERIFY_WIDTHS
+        ):
             # An ordinary decode or another query shape may append rows using a
-            # different projection schedule.  Rebuild on the next Q3 verifier
-            # instead of retaining an ambiguous projected prefix.
+            # different projection schedule. Rebuild on the next screened
+            # short-width verifier instead of retaining an ambiguous prefix.
             cache.clear_projected_arrays()
 
         if _can_use_k3_tp2_sequential_absorbed_q3(
@@ -2025,7 +2029,7 @@ class KimiK3SparseMoE(nn.Module):
             x.ndim == 3
             and x.shape[0] == 1
             and (
-                (self.mok_routed_shared_overlap and x.shape[1] == 3)
+                (self.mok_routed_shared_overlap and x.shape[1] in (3, 4))
                 or (self.mok_prefill_overlap and x.shape[1] >= 128)
             )
         )
@@ -3474,7 +3478,7 @@ class LanguageModel(nn.Module):
             raise ValueError("Kimi K3 speculative MLA cache offsets disagree")
 
         # Reject nested projected-cache transactions before activating any KDA
-        # cache.  The opaque marker makes a width-three model call insufficient
+        # cache. The opaque marker makes a short-width model call insufficient
         # on its own to select the expanded-cache path.
         for _, layer_cache, _ in projected_kv_states:
             layer_cache.validate_begin_projected_transaction()
@@ -3489,7 +3493,9 @@ class LanguageModel(nn.Module):
             raise
 
         projected_transaction_token = (
-            object() if projected_kv_states and width == 3 else None
+            object()
+            if projected_kv_states and width in _PROJECTED_KV_VERIFY_WIDTHS
+            else None
         )
         transaction = KimiK3SpeculativeCacheTransaction(
             owner_id=id(self),
