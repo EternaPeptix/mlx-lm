@@ -40,6 +40,11 @@ RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS = (7, 23, 51, 67, 83)
 RADIXARK_KIMI_K3_DSPARK_BLOCK_SIZE = 7
 KIMI_K3_DSPARK_MODEL_VERIFY_WIDTH = RADIXARK_KIMI_K3_DSPARK_BLOCK_SIZE + 1
 KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH = 3
+KIMI_K3_DSPARK_INTERMEDIATE_VERIFY_WIDTH = 4
+KIMI_K3_DSPARK_SCREENED_VERIFY_WIDTHS = (
+    KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH,
+    KIMI_K3_DSPARK_INTERMEDIATE_VERIFY_WIDTH,
+)
 # Compatibility name retained for callers of the first contract prototype.
 KIMI_K3_DSPARK_INITIAL_VERIFY_WIDTH = KIMI_K3_DSPARK_MODEL_VERIFY_WIDTH
 
@@ -316,11 +321,11 @@ class KimiK3DSparkContract:
             raise TypeError("Kimi K3 DSpark screening_override must be bool")
         if verify_width != native_width and (
             not screening_override
-            or verify_width != KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH
+            or verify_width not in KIMI_K3_DSPARK_SCREENED_VERIFY_WIDTHS
         ):
             raise ValueError(
                 "non-native Kimi K3 DSpark verification requires the explicit "
-                "width-three screening override"
+                "width-three or width-four screening override"
             )
         if placement != "replicated":
             raise ValueError(
@@ -1144,20 +1149,20 @@ class KimiK3DSparkProposer:
                 )
             self.mode = "model_native"
         elif (
-            self.verify_width == KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH
+            self.verify_width in KIMI_K3_DSPARK_SCREENED_VERIFY_WIDTHS
             and screening_override
         ):
-            self.mode = "width3_screening_override"
+            self.mode = f"width{self.verify_width}_screening_override"
             warnings.warn(
-                "Kimi K3 DSpark width-three screening overrides the checkpoint's "
-                "model-native gamma=7 / verify-width=8 contract",
+                f"Kimi K3 DSpark width-{self.verify_width} screening overrides "
+                "the checkpoint's model-native gamma=7 / verify-width=8 contract",
                 RuntimeWarning,
                 stacklevel=2,
             )
         else:
             raise ValueError(
                 "non-native Kimi K3 DSpark verification requires the explicit "
-                "width-three screening override"
+                "width-three or width-four screening override"
             )
 
     @property

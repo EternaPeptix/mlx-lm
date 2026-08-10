@@ -6,6 +6,7 @@ import unittest
 from mlx_lm.models.kimi_k3 import _validate_aux_hidden_state_layer_ids
 from mlx_lm.models.kimi_k3_dspark import (
     KIMI_K3_DSPARK_INITIAL_VERIFY_WIDTH,
+    KIMI_K3_DSPARK_INTERMEDIATE_VERIFY_WIDTH,
     KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH,
     RADIXARK_KIMI_K3_DSPARK_PARAMETERS,
     RADIXARK_KIMI_K3_DSPARK_TARGET_LAYERS,
@@ -65,21 +66,28 @@ class KimiK3DSparkContractTest(unittest.TestCase):
         self.assertFalse(contract.owns_lm_head)
         self.assertFalse(contract.screening_override)
 
-    def test_width_three_requires_explicit_screening_override(self):
-        with self.assertRaisesRegex(ValueError, "screening override"):
-            KimiK3DSparkContract.from_config(
-                _official_config(),
-                verify_width=KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH,
-            )
+    def test_screened_widths_require_explicit_override(self):
+        for width in (
+            KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH,
+            KIMI_K3_DSPARK_INTERMEDIATE_VERIFY_WIDTH,
+        ):
+            with (
+                self.subTest(width=width, override=False),
+                self.assertRaisesRegex(ValueError, "screening override"),
+            ):
+                KimiK3DSparkContract.from_config(
+                    _official_config(),
+                    verify_width=width,
+                )
 
-        contract = KimiK3DSparkContract.from_config(
-            _official_config(),
-            verify_width=KIMI_K3_DSPARK_SCREENING_VERIFY_WIDTH,
-            screening_override=True,
-        )
-        self.assertEqual(contract.verify_width, 3)
-        self.assertEqual(contract.num_draft_tokens, 2)
-        self.assertTrue(contract.screening_override)
+            contract = KimiK3DSparkContract.from_config(
+                _official_config(),
+                verify_width=width,
+                screening_override=True,
+            )
+            self.assertEqual(contract.verify_width, width)
+            self.assertEqual(contract.num_draft_tokens, width - 1)
+            self.assertTrue(contract.screening_override)
 
     def test_checkpoint_shape_mismatch_fails_closed(self):
         for field, invalid in (
@@ -127,7 +135,7 @@ class KimiK3DSparkContractTest(unittest.TestCase):
                     _official_config(),
                     verify_width=width,
                 )
-        for width in (2, 4, 7):
+        for width in (2, 5, 6, 7):
             with (
                 self.subTest(width=width),
                 self.assertRaisesRegex(ValueError, "screening override"),
@@ -135,6 +143,7 @@ class KimiK3DSparkContractTest(unittest.TestCase):
                 KimiK3DSparkContract.from_config(
                     _official_config(),
                     verify_width=width,
+                    screening_override=True,
                 )
         with self.assertRaisesRegex(ValueError, "replicated"):
             KimiK3DSparkContract.from_config(

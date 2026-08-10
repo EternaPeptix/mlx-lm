@@ -530,26 +530,66 @@ class KimiK3DSparkModelTest(unittest.TestCase):
         self.assertEqual(proposal.mode, "model_native")
         self.assertEqual({cache.length for cache in context}, {3})
 
-    def test_gamma_seven_is_default_and_width_three_is_screening_only(self):
+    def test_gamma_seven_is_default_and_shorter_widths_are_screening_only(self):
         model = KimiK3DSparkModel(_tiny_args(block_size=7))
         native = KimiK3DSparkProposer(model)
         self.assertEqual(native.verify_width, 8)
         self.assertEqual(native.proposal_count, 7)
         self.assertEqual(native.mode, "model_native")
 
-        with self.assertRaisesRegex(ValueError, "screening override"):
-            KimiK3DSparkProposer(model, verify_width=3)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            screening = KimiK3DSparkProposer(
+        for width in (3, 4):
+            with (
+                self.subTest(width=width, override=False),
+                self.assertRaisesRegex(ValueError, "screening override"),
+            ):
+                KimiK3DSparkProposer(model, verify_width=width)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                screening = KimiK3DSparkProposer(
+                    model,
+                    verify_width=width,
+                    screening_override=True,
+                )
+            self.assertEqual(screening.proposal_count, width - 1)
+            self.assertEqual(screening.mode, f"width{width}_screening_override")
+            self.assertEqual(len(caught), 1)
+            self.assertIn("gamma=7", str(caught[0].message))
+
+    def test_width_four_screening_proposes_three_tokens(self):
+        args = _tiny_args(block_size=7)
+        model = KimiK3DSparkModel(args)
+        embedding = nn.Embedding(args.vocab_size, args.hidden_size)
+        vocab_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        model.bind_target_modules(embedding, vocab_head)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            proposer = KimiK3DSparkProposer(
                 model,
-                verify_width=3,
+                verify_width=4,
                 screening_override=True,
             )
-        self.assertEqual(screening.proposal_count, 2)
-        self.assertEqual(screening.mode, "width3_screening_override")
-        self.assertEqual(len(caught), 1)
-        self.assertIn("gamma=7", str(caught[0].message))
+        context = proposer.make_context_cache()
+        taps = (
+            mx.ones((1, 3, args.hidden_size), dtype=mx.float32),
+            mx.full((1, 3, args.hidden_size), 0.5, dtype=mx.float32),
+        )
+        proposer.append_target_context(taps, 0, context, use_stacked_context_kv=False)
+        with patch.dict(os.environ, {DSPARK_PROPOSER_ENV: "1"}):
+            proposal = proposer.propose(1, context)
+        mx.eval(
+            proposal.tokens,
+            proposal.base_logits,
+            proposal.corrected_logits,
+            proposal.confidence_logits,
+        )
+
+        self.assertEqual(tuple(proposal.tokens.shape), (1, 3))
+        self.assertEqual(tuple(proposal.base_logits.shape), (1, 3, 16))
+        self.assertEqual(tuple(proposal.corrected_logits.shape), (1, 3, 16))
+        self.assertEqual(tuple(proposal.confidence_logits.shape), (1, 3))
+        self.assertEqual(proposal.verify_width, 4)
+        self.assertEqual(proposal.draft_block_width, 7)
+        self.assertEqual(proposal.mode, "width4_screening_override")
 
     def test_feature_gates_are_strict_and_default_off(self):
         with patch.dict(os.environ):
