@@ -25,11 +25,17 @@ from .kimi_k3_tuned_gather_qmv import (
     supports_tuned_gather_qmv,
     tuned_gather_qmv,
 )
+from .kimi_k3_width4_fused_expert import (
+    supports_width4_native_down_projection,
+    supports_width4_switch_situ,
+    width4_switch_glu_native_down,
+)
 
 FUSED_EXPERT_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERTS"
 FUSED_DOWN_REDUCE_ENV = "MLX_LM_KIMI_K3_FUSED_DOWN_REDUCE"
 FUSED_EXPERT_WIDTH2_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH2"
 FUSED_EXPERT_WIDTH3_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH3"
+FUSED_EXPERT_WIDTH4_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH4_EXACT"
 
 
 @partial(mx.compile, shapeless=False)
@@ -78,6 +84,31 @@ def _compiled_fused_switch_situ_decode_derived_bias(
         results_per_simdgroup=2,
         simdgroups=4,
         derive_bias=True,
+    )
+
+
+@partial(mx.compile, shapeless=False)
+def _compiled_width4_switch_glu_all_derived(
+    x: mx.array,
+    indices: mx.array,
+    up_weight: mx.array,
+    up_scales: mx.array,
+    up_biases: mx.array,
+    gate_weight: mx.array,
+    gate_scales: mx.array,
+    gate_biases: mx.array,
+    down_weight: mx.array,
+    down_scales: mx.array,
+    down_biases: mx.array,
+) -> mx.array:
+    return width4_switch_glu_native_down(
+        x,
+        indices,
+        (up_weight, up_scales, up_biases),
+        (gate_weight, gate_scales, gate_biases),
+        (down_weight, down_scales, down_biases),
+        front_results_per_simdgroup=8,
+        derive_front_bias=True,
     )
 
 
@@ -187,6 +218,16 @@ def fused_k3_expert_width3_enabled() -> bool:
     return os.environ.get(FUSED_EXPERT_WIDTH3_ENV, "0") == "1"
 
 
+@lru_cache(maxsize=1)
+def fused_k3_expert_width4_enabled() -> bool:
+    """Parse the independent fail-closed width-four selector."""
+
+    value = os.environ.get(FUSED_EXPERT_WIDTH4_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{FUSED_EXPERT_WIDTH4_ENV} must be exactly '0' or '1'")
+    return value == "1"
+
+
 def _fused_expert_width_enabled(x: mx.array) -> bool:
     if x.ndim != 3:
         return True
@@ -194,6 +235,8 @@ def _fused_expert_width_enabled(x: mx.array) -> bool:
         return fused_k3_expert_width2_enabled()
     if x.shape[-2] == 3:
         return fused_k3_expert_width3_enabled()
+    if x.shape[-2] == 4:
+        return fused_k3_expert_width4_enabled()
     return True
 
 
@@ -252,6 +295,23 @@ def maybe_fused_k3_switch_glu(
         return None
     if down[0].shape[0] != up[0].shape[0]:
         return None
+    if x.ndim == 3 and x.shape[-2] == 4:
+        if not supports_width4_switch_situ(x, indices, up, gate):
+            return None
+        derive_bias = derive_affine2_bias_enabled()
+        if not derive_bias or not _all_projections_support_derived_bias(
+            (
+                (switch_mlp.up_proj, up),
+                (switch_mlp.gate_proj, gate),
+                (switch_mlp.down_proj, down),
+            )
+        ):
+            return None
+        if not supports_width4_native_down_projection(indices, down):
+            return None
+        return _compiled_width4_switch_glu_all_derived(
+            x, indices, *up, *gate, *down
+        )
     if not supports_fused_switch_situ(x, indices, up, gate):
         return None
     derive_bias = derive_affine2_bias_enabled()
