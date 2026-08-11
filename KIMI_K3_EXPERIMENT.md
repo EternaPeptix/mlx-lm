@@ -69,6 +69,18 @@ single-batch, single-token, eager Metal execution with a populated cache and a
 full non-pipeline model. Compiled decode and asynchronous boundaries cannot be
 enabled together.
 
+`MLX_LM_KIMI_K3_ASYNC_DECODE_WIDTH3=1` is a separate strict opt-in for the
+width-three speculative verifier. It requires `laguna8`, hidden-state mode,
+projected KV, and ReplaySSM. Unlike the single-token path, MLX-LM does not
+submit work while the distributed verifier graph is being built. Callers must
+explicitly pass `defer_async_decode_boundaries=True` to either target-forward
+method; the immutable result then exposes the ordered hidden roots as
+`deferred_async_decode_states`. A distributed caller may submit those roots
+only after every rank has agreed that graph construction succeeded. Generic
+three-token forwards and prompt prefill retain the legacy path, and a requested
+deferred build outside a fresh authenticated width-three transaction fails
+closed.
+
 When compiled decode is enabled,
 `MLX_LM_KIMI_K3_COMPILED_DECODE_SEGMENTS` can select `all`, `none`, individual
 segment indices, or inclusive ranges such as `0-11,24`. Production Kimi K3

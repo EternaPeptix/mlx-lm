@@ -69,6 +69,7 @@ COMPILED_DECODE_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE"
 COMPILED_DECODE_SEGMENTS_ENV = "MLX_LM_KIMI_K3_COMPILED_DECODE_SEGMENTS"
 ASYNC_DECODE_BOUNDARIES_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES"
 ASYNC_DECODE_STATE_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE"
+ASYNC_DECODE_WIDTH3_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_WIDTH3"
 REPLAYSSM_SPECULATIVE_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
 BATCHED_REPLAYSSM_COMMIT_ENV = "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_COMMIT"
 BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV = (
@@ -2487,6 +2488,10 @@ class KimiK3TextModel(nn.Module):
             os.environ.get(ASYNC_DECODE_BOUNDARIES_ENV, "none"),
             len(self.layers),
         )
+        async_decode_width3 = os.environ.get(ASYNC_DECODE_WIDTH3_ENV, "0")
+        if async_decode_width3 not in {"0", "1"}:
+            raise ValueError(f"{ASYNC_DECODE_WIDTH3_ENV} must be exactly '0' or '1'")
+        self._async_decode_width3 = async_decode_width3 == "1"
         async_decode_state = os.environ.get(ASYNC_DECODE_STATE_ENV)
         if not self._async_decode_boundaries and async_decode_state is not None:
             raise ValueError(
@@ -2495,6 +2500,31 @@ class KimiK3TextModel(nn.Module):
         self._async_decode_state = async_decode_state or "residual"
         if self._async_decode_state not in {"hidden", "residual"}:
             raise ValueError(f"{ASYNC_DECODE_STATE_ENV} must be 'hidden' or 'residual'")
+        if self._async_decode_width3:
+            boundary_selector = os.environ.get(
+                ASYNC_DECODE_BOUNDARIES_ENV,
+                "none",
+            ).strip().lower()
+            if boundary_selector != "laguna8":
+                raise ValueError(
+                    f"{ASYNC_DECODE_WIDTH3_ENV}=1 requires "
+                    f"{ASYNC_DECODE_BOUNDARIES_ENV}=laguna8"
+                )
+            if self._async_decode_state != "hidden":
+                raise ValueError(
+                    f"{ASYNC_DECODE_WIDTH3_ENV}=1 requires "
+                    f"{ASYNC_DECODE_STATE_ENV}=hidden"
+                )
+            if not _projected_kv_cache_requested():
+                raise ValueError(
+                    f"{ASYNC_DECODE_WIDTH3_ENV}=1 requires "
+                    f"{PROJECTED_KV_CACHE_ENV}=1"
+                )
+            if not replayssm_speculative_enabled():
+                raise ValueError(
+                    f"{ASYNC_DECODE_WIDTH3_ENV}=1 requires "
+                    f"{REPLAYSSM_SPECULATIVE_ENV}=1"
+                )
         if self._compiled_decode_enabled and self._async_decode_boundaries:
             raise ValueError(
                 f"{ASYNC_DECODE_BOUNDARIES_ENV} cannot be combined with "
@@ -2525,6 +2555,7 @@ class KimiK3TextModel(nn.Module):
         ssm_mask: Optional[mx.array],
         active_layers: List[KimiK3DecoderLayer],
     ) -> bool:
+        query_length = h.shape[1] if h.ndim == 3 else 0
         if (
             not self._async_decode_boundaries
             or self._compiled_decode_enabled
@@ -2533,7 +2564,9 @@ class KimiK3TextModel(nn.Module):
             or mx.default_device() != mx.gpu
             or h.ndim != 3
             or h.shape[0] != 1
-            or h.shape[1] != 1
+            or query_length not in {1, 3}
+            or (query_length == 3 and not self._async_decode_width3)
+            or (query_length == 3 and self._async_decode_state != "hidden")
             or ssm_mask is not None
             or self.pipeline_size != 1
             or self.start_idx != 0
@@ -2543,6 +2576,10 @@ class KimiK3TextModel(nn.Module):
         ):
             return False
 
+        width3_transaction_token: Optional[object] = None
+        saw_width3_kda = False
+        saw_width3_mla = False
+        width3_mla_offset: Optional[int] = None
         for layer, layer_cache in zip(active_layers, cache, strict=True):
             if layer_cache is None:
                 return False
@@ -2553,11 +2590,43 @@ class KimiK3TextModel(nn.Module):
                     or layer_cache[1] is None
                 ):
                     return False
+                if query_length == 3 and (
+                    not isinstance(layer_cache, ArraysCache)
+                    or layer_cache.speculative_width != 3
+                    or layer_cache.speculative_ready
+                    or layer_cache._speculative_initial_state is None
+                ):
+                    return False
+                saw_width3_kda = saw_width3_kda or query_length == 3
             elif (
                 getattr(layer_cache, "keys", None) is None
                 or getattr(layer_cache, "values", None) is None
             ):
                 return False
+            elif query_length == 3 and (
+                not isinstance(layer_cache, KimiK3ProjectedKVCache)
+                or layer_cache._projected_transaction_token is None
+                or layer_cache._projected_transaction_width != 3
+                or layer_cache.offset <= 0
+            ):
+                return False
+            elif query_length == 3:
+                token = layer_cache._projected_transaction_token
+                if width3_transaction_token is None:
+                    width3_transaction_token = token
+                    width3_mla_offset = int(layer_cache.offset)
+                elif (
+                    token is not width3_transaction_token
+                    or layer_cache.offset != width3_mla_offset
+                ):
+                    return False
+                saw_width3_mla = True
+        if query_length == 3 and (
+            not saw_width3_kda
+            or not saw_width3_mla
+            or width3_transaction_token is None
+        ):
+            return False
         return True
 
     def _submit_async_decode_boundary(
@@ -2960,7 +3029,12 @@ class KimiK3TextModel(nn.Module):
         cache: Optional[List[Any]] = None,
         *,
         aux_hidden_state_layer_ids: Optional[Tuple[int, ...]] = None,
-    ) -> Union[mx.array, Tuple[mx.array, Tuple[mx.array, ...]]]:
+        defer_width3_async_boundaries: bool = False,
+    ) -> Union[
+        mx.array,
+        Tuple[mx.array, Tuple[mx.array, ...]],
+        Tuple[mx.array, Tuple[mx.array, ...], Tuple[mx.array, ...]],
+    ]:
         capture_layer_ids = _validate_aux_hidden_state_layer_ids(
             aux_hidden_state_layer_ids,
             len(self.layers),
@@ -3013,12 +3087,32 @@ class KimiK3TextModel(nn.Module):
             else:
                 h = mx.distributed.recv_like(h, src)
 
-        submit_async_boundaries = self._async_decode_boundary_eligible(
+        async_boundaries_eligible = self._async_decode_boundary_eligible(
             h,
             cache,
             ssm_mask,
             active_layers,
         )
+        submit_async_boundaries = async_boundaries_eligible and h.shape[1] == 1
+        capture_async_boundaries = (
+            async_boundaries_eligible
+            and h.shape[1] == 3
+            and defer_width3_async_boundaries
+        )
+        if defer_width3_async_boundaries and (
+            h.shape[1] != 3 or not self._async_decode_width3
+        ):
+            raise RuntimeError(
+                "Kimi K3 deferred async-boundary capture requires the explicit "
+                "width-three selector and an exact width-three forward"
+            )
+        width3_capture_requested = defer_width3_async_boundaries
+        if width3_capture_requested and not capture_async_boundaries:
+            raise RuntimeError(
+                "Kimi K3 width-three async-boundary capture was requested "
+                "outside its exact speculative transaction geometry"
+            )
+        deferred_async_decode_states = []
         aux_hidden_states = []
         for layer_idx, (layer, layer_cache) in enumerate(
             zip(active_layers, cache, strict=True),
@@ -3030,8 +3124,15 @@ class KimiK3TextModel(nn.Module):
                 # DSpark/DFlash target ids use the Hugging Face convention:
                 # capture the residual stream after target layer ``layer_idx``.
                 aux_hidden_states.append(h)
-            if submit_async_boundaries and layer_idx in self._async_decode_boundaries:
-                self._submit_async_decode_boundary(h, blocks)
+            if layer_idx in self._async_decode_boundaries:
+                if submit_async_boundaries:
+                    self._submit_async_decode_boundary(h, blocks)
+                elif capture_async_boundaries:
+                    # EXO builds the width-three graph before the ranks agree
+                    # that it is safe to enter TP collectives. Retain these
+                    # hidden roots without submitting them; the post-agreement
+                    # materializer owns their eventual async evaluation.
+                    deferred_async_decode_states.append(h)
 
         if pipeline_rank != 0:
             dst = pipeline_rank - 1
@@ -3063,6 +3164,20 @@ class KimiK3TextModel(nn.Module):
             h = mx.distributed.all_gather(h.astype(boundary_dtype))[: h.shape[0]]
 
         h = self.norm(h)
+        if defer_width3_async_boundaries:
+            if capture_layer_ids and len(aux_hidden_states) != len(capture_layer_ids):
+                raise RuntimeError("Kimi K3 auxiliary hidden capture is incomplete")
+            if capture_async_boundaries and len(deferred_async_decode_states) != len(
+                self._async_decode_boundaries
+            ):
+                raise RuntimeError(
+                    "Kimi K3 deferred async-boundary capture is incomplete"
+                )
+            return (
+                h,
+                tuple(aux_hidden_states),
+                tuple(deferred_async_decode_states),
+            )
         if capture_layer_ids:
             if len(aux_hidden_states) != len(capture_layer_ids):
                 raise RuntimeError("Kimi K3 auxiliary hidden capture is incomplete")
@@ -3343,6 +3458,7 @@ class KimiK3TargetForward:
 
     logits: mx.array
     aux_hidden_states: Tuple[mx.array, ...]
+    deferred_async_decode_states: Tuple[mx.array, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3351,6 +3467,7 @@ class KimiK3TargetGreedyForward:
 
     tokens: mx.array
     aux_hidden_states: Tuple[mx.array, ...]
+    deferred_async_decode_states: Tuple[mx.array, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3388,15 +3505,23 @@ class LanguageModel(nn.Module):
         inputs: mx.array,
         cache: Optional[List[Any]],
         layer_ids: Tuple[int, ...],
+        *,
+        defer_async_decode_boundaries: bool = False,
     ) -> KimiK3TargetForward:
         result = self.model(
             inputs,
             cache,
             aux_hidden_state_layer_ids=layer_ids,
+            defer_width3_async_boundaries=defer_async_decode_boundaries,
         )
-        if not isinstance(result, tuple):
+        expected_size = 3 if defer_async_decode_boundaries else 2
+        if not isinstance(result, tuple) or len(result) != expected_size:
             raise RuntimeError("Kimi K3 target did not return auxiliary states")
-        out, aux_hidden_states = result
+        if defer_async_decode_boundaries:
+            out, aux_hidden_states, deferred_async_decode_states = result
+        else:
+            out, aux_hidden_states = result
+            deferred_async_decode_states = ()
         logits = (
             self.model.embed_tokens.as_linear(out)
             if self.lm_head is None
@@ -3405,6 +3530,7 @@ class LanguageModel(nn.Module):
         return KimiK3TargetForward(
             logits=logits,
             aux_hidden_states=aux_hidden_states,
+            deferred_async_decode_states=deferred_async_decode_states,
         )
 
     def forward_aux_hidden_states_for_cache(
@@ -3431,7 +3557,7 @@ class LanguageModel(nn.Module):
             cache,
             aux_hidden_state_layer_ids=layer_ids,
         )
-        if not isinstance(result, tuple):
+        if not isinstance(result, tuple) or len(result) != 2:
             raise RuntimeError("Kimi K3 target did not return auxiliary states")
         out, aux_hidden_states = result
         return KimiK3AuxPrefill(
@@ -3445,6 +3571,8 @@ class LanguageModel(nn.Module):
         cache: Optional[List[Any]],
         layer_ids: Tuple[int, ...],
         banned_token_ids: Tuple[int, ...] = (),
+        *,
+        defer_async_decode_boundaries: bool = False,
     ) -> KimiK3TargetGreedyForward:
         """Verify a greedy block without reconstructing full-vocabulary logits."""
 
@@ -3454,10 +3582,16 @@ class LanguageModel(nn.Module):
             inputs,
             cache,
             aux_hidden_state_layer_ids=layer_ids,
+            defer_width3_async_boundaries=defer_async_decode_boundaries,
         )
-        if not isinstance(result, tuple):
+        expected_size = 3 if defer_async_decode_boundaries else 2
+        if not isinstance(result, tuple) or len(result) != expected_size:
             raise RuntimeError("Kimi K3 target did not return auxiliary states")
-        out, aux_hidden_states = result
+        if defer_async_decode_boundaries:
+            out, aux_hidden_states, deferred_async_decode_states = result
+        else:
+            out, aux_hidden_states = result
+            deferred_async_decode_states = ()
         if out.ndim != 3:
             raise RuntimeError("Kimi K3 target hidden states must have rank three")
         tokens = self.lm_head.greedy_token(
@@ -3467,6 +3601,7 @@ class LanguageModel(nn.Module):
         return KimiK3TargetGreedyForward(
             tokens=tokens,
             aux_hidden_states=aux_hidden_states,
+            deferred_async_decode_states=deferred_async_decode_states,
         )
 
     def supports_vocab_parallel_greedy(self) -> bool:
@@ -4136,11 +4271,14 @@ class Model(nn.Module):
         inputs: mx.array,
         cache: Optional[List[Any]],
         layer_ids: Tuple[int, ...],
+        *,
+        defer_async_decode_boundaries: bool = False,
     ) -> KimiK3TargetForward:
         return self.language_model.forward_with_aux_hidden_states(
             inputs,
             cache,
             layer_ids,
+            defer_async_decode_boundaries=defer_async_decode_boundaries,
         )
 
     def forward_aux_hidden_states_for_cache(
@@ -4161,12 +4299,15 @@ class Model(nn.Module):
         cache: Optional[List[Any]],
         layer_ids: Tuple[int, ...],
         banned_token_ids: Tuple[int, ...] = (),
+        *,
+        defer_async_decode_boundaries: bool = False,
     ) -> KimiK3TargetGreedyForward:
         return self.language_model.forward_with_aux_hidden_states_greedy(
             inputs,
             cache,
             layer_ids,
             banned_token_ids,
+            defer_async_decode_boundaries=defer_async_decode_boundaries,
         )
 
     def supports_vocab_parallel_greedy(self) -> bool:

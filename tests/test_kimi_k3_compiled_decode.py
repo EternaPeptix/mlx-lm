@@ -132,6 +132,53 @@ def _assert_cache_equal(test, left, right):
             test.fail(f"Unsupported cache type in equality helper: {type(lhs)}")
 
 
+def _assert_closed_speculative_cache_equal(test, left, right):
+    test.assertEqual([type(entry) for entry in left], [type(entry) for entry in right])
+    for lhs, rhs in zip(left, right, strict=True):
+        if isinstance(lhs, kimi_k3.ArraysCache):
+            _assert_tree_equal(test, lhs.cache, rhs.cache)
+            _assert_optional_array_equal(test, lhs.lengths, rhs.lengths)
+            _assert_optional_array_equal(test, lhs.left_padding, rhs.left_padding)
+            test.assertEqual(lhs.speculative_width, rhs.speculative_width)
+            test.assertEqual(lhs.speculative_width, 0)
+            test.assertEqual(lhs.speculative_ready, rhs.speculative_ready)
+            test.assertFalse(lhs.speculative_ready)
+            test.assertIsNone(lhs._speculative_initial_state)
+            test.assertIsNone(rhs._speculative_initial_state)
+        elif isinstance(lhs, kimi_k3.KVCache):
+            test.assertEqual(lhs.offset, rhs.offset)
+            _assert_tree_equal(test, lhs.state, rhs.state)
+            if not isinstance(lhs, kimi_k3.KimiK3ProjectedKVCache):
+                continue
+            test.assertEqual(lhs.projected_capacity, rhs.projected_capacity)
+            test.assertEqual(
+                lhs.projected_valid_offset,
+                rhs.projected_valid_offset,
+            )
+            test.assertEqual(lhs.projected_owner_id, rhs.projected_owner_id)
+            test.assertIsNone(lhs._projected_transaction_token)
+            test.assertIsNone(rhs._projected_transaction_token)
+            test.assertEqual(lhs._projected_transaction_width, 0)
+            test.assertEqual(rhs._projected_transaction_width, 0)
+            if lhs.projected_keys is None or rhs.projected_keys is None:
+                test.assertIs(lhs.projected_keys, rhs.projected_keys)
+                test.assertIs(lhs.projected_values, rhs.projected_values)
+            else:
+                valid = lhs.projected_valid_offset
+                _assert_optional_array_equal(
+                    test,
+                    lhs.projected_keys[..., :valid, :],
+                    rhs.projected_keys[..., :valid, :],
+                )
+                _assert_optional_array_equal(
+                    test,
+                    lhs.projected_values[..., :valid, :],
+                    rhs.projected_values[..., :valid, :],
+                )
+        else:
+            test.fail(f"Unsupported cache type in equality helper: {type(lhs)}")
+
+
 class TestKimiK3CompiledDecodeSelector(unittest.TestCase):
     def test_selector_accepts_all_none_indices_and_inclusive_ranges(self):
         parse = kimi_k3._parse_compiled_decode_segments
@@ -721,6 +768,10 @@ class TestKimiK3AsyncDecodeBoundaries(unittest.TestCase):
             {
                 kimi_k3.COMPILED_DECODE_ENV: "0",
                 kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "none",
+                kimi_k3.ASYNC_DECODE_WIDTH3_ENV: "0",
+                kimi_k3.PROJECTED_KV_CACHE_ENV: "1",
+                kimi_k3.REPLAYSSM_SPECULATIVE_ENV: "1",
+                kimi_k3.BATCHED_REPLAYSSM_COMMIT_ENV: "0",
                 "MLX_LM_KIMI_K3_FUSED_EXPERTS": "0",
             },
             clear=False,
@@ -731,6 +782,18 @@ class TestKimiK3AsyncDecodeBoundaries(unittest.TestCase):
     def tearDown(self):
         kimi_k3.fused_k3_experts_enabled.cache_clear()
         self._env.stop()
+
+    def _make_width_three_model(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "laguna8",
+                kimi_k3.ASYNC_DECODE_STATE_ENV: "hidden",
+                kimi_k3.ASYNC_DECODE_WIDTH3_ENV: "1",
+            },
+            clear=False,
+        ):
+            return _make_model()
 
     def test_boundaries_are_snapshotted_and_conflicts_fail_closed(self):
         with mock.patch.dict(
@@ -758,6 +821,39 @@ class TestKimiK3AsyncDecodeBoundaries(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 _make_model()
+
+    def test_width_three_selector_is_strict_snapshotted_and_laguna_hidden_only(self):
+        valid = {
+            kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "laguna8",
+            kimi_k3.ASYNC_DECODE_STATE_ENV: "hidden",
+            kimi_k3.ASYNC_DECODE_WIDTH3_ENV: "1",
+        }
+        with mock.patch.dict(os.environ, valid, clear=False):
+            model = _make_model()
+        self.assertTrue(model.model._async_decode_width3)
+        self.assertEqual(model.model._async_decode_state, "hidden")
+        self.assertEqual(model.model._async_decode_boundaries, frozenset((1,)))
+
+        with mock.patch.dict(
+            os.environ,
+            {kimi_k3.ASYNC_DECODE_WIDTH3_ENV: "0"},
+            clear=False,
+        ):
+            self.assertTrue(model.model._async_decode_width3)
+
+        invalid_environments = (
+            {**valid, kimi_k3.ASYNC_DECODE_WIDTH3_ENV: "true"},
+            {**valid, kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "1,5"},
+            {**valid, kimi_k3.ASYNC_DECODE_STATE_ENV: "residual"},
+            {**valid, kimi_k3.PROJECTED_KV_CACHE_ENV: "0"},
+            {**valid, kimi_k3.REPLAYSSM_SPECULATIVE_ENV: "0"},
+            {**valid, kimi_k3.COMPILED_DECODE_ENV: "1"},
+        )
+        for environment in invalid_environments:
+            with self.subTest(environment=environment):
+                with mock.patch.dict(os.environ, environment, clear=False):
+                    with self.assertRaises(ValueError):
+                        _make_model()
 
         with mock.patch.dict(
             os.environ,
@@ -823,6 +919,342 @@ class TestKimiK3AsyncDecodeBoundaries(unittest.TestCase):
                 layers,
             )
         )
+
+    def test_width_three_guard_requires_fresh_authenticated_transaction(self):
+        model = self._make_width_three_model()
+        text_model = model.model
+        cache = _warm_cache(model)
+        layers = text_model.layers
+        h3 = text_model.embed_tokens(mx.array([[17, 23, 29]], dtype=mx.int32))
+
+        self.assertFalse(
+            text_model._async_decode_boundary_eligible(h3, cache, None, layers)
+        )
+        self.assertFalse(
+            text_model._async_decode_boundary_eligible(
+                text_model.embed_tokens(mx.array([[17, 23]], dtype=mx.int32)),
+                cache,
+                None,
+                layers,
+            )
+        )
+        self.assertFalse(
+            text_model._async_decode_boundary_eligible(
+                h3,
+                model.make_cache(),
+                None,
+                layers,
+            )
+        )
+
+        transaction = model.begin_speculative_cache(cache, 3)
+        try:
+            self.assertTrue(
+                text_model._async_decode_boundary_eligible(h3, cache, None, layers)
+            )
+            self.assertFalse(
+                text_model._async_decode_boundary_eligible(
+                    h3,
+                    cache,
+                    mx.ones((3, 3), dtype=mx.bool_),
+                    layers,
+                )
+            )
+
+            text_model._async_decode_state = "residual"
+            self.assertFalse(
+                text_model._async_decode_boundary_eligible(h3, cache, None, layers)
+            )
+            text_model._async_decode_state = "hidden"
+
+            text_model.pipeline_size = 2
+            self.assertFalse(
+                text_model._async_decode_boundary_eligible(h3, cache, None, layers)
+            )
+            text_model.pipeline_size = 1
+
+            text_model.train()
+            self.assertFalse(
+                text_model._async_decode_boundary_eligible(h3, cache, None, layers)
+            )
+            text_model.eval()
+        finally:
+            model.cancel_speculative_cache(transaction)
+
+    def test_width_three_build_defers_boundaries_and_resolve_is_exact(self):
+        model = self._make_width_three_model()
+        base_cache = _warm_cache(model)
+        inputs = mx.array([[17, 23, 29]], dtype=mx.int32)
+        layer_ids = (0, 3)
+
+        for consumed in (1, 2, 3):
+            with self.subTest(consumed=consumed):
+                control_cache = copy.deepcopy(base_cache)
+                deferred_cache = copy.deepcopy(base_cache)
+
+                control_transaction = model.begin_speculative_cache(control_cache, 3)
+                control = model.forward_with_aux_hidden_states(
+                    inputs,
+                    control_cache,
+                    layer_ids,
+                )
+                self.assertEqual(control.deferred_async_decode_states, ())
+                mx.eval(
+                    control.logits,
+                    control.aux_hidden_states,
+                    [entry.state for entry in control_cache],
+                )
+                model.resolve_speculative_cache(control_transaction, consumed)
+
+                deferred_transaction = model.begin_speculative_cache(deferred_cache, 3)
+                with mock.patch.object(
+                    mx,
+                    "async_eval",
+                    wraps=mx.async_eval,
+                ) as async_eval:
+                    deferred = model.forward_with_aux_hidden_states(
+                        inputs,
+                        deferred_cache,
+                        layer_ids,
+                        defer_async_decode_boundaries=True,
+                    )
+                async_eval.assert_not_called()
+                self.assertEqual(
+                    len(deferred.deferred_async_decode_states),
+                    len(model.model._async_decode_boundaries),
+                )
+                with mock.patch.object(
+                    mx,
+                    "async_eval",
+                    wraps=mx.async_eval,
+                ) as second_async_eval:
+                    with self.assertRaisesRegex(RuntimeError, "transaction geometry"):
+                        model.forward_with_aux_hidden_states(
+                            inputs,
+                            deferred_cache,
+                            layer_ids,
+                            defer_async_decode_boundaries=True,
+                        )
+                second_async_eval.assert_not_called()
+                self.assertEqual(
+                    model.model._async_decode_boundaries,
+                    frozenset((1,)),
+                )
+                for state in deferred.deferred_async_decode_states:
+                    self.assertIsInstance(state, mx.array)
+                    self.assertEqual(state.shape, (1, 3, 64))
+                    mx.async_eval(state)
+                mx.eval(
+                    deferred.logits,
+                    deferred.aux_hidden_states,
+                    [entry.state for entry in deferred_cache],
+                )
+                model.resolve_speculative_cache(deferred_transaction, consumed)
+
+                self.assertTrue(
+                    mx.array_equal(control.logits, deferred.logits).item()
+                )
+                _assert_tree_equal(
+                    self,
+                    control.aux_hidden_states,
+                    deferred.aux_hidden_states,
+                )
+                _assert_closed_speculative_cache_equal(
+                    self,
+                    control_cache,
+                    deferred_cache,
+                )
+
+    def test_width_three_cancel_restores_full_cache_without_build_submission(self):
+        model = self._make_width_three_model()
+        base_cache = _warm_cache(model)
+        candidate_cache = copy.deepcopy(base_cache)
+        transaction = model.begin_speculative_cache(candidate_cache, 3)
+
+        with mock.patch.object(mx, "async_eval", wraps=mx.async_eval) as async_eval:
+            candidate = model.forward_with_aux_hidden_states(
+                mx.array([[31, 37, 41]], dtype=mx.int32),
+                candidate_cache,
+                (0, 3),
+                defer_async_decode_boundaries=True,
+            )
+        async_eval.assert_not_called()
+        self.assertEqual(len(candidate.deferred_async_decode_states), 1)
+        model.cancel_speculative_cache(transaction)
+        _assert_closed_speculative_cache_equal(self, base_cache, candidate_cache)
+
+    def test_width_three_compact_greedy_surfaces_same_deferred_contract(self):
+        model = self._make_width_three_model()
+        base_cache = _warm_cache(model)
+        original_head = model.language_model.lm_head
+
+        class FakeVocabParallelHead:
+            def __init__(self, head):
+                self.head = head
+
+            def greedy_token(self, hidden, *, banned_token_ids=()):
+                logits = self.head(hidden)
+                for token_id in banned_token_ids:
+                    logits[..., token_id] = float("-inf")
+                return mx.argmax(logits, axis=-1).astype(mx.uint32)
+
+        try:
+            with mock.patch.object(
+                kimi_k3,
+                "VocabParallelHead",
+                FakeVocabParallelHead,
+            ):
+                model.language_model.lm_head = FakeVocabParallelHead(original_head)
+                for consumed in (1, 2, 3):
+                    with self.subTest(consumed=consumed):
+                        control_cache = copy.deepcopy(base_cache)
+                        deferred_cache = copy.deepcopy(base_cache)
+                        control_transaction = model.begin_speculative_cache(
+                            control_cache,
+                            3,
+                        )
+                        control = model.forward_with_aux_hidden_states_greedy(
+                            mx.array([[43, 47, 53]], dtype=mx.int32),
+                            control_cache,
+                            (0, 3),
+                        )
+                        self.assertEqual(control.deferred_async_decode_states, ())
+                        mx.eval(
+                            control.tokens,
+                            control.aux_hidden_states,
+                            [entry.state for entry in control_cache],
+                        )
+                        model.resolve_speculative_cache(
+                            control_transaction,
+                            consumed,
+                        )
+
+                        deferred_transaction = model.begin_speculative_cache(
+                            deferred_cache,
+                            3,
+                        )
+                        with mock.patch.object(
+                            mx,
+                            "async_eval",
+                            wraps=mx.async_eval,
+                        ) as async_eval:
+                            deferred = model.forward_with_aux_hidden_states_greedy(
+                                mx.array([[43, 47, 53]], dtype=mx.int32),
+                                deferred_cache,
+                                (0, 3),
+                                defer_async_decode_boundaries=True,
+                            )
+                        async_eval.assert_not_called()
+                        self.assertEqual(
+                            len(deferred.deferred_async_decode_states),
+                            1,
+                        )
+                        self.assertEqual(deferred.tokens.shape, (1, 3))
+                        for state in deferred.deferred_async_decode_states:
+                            mx.async_eval(state)
+                        mx.eval(
+                            deferred.tokens,
+                            deferred.aux_hidden_states,
+                            [entry.state for entry in deferred_cache],
+                        )
+                        model.resolve_speculative_cache(
+                            deferred_transaction,
+                            consumed,
+                        )
+
+                        self.assertTrue(
+                            mx.array_equal(control.tokens, deferred.tokens).item()
+                        )
+                        _assert_tree_equal(
+                            self,
+                            control.aux_hidden_states,
+                            deferred.aux_hidden_states,
+                        )
+                        _assert_closed_speculative_cache_equal(
+                            self,
+                            control_cache,
+                            deferred_cache,
+                        )
+        finally:
+            model.language_model.lm_head = original_head
+
+    def test_width_three_generic_prefill_is_unchanged_and_explicit_defer_rejects(self):
+        model = self._make_width_three_model()
+        cache = _warm_cache(model)
+        inputs = mx.array([[59, 61, 67]], dtype=mx.int32)
+
+        with mock.patch.object(mx, "async_eval", wraps=mx.async_eval) as async_eval:
+            generic = model.forward_with_aux_hidden_states(
+                inputs,
+                cache,
+                (0, 3),
+            )
+        async_eval.assert_not_called()
+        self.assertEqual(generic.deferred_async_decode_states, ())
+        mx.eval(
+            generic.logits,
+            generic.aux_hidden_states,
+            [entry.state for entry in cache],
+        )
+
+        with mock.patch.object(mx, "async_eval", wraps=mx.async_eval) as async_eval:
+            with self.assertRaisesRegex(RuntimeError, "transaction geometry"):
+                model.forward_with_aux_hidden_states(
+                    inputs,
+                    cache,
+                    (0, 3),
+                    defer_async_decode_boundaries=True,
+                )
+        async_eval.assert_not_called()
+
+        with self.assertRaisesRegex(RuntimeError, "exact width-three forward"):
+            model.forward_with_aux_hidden_states(
+                mx.array([[71, 73]], dtype=mx.int32),
+                cache,
+                (0, 3),
+                defer_async_decode_boundaries=True,
+            )
+
+    def test_width_three_default_off_and_t1_direct_behavior_are_unchanged(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                kimi_k3.ASYNC_DECODE_BOUNDARIES_ENV: "laguna8",
+                kimi_k3.ASYNC_DECODE_STATE_ENV: "hidden",
+                kimi_k3.ASYNC_DECODE_WIDTH3_ENV: "0",
+            },
+            clear=False,
+        ):
+            model = _make_model()
+        cache = _warm_cache(model)
+        transaction = model.begin_speculative_cache(cache, 3)
+        with mock.patch.object(mx, "async_eval", wraps=mx.async_eval) as async_eval:
+            wide = model.forward_with_aux_hidden_states(
+                mx.array([[59, 61, 67]], dtype=mx.int32),
+                cache,
+                (0, 3),
+            )
+        async_eval.assert_not_called()
+        self.assertEqual(wide.deferred_async_decode_states, ())
+        with self.assertRaisesRegex(RuntimeError, "explicit width-three selector"):
+            model.forward_with_aux_hidden_states(
+                mx.array([[59, 61, 67]], dtype=mx.int32),
+                cache,
+                (0, 3),
+                defer_async_decode_boundaries=True,
+            )
+        model.cancel_speculative_cache(transaction)
+
+        t1_cache = _warm_cache(model)
+        with mock.patch.object(mx, "async_eval", wraps=mx.async_eval) as async_eval:
+            t1 = model.forward_with_aux_hidden_states(
+                mx.array([[71]], dtype=mx.int32),
+                t1_cache,
+                (0, 3),
+            )
+        self.assertEqual(async_eval.call_count, 1)
+        self.assertEqual(t1.deferred_async_decode_states, ())
+        mx.eval(t1.logits, t1.aux_hidden_states, [entry.state for entry in t1_cache])
 
     def test_boundaries_preserve_exact_logits_and_cache(self):
         model = _make_model()
