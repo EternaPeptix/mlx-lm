@@ -6,8 +6,17 @@ Date: 2026-08-13
 
 This revision supersedes the non-transactional receipt in `03b2690`. It adds
 opt-in, process-local evidence instrumentation to the exact Kimi K3 width-four
-fused-expert adapter. It does not alter the selected kernel, synchronize Metal,
-print per-layer or per-token data, or claim a performance gain.
+fused-expert adapter. The instrumentation does not synchronize Metal or print
+per-layer or per-token data.
+
+It also repairs the full-checkpoint integration exposed by the first TP2
+service canary. Gate/up derived-bias validation remains strict, while the down
+projection now follows the model's existing selective contract: exact banks
+use the all-derived width-four reducer and non-exact banks use the same fused
+reducer with their authoritative stored down bias. Both are clean
+`switch_glu_reduce` dispatches; neither is a fallback. No Metal kernel changed,
+and the receipt schema and its prohibition on `switch_glu` fallback remain
+unchanged.
 
 The receipt is independently default-off. Set exactly:
 
@@ -88,11 +97,11 @@ No cluster hosts, network, model files, or service were used.
 Final source/test SHA-256 values:
 
 - `mlx_lm/models/kimi_k3_fused_expert.py`:
-  `3e5e45337d521bf4e8f5e4b2578ab75cffe40d4fd7af39387acfb4c4e87bc95d`;
+  `0b8eec17606b8a4fbd8c6656acbe085dd293436a33004c9282d8e549b8f2c66d`;
 - `mlx_lm/models/kimi_k3_width4_fused_expert.py`:
   `5e22a89e1c9b731eedfd342d6b18a3e3324574477e7991df8040658769e0a832`;
 - `tests/test_kimi_k3_width4_fused_expert.py`:
-  `35a97c379d604acc5479768b2c5ba2cee148aa4b91ba35185b44e77eaa279c23`.
+  `179342d5111ae0b6c60d97b9b6d9862b74a919d44af73ea00dbfcf735b5137fe`.
 
 ## Verification
 
@@ -122,6 +131,11 @@ width-four compiled reduce adapter against the stock graph with bit-exact BF16
 output and terminal totals `1 attempted / 1 supported / 1 dispatched / 0
 fallback / 0 error`. The width-one-through-three regressions also passed,
 preserving the Config-B path.
+
+After the selective-down repair, the complete `test_kimi_k3*.py` family passes
+with the sealed native runtime: **307 passed, 2 expected skips, 336 subtests**.
+The width-four file alone passes **19 tests and 16 subtests**, including a real
+Metal, bit-exact stored-down reducer comparison and a clean schema-v3 receipt.
 
 Static verification:
 

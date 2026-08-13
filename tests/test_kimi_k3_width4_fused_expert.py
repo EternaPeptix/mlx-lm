@@ -178,6 +178,7 @@ class _ProjectionStub:
         self.weight = _ArrayStub(shape)
         self.scales = _ArrayStub(shape)
         self.biases = _ArrayStub(shape)
+        self._k3_affine2_derived_bias_validated = True
 
     def __contains__(self, name):
         return False
@@ -485,6 +486,84 @@ class Width4AdapterRoutingTest(unittest.TestCase):
                 DERIVE_AFFINE2_BIAS_ENV: "1",
             },
         )
+
+    def test_dispatch_receipt_accepts_selective_stored_down_path(self):
+        self._enable_all()
+        self._enable_receipt()
+        self.switch.down_proj._k3_affine2_derived_bias_validated = False
+        sentinel = object()
+        front_patch, down_patch, bias_patch = self._adapter_patches()
+        with (
+            front_patch,
+            down_patch,
+            bias_patch,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+            ) as all_derived,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_stored_down",
+                return_value=sentinel,
+            ) as stored_down,
+        ):
+            result = maybe_fused_k3_switch_glu_reduce(
+                self.switch,
+                self.x,
+                self.indices,
+                self.router_weights,
+            )
+
+        self.assertIs(result, sentinel)
+        all_derived.assert_not_called()
+        stored_down.assert_called_once()
+        receipt = snapshot_k3_width4_dispatch_receipt()
+        self.assertEqual(
+            receipt["totals"],
+            {
+                "attempted": 1,
+                "supported": 1,
+                "dispatched": 1,
+                "fallback": 0,
+                "error": 0,
+            },
+        )
+        self.assertFalse(any(receipt["paths"]["switch_glu"].values()))
+        self.assertEqual(receipt["fallback_reason_classes"], {})
+
+    def test_invalid_gate_metadata_remains_fail_closed(self):
+        self._enable_all()
+        self.switch.gate_proj._k3_affine2_derived_bias_validated = False
+        with (
+            mock.patch.object(
+                fused_expert_adapter,
+                "supports_width4_switch_situ",
+                return_value=True,
+            ),
+            mock.patch.object(
+                fused_expert_adapter,
+                "supports_width4_down_reduce_projection",
+                return_value=True,
+            ),
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+            ) as all_derived,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_stored_down",
+            ) as stored_down,
+        ):
+            self.assertIsNone(
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch,
+                    self.x,
+                    self.indices,
+                    self.router_weights,
+                )
+            )
+        all_derived.assert_not_called()
+        stored_down.assert_not_called()
 
     def test_dispatch_receipt_classifies_unsupported_fallback(self):
         self._enable_all()
@@ -889,6 +968,103 @@ class Width4KernelTest(unittest.TestCase):
                 "error": 0,
             },
         )
+
+    def test_reduce_adapter_stored_down_dispatch_is_bit_exact(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        os.environ[FUSED_DOWN_REDUCE_ENV] = "1"
+        os.environ[FUSED_EXPERT_ENV] = "1"
+        os.environ[FUSED_EXPERT_WIDTH4_ENV] = "1"
+        os.environ[WIDTH4_DISPATCH_RECEIPT_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        fused_k3_down_reduce_enabled.cache_clear()
+        fused_k3_experts_enabled.cache_clear()
+        fused_k3_expert_width4_enabled.cache_clear()
+        k3_width4_dispatch_receipt_enabled.cache_clear()
+        reset_k3_width4_dispatch_receipt()
+
+        down = self.switch.down_proj
+        original_biases = down.biases
+        marker_name = "_k3_affine2_derived_bias_validated"
+        marker_missing = object()
+        original_marker = getattr(down, marker_name, marker_missing)
+        try:
+            down.biases = mx.contiguous(
+                original_biases + mx.array(1 / 256, dtype=mx.bfloat16)
+            )
+            setattr(down, marker_name, False)
+            mx.eval(down.biases)
+            router_weights = mx.random.uniform(
+                shape=(1, K3_WIDTH4, K3_TOP_K),
+                dtype=mx.bfloat16,
+            )
+            expanded = mx.expand_dims(self.x, (-2, -3))
+            up = _qmm(expanded, self.indices, self.switch.up_proj).astype(mx.float32)
+            gate = _qmm(expanded, self.indices, self.switch.gate_proj).astype(
+                mx.float32
+            )
+            activated = (
+                4.0
+                * mx.tanh(gate / 4.0)
+                * mx.sigmoid(gate)
+                * (25.0 * mx.tanh(up / 25.0))
+            ).astype(mx.bfloat16)
+            stored_down = mx.gather_qmm(
+                activated,
+                down.weight,
+                down.scales,
+                down.biases,
+                rhs_indices=self.indices,
+                transpose=True,
+                group_size=128,
+                bits=2,
+                mode="affine",
+            ).squeeze(-2)
+            reference = (stored_down * router_weights[..., None]).sum(axis=-2)
+
+            original = (
+                fused_expert_adapter._compiled_width4_switch_glu_reduce_stored_down
+            )
+            with (
+                mock.patch.object(
+                    fused_expert_adapter,
+                    "_compiled_width4_switch_glu_reduce_all_derived",
+                ) as all_derived,
+                mock.patch.object(
+                    fused_expert_adapter,
+                    "_compiled_width4_switch_glu_reduce_stored_down",
+                    wraps=original,
+                ) as dispatch,
+            ):
+                candidate = maybe_fused_k3_switch_glu_reduce(
+                    self.switch,
+                    self.x,
+                    self.indices,
+                    router_weights,
+                )
+            self.assertIsNotNone(candidate)
+            all_derived.assert_not_called()
+            dispatch.assert_called_once()
+            mx.eval(reference, candidate)
+            self.assertTrue(
+                bool(
+                    mx.array_equal(
+                        reference.view(mx.uint8),
+                        candidate.view(mx.uint8),
+                    ).item()
+                )
+            )
+            receipt = snapshot_k3_width4_dispatch_receipt()
+            self.assertEqual(receipt["totals"]["fallback"], 0)
+            self.assertEqual(receipt["totals"]["error"], 0)
+            self.assertGreater(receipt["totals"]["dispatched"], 0)
+            self.assertFalse(any(receipt["paths"]["switch_glu"].values()))
+        finally:
+            down.biases = original_biases
+            if original_marker is marker_missing:
+                if hasattr(down, marker_name):
+                    delattr(down, marker_name)
+            else:
+                setattr(down, marker_name, original_marker)
 
 
 if __name__ == "__main__":
