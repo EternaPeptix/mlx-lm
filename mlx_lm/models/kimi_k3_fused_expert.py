@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from dataclasses import dataclass
 from functools import lru_cache, partial
 from threading import Lock
 from typing import Any
@@ -44,7 +45,13 @@ FUSED_EXPERT_WIDTH4_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERT_WIDTH4_EXACT"
 WIDTH4_DISPATCH_RECEIPT_ENV = "MLX_LM_KIMI_K3_WIDTH4_DISPATCH_RECEIPT"
 
 _WIDTH4_RECEIPT_PATHS = ("switch_glu", "switch_glu_reduce")
-_WIDTH4_RECEIPT_METRICS = ("attempted", "supported", "dispatched", "fallback")
+_WIDTH4_RECEIPT_METRICS = (
+    "attempted",
+    "supported",
+    "dispatched",
+    "fallback",
+    "error",
+)
 _WIDTH4_RECEIPT_SELECTOR_ENVS = (
     WIDTH4_DISPATCH_RECEIPT_ENV,
     FUSED_EXPERT_ENV,
@@ -52,15 +59,26 @@ _WIDTH4_RECEIPT_SELECTOR_ENVS = (
     FUSED_EXPERT_WIDTH4_ENV,
     DERIVE_AFFINE2_BIAS_ENV,
 )
+
+
+@dataclass(slots=True)
+class _Width4ReceiptAttempt:
+    path: str
+    selectors: tuple[tuple[str, str | None], ...]
+    committed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Width4TerminalRecord:
+    path: str
+    outcome: str
+    supported: bool
+    reason_class: str | None
+    selectors: tuple[tuple[str, str | None], ...]
+
+
 _width4_receipt_lock = Lock()
-_width4_receipt_totals: Counter[str] = Counter()
-_width4_receipt_paths: dict[str, Counter[str]] = {
-    path: Counter() for path in _WIDTH4_RECEIPT_PATHS
-}
-_width4_receipt_fallback_classes: Counter[str] = Counter()
-_width4_receipt_selector_states: Counter[
-    tuple[str, tuple[tuple[str, str | None], ...]]
-] = Counter()
+_width4_terminal_records: Counter[_Width4TerminalRecord] = Counter()
 
 
 @lru_cache(maxsize=1)
@@ -79,49 +97,57 @@ def _width4_receipt_selector_state() -> tuple[tuple[str, str | None], ...]:
     return tuple((name, os.environ.get(name)) for name in _WIDTH4_RECEIPT_SELECTOR_ENVS)
 
 
-def _begin_width4_dispatch_receipt(path: str, x: mx.array) -> bool:
-    """Start an aggregate receipt only for the exact width-four model path."""
+def _begin_width4_dispatch_receipt(
+    path: str,
+    x: mx.array,
+) -> _Width4ReceiptAttempt | None:
+    """Capture metadata for an exact width-four attempt without publishing it."""
 
     if x.ndim != 3 or x.shape[-2] != 4:
-        return False
+        return None
     if not k3_width4_dispatch_receipt_enabled():
-        return False
-    selector_state = _width4_receipt_selector_state()
-    with _width4_receipt_lock:
-        _width4_receipt_totals["attempted"] += 1
-        _width4_receipt_paths[path]["attempted"] += 1
-        _width4_receipt_selector_states[(path, selector_state)] += 1
-    return True
+        return None
+    return _Width4ReceiptAttempt(path, _width4_receipt_selector_state())
 
 
-def _record_width4_event(
-    path: str,
-    receipt_active: bool,
-    event: str,
-    fallback_class: str | None = None,
+def _commit_width4_dispatch_receipt(
+    attempt: _Width4ReceiptAttempt | None,
+    outcome: str,
+    *,
+    supported: bool,
+    reason_class: str | None = None,
 ) -> None:
-    if not receipt_active:
+    """Atomically publish exactly one terminal outcome for an attempt."""
+
+    if attempt is None:
         return
+    if outcome not in {"dispatched", "fallback", "error"}:
+        raise ValueError(f"invalid width-four receipt outcome: {outcome!r}")
+    if outcome == "dispatched" and (not supported or reason_class is not None):
+        raise ValueError("dispatched receipt must be supported and have no reason")
+    if outcome == "fallback" and (supported or reason_class is None):
+        raise ValueError("fallback receipt must be unsupported and have a reason")
+    if outcome == "error" and reason_class is None:
+        raise ValueError("error receipt must have a reason")
+    record = _Width4TerminalRecord(
+        path=attempt.path,
+        outcome=outcome,
+        supported=supported,
+        reason_class=reason_class,
+        selectors=attempt.selectors,
+    )
     with _width4_receipt_lock:
-        _width4_receipt_totals[event] += 1
-        _width4_receipt_paths[path][event] += 1
-        if fallback_class is not None:
-            _width4_receipt_fallback_classes[fallback_class] += 1
-
-
-def _clear_k3_width4_dispatch_receipt() -> None:
-    _width4_receipt_totals.clear()
-    for counts in _width4_receipt_paths.values():
-        counts.clear()
-    _width4_receipt_fallback_classes.clear()
-    _width4_receipt_selector_states.clear()
+        if attempt.committed:
+            raise RuntimeError("width-four receipt attempt is already terminal")
+        _width4_terminal_records[record] += 1
+        attempt.committed = True
 
 
 def reset_k3_width4_dispatch_receipt() -> None:
     """Reset the current process's aggregate width-four receipt counters."""
 
     with _width4_receipt_lock:
-        _clear_k3_width4_dispatch_receipt()
+        _width4_terminal_records.clear()
 
 
 def snapshot_k3_width4_dispatch_receipt() -> dict[str, Any]:
@@ -132,40 +158,66 @@ def snapshot_k3_width4_dispatch_receipt() -> dict[str, Any]:
     device execution without adding a receipt-specific synchronization point.
     """
 
-    enabled = k3_width4_dispatch_receipt_enabled()
-    current_selectors = dict(_width4_receipt_selector_state())
     with _width4_receipt_lock:
-        snapshot = {
-            "schema_version": 1,
-            "enabled": enabled,
-            "current_selectors": current_selectors,
-            "totals": {
-                metric: _width4_receipt_totals[metric]
-                for metric in _WIDTH4_RECEIPT_METRICS
-            },
-            "paths": {
-                path: {
-                    metric: _width4_receipt_paths[path][metric]
-                    for metric in _WIDTH4_RECEIPT_METRICS
-                }
-                for path in _WIDTH4_RECEIPT_PATHS
-            },
-            "fallback_reason_classes": dict(
-                sorted(_width4_receipt_fallback_classes.items())
-            ),
-            "selector_states": [
-                {
-                    "path": path,
-                    "attempted": count,
-                    "selectors": dict(selector_state),
-                }
-                for (path, selector_state), count in sorted(
-                    _width4_receipt_selector_states.items(),
-                    key=lambda item: repr(item[0]),
-                )
-            ],
-        }
-    return snapshot
+        terminal_records = tuple(_width4_terminal_records.items())
+
+    totals: Counter[str] = Counter()
+    paths = {path: Counter() for path in _WIDTH4_RECEIPT_PATHS}
+    fallback_classes: Counter[str] = Counter()
+    error_classes: Counter[str] = Counter()
+    selector_states: Counter[tuple[str, tuple[tuple[str, str | None], ...]]] = Counter()
+    for record, count in terminal_records:
+        totals["attempted"] += count
+        totals[record.outcome] += count
+        if record.supported:
+            totals["supported"] += count
+        paths[record.path]["attempted"] += count
+        paths[record.path][record.outcome] += count
+        if record.supported:
+            paths[record.path]["supported"] += count
+        if record.outcome == "fallback":
+            fallback_classes[record.reason_class] += count
+        elif record.outcome == "error":
+            error_classes[record.reason_class] += count
+        selector_states[(record.path, record.selectors)] += count
+
+    return {
+        "schema_version": 2,
+        "enabled": k3_width4_dispatch_receipt_enabled(),
+        "current_selectors": dict(_width4_receipt_selector_state()),
+        "totals": {metric: totals[metric] for metric in _WIDTH4_RECEIPT_METRICS},
+        "paths": {
+            path: {metric: paths[path][metric] for metric in _WIDTH4_RECEIPT_METRICS}
+            for path in _WIDTH4_RECEIPT_PATHS
+        },
+        "fallback_reason_classes": dict(sorted(fallback_classes.items())),
+        "error_reason_classes": dict(sorted(error_classes.items())),
+        "selector_states": [
+            {
+                "path": path,
+                "attempted": count,
+                "selectors": dict(selector_state),
+            }
+            for (path, selector_state), count in sorted(
+                selector_states.items(),
+                key=lambda item: repr(item[0]),
+            )
+        ],
+        "terminal_records": [
+            {
+                "path": record.path,
+                "outcome": record.outcome,
+                "supported": record.supported,
+                "reason_class": record.reason_class,
+                "selectors": dict(record.selectors),
+                "count": count,
+            }
+            for record, count in sorted(
+                terminal_records,
+                key=lambda item: repr(item[0]),
+            )
+        ],
+    }
 
 
 @partial(mx.compile, shapeless=False)
@@ -458,38 +510,59 @@ def maybe_fused_k3_switch_glu(
     if down[0].shape[0] != up[0].shape[0]:
         return None
     if x.ndim == 3 and x.shape[-2] == 4:
-        receipt_path = "switch_glu"
-        receipt_active = _begin_width4_dispatch_receipt(receipt_path, x)
-        if not supports_width4_switch_situ(x, indices, up, gate):
-            _record_width4_event(receipt_path, receipt_active, "fallback", "geometry")
-            return None
-        derive_bias = derive_affine2_bias_enabled()
-        if not derive_bias or not _all_projections_support_derived_bias(
-            (
-                (switch_mlp.up_proj, up),
-                (switch_mlp.gate_proj, gate),
-                (switch_mlp.down_proj, down),
+        attempt = _begin_width4_dispatch_receipt("switch_glu", x)
+        supported = False
+        try:
+            if not supports_width4_switch_situ(x, indices, up, gate):
+                _commit_width4_dispatch_receipt(
+                    attempt,
+                    "fallback",
+                    supported=False,
+                    reason_class="geometry",
+                )
+                return None
+            derive_bias = derive_affine2_bias_enabled()
+            if not derive_bias or not _all_projections_support_derived_bias(
+                (
+                    (switch_mlp.up_proj, up),
+                    (switch_mlp.gate_proj, gate),
+                    (switch_mlp.down_proj, down),
+                )
+            ):
+                reason = "selector" if not derive_bias else "metadata"
+                _commit_width4_dispatch_receipt(
+                    attempt,
+                    "fallback",
+                    supported=False,
+                    reason_class=reason,
+                )
+                return None
+            if not supports_width4_native_down_projection(indices, down):
+                _commit_width4_dispatch_receipt(
+                    attempt,
+                    "fallback",
+                    supported=False,
+                    reason_class="geometry",
+                )
+                return None
+            supported = True
+            output = _compiled_width4_switch_glu_all_derived(
+                x, indices, *up, *gate, *down
             )
-        ):
-            reason = "selector" if not derive_bias else "metadata"
-            _record_width4_event(
-                receipt_path,
-                receipt_active,
-                "fallback",
-                reason,
-            )
-            return None
-        if not supports_width4_native_down_projection(indices, down):
-            _record_width4_event(
-                receipt_path,
-                receipt_active,
-                "fallback",
-                "geometry",
-            )
-            return None
-        _record_width4_event(receipt_path, receipt_active, "supported")
-        output = _compiled_width4_switch_glu_all_derived(x, indices, *up, *gate, *down)
-        _record_width4_event(receipt_path, receipt_active, "dispatched")
+        except Exception as error:
+            if attempt is not None and not attempt.committed:
+                _commit_width4_dispatch_receipt(
+                    attempt,
+                    "error",
+                    supported=supported,
+                    reason_class=type(error).__name__,
+                )
+            raise
+        _commit_width4_dispatch_receipt(
+            attempt,
+            "dispatched",
+            supported=True,
+        )
         return output
     if not supports_fused_switch_situ(x, indices, up, gate):
         return None
@@ -560,51 +633,70 @@ def maybe_fused_k3_switch_glu_reduce(
     if down[0].shape[0] != up[0].shape[0]:
         return None
     if x.ndim == 3 and x.shape[-2] == 4:
-        receipt_path = "switch_glu_reduce"
-        receipt_active = _begin_width4_dispatch_receipt(receipt_path, x)
-        if not supports_width4_switch_situ(x, indices, up, gate):
-            _record_width4_event(receipt_path, receipt_active, "fallback", "geometry")
-            return None
-        if not supports_width4_down_reduce_projection(
-            indices,
-            router_weights,
-            down,
-            results_per_threadgroup=4,
-            simdgroups_per_threadgroup=8,
-        ):
-            _record_width4_event(
-                receipt_path,
-                receipt_active,
-                "fallback",
-                "geometry",
+        attempt = _begin_width4_dispatch_receipt("switch_glu_reduce", x)
+        supported = False
+        try:
+            if not supports_width4_switch_situ(x, indices, up, gate):
+                _commit_width4_dispatch_receipt(
+                    attempt,
+                    "fallback",
+                    supported=False,
+                    reason_class="geometry",
+                )
+                return None
+            if not supports_width4_down_reduce_projection(
+                indices,
+                router_weights,
+                down,
+                results_per_threadgroup=4,
+                simdgroups_per_threadgroup=8,
+            ):
+                _commit_width4_dispatch_receipt(
+                    attempt,
+                    "fallback",
+                    supported=False,
+                    reason_class="geometry",
+                )
+                return None
+            derive_bias = derive_affine2_bias_enabled()
+            if not derive_bias or not _all_projections_support_derived_bias(
+                (
+                    (switch_mlp.up_proj, up),
+                    (switch_mlp.gate_proj, gate),
+                    (switch_mlp.down_proj, down),
+                )
+            ):
+                reason = "selector" if not derive_bias else "metadata"
+                _commit_width4_dispatch_receipt(
+                    attempt,
+                    "fallback",
+                    supported=False,
+                    reason_class=reason,
+                )
+                return None
+            supported = True
+            output = _compiled_width4_switch_glu_reduce_all_derived(
+                x,
+                indices,
+                router_weights,
+                *up,
+                *gate,
+                *down,
             )
-            return None
-        derive_bias = derive_affine2_bias_enabled()
-        if not derive_bias or not _all_projections_support_derived_bias(
-            (
-                (switch_mlp.up_proj, up),
-                (switch_mlp.gate_proj, gate),
-                (switch_mlp.down_proj, down),
-            )
-        ):
-            reason = "selector" if not derive_bias else "metadata"
-            _record_width4_event(
-                receipt_path,
-                receipt_active,
-                "fallback",
-                reason,
-            )
-            return None
-        _record_width4_event(receipt_path, receipt_active, "supported")
-        output = _compiled_width4_switch_glu_reduce_all_derived(
-            x,
-            indices,
-            router_weights,
-            *up,
-            *gate,
-            *down,
+        except Exception as error:
+            if attempt is not None and not attempt.committed:
+                _commit_width4_dispatch_receipt(
+                    attempt,
+                    "error",
+                    supported=supported,
+                    reason_class=type(error).__name__,
+                )
+            raise
+        _commit_width4_dispatch_receipt(
+            attempt,
+            "dispatched",
+            supported=True,
         )
-        _record_width4_event(receipt_path, receipt_active, "dispatched")
         return output
     if not supports_fused_switch_situ(x, indices, up, gate):
         return None

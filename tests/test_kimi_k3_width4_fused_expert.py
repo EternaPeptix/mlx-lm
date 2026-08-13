@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from threading import Event, Thread
 from unittest import mock
 
 import mlx.core as mx
@@ -257,6 +258,15 @@ class Width4AdapterRoutingTest(unittest.TestCase):
             ),
         )
 
+    def _assert_receipt_invariants(self, receipt):
+        for counts in (receipt["totals"], *receipt["paths"].values()):
+            self.assertEqual(
+                counts["attempted"],
+                counts["dispatched"] + counts["fallback"] + counts["error"],
+            )
+            self.assertLessEqual(counts["dispatched"], counts["supported"])
+            self.assertLessEqual(counts["supported"], counts["attempted"])
+
     def test_selector_chain_is_default_off_and_exact(self):
         sentinel = object()
         front_patch, down_patch, bias_patch = self._adapter_patches()
@@ -351,6 +361,10 @@ class Width4AdapterRoutingTest(unittest.TestCase):
             simdgroups_per_threadgroup=8,
         )
         dispatch.assert_called_once()
+        self.assertEqual(
+            snapshot_k3_width4_dispatch_receipt()["totals"]["attempted"],
+            0,
+        )
 
     def test_neighboring_geometry_falls_back_before_dispatch(self):
         self._enable_all()
@@ -424,13 +438,41 @@ class Width4AdapterRoutingTest(unittest.TestCase):
         receipt = snapshot_k3_width4_dispatch_receipt()
         self.assertEqual(
             receipt["totals"],
-            {"attempted": 1, "supported": 1, "dispatched": 1, "fallback": 0},
+            {
+                "attempted": 1,
+                "supported": 1,
+                "dispatched": 1,
+                "fallback": 0,
+                "error": 0,
+            },
         )
         self.assertEqual(
             receipt["paths"]["switch_glu_reduce"],
-            {"attempted": 1, "supported": 1, "dispatched": 1, "fallback": 0},
+            {
+                "attempted": 1,
+                "supported": 1,
+                "dispatched": 1,
+                "fallback": 0,
+                "error": 0,
+            },
         )
+        self._assert_receipt_invariants(receipt)
+        self.assertEqual(receipt["schema_version"], 2)
         self.assertEqual(receipt["fallback_reason_classes"], {})
+        self.assertEqual(receipt["error_reason_classes"], {})
+        self.assertEqual(
+            [
+                (
+                    record["path"],
+                    record["outcome"],
+                    record["supported"],
+                    record["reason_class"],
+                    record["count"],
+                )
+                for record in receipt["terminal_records"]
+            ],
+            [("switch_glu_reduce", "dispatched", True, None, 1)],
+        )
         self.assertEqual(len(receipt["selector_states"]), 1)
         self.assertEqual(receipt["selector_states"][0]["attempted"], 1)
         self.assertEqual(
@@ -471,9 +513,135 @@ class Width4AdapterRoutingTest(unittest.TestCase):
         receipt = snapshot_k3_width4_dispatch_receipt()
         self.assertEqual(
             receipt["totals"],
-            {"attempted": 1, "supported": 0, "dispatched": 0, "fallback": 1},
+            {
+                "attempted": 1,
+                "supported": 0,
+                "dispatched": 0,
+                "fallback": 1,
+                "error": 0,
+            },
         )
+        self._assert_receipt_invariants(receipt)
         self.assertEqual(receipt["fallback_reason_classes"], {"geometry": 1})
+
+    def test_dispatch_receipt_is_atomic_across_snapshot_and_reset(self):
+        self._enable_all()
+        self._enable_receipt()
+        entered = Event()
+        release = Event()
+        sentinel = object()
+        result = []
+        failures = []
+
+        def blocking_dispatch(*args):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("test did not release candidate dispatch")
+            return sentinel
+
+        def run_adapter():
+            try:
+                result.append(
+                    maybe_fused_k3_switch_glu_reduce(
+                        self.switch,
+                        self.x,
+                        self.indices,
+                        self.router_weights,
+                    )
+                )
+            except Exception as error:
+                failures.append(error)
+
+        front_patch, down_patch, bias_patch = self._adapter_patches()
+        with (
+            front_patch,
+            down_patch,
+            bias_patch,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+                side_effect=blocking_dispatch,
+            ),
+        ):
+            worker = Thread(target=run_adapter)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+
+            in_flight = snapshot_k3_width4_dispatch_receipt()
+            self._assert_receipt_invariants(in_flight)
+            self.assertEqual(in_flight["totals"]["attempted"], 0)
+
+            reset_k3_width4_dispatch_receipt()
+            after_reset = snapshot_k3_width4_dispatch_receipt()
+            self._assert_receipt_invariants(after_reset)
+            self.assertEqual(after_reset["totals"]["attempted"], 0)
+
+            release.set()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(result, [sentinel])
+        receipt = snapshot_k3_width4_dispatch_receipt()
+        self._assert_receipt_invariants(receipt)
+        self.assertEqual(
+            receipt["totals"],
+            {
+                "attempted": 1,
+                "supported": 1,
+                "dispatched": 1,
+                "fallback": 0,
+                "error": 0,
+            },
+        )
+
+    def test_dispatch_receipt_terminalizes_candidate_exception(self):
+        self._enable_all()
+        self._enable_receipt()
+        front_patch, down_patch, bias_patch = self._adapter_patches()
+        with (
+            front_patch,
+            down_patch,
+            bias_patch,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+                side_effect=RuntimeError("synthetic candidate failure"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "synthetic candidate"):
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch,
+                    self.x,
+                    self.indices,
+                    self.router_weights,
+                )
+
+        receipt = snapshot_k3_width4_dispatch_receipt()
+        self._assert_receipt_invariants(receipt)
+        self.assertEqual(
+            receipt["totals"],
+            {
+                "attempted": 1,
+                "supported": 1,
+                "dispatched": 0,
+                "fallback": 0,
+                "error": 1,
+            },
+        )
+        self.assertEqual(receipt["error_reason_classes"], {"RuntimeError": 1})
+        self.assertEqual(
+            [
+                (
+                    record["outcome"],
+                    record["supported"],
+                    record["reason_class"],
+                    record["count"],
+                )
+                for record in receipt["terminal_records"]
+            ],
+            [("error", True, "RuntimeError", 1)],
+        )
 
 
 @unittest.skipUnless(_metal_available(), "requires Metal")
@@ -620,10 +788,13 @@ class Width4KernelTest(unittest.TestCase):
         os.environ.pop(FUSED_DOWN_REDUCE_ENV, None)
         os.environ.pop(FUSED_EXPERT_ENV, None)
         os.environ.pop(FUSED_EXPERT_WIDTH4_ENV, None)
+        os.environ.pop(WIDTH4_DISPATCH_RECEIPT_ENV, None)
         derive_affine2_bias_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_experts_enabled.cache_clear()
         fused_k3_expert_width4_enabled.cache_clear()
+        k3_width4_dispatch_receipt_enabled.cache_clear()
+        reset_k3_width4_dispatch_receipt()
 
     def test_adapter_is_independently_default_off(self):
         os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
@@ -657,10 +828,13 @@ class Width4KernelTest(unittest.TestCase):
         os.environ[FUSED_DOWN_REDUCE_ENV] = "1"
         os.environ[FUSED_EXPERT_ENV] = "1"
         os.environ[FUSED_EXPERT_WIDTH4_ENV] = "1"
+        os.environ[WIDTH4_DISPATCH_RECEIPT_ENV] = "1"
         derive_affine2_bias_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_experts_enabled.cache_clear()
         fused_k3_expert_width4_enabled.cache_clear()
+        k3_width4_dispatch_receipt_enabled.cache_clear()
+        reset_k3_width4_dispatch_receipt()
         router_weights = mx.random.uniform(
             shape=(1, K3_WIDTH4, K3_TOP_K),
             dtype=mx.bfloat16,
@@ -693,6 +867,16 @@ class Width4KernelTest(unittest.TestCase):
                     candidate.view(mx.uint8),
                 ).item()
             )
+        )
+        self.assertEqual(
+            snapshot_k3_width4_dispatch_receipt()["totals"],
+            {
+                "attempted": 1,
+                "supported": 1,
+                "dispatched": 1,
+                "fallback": 0,
+                "error": 0,
+            },
         )
 
 
