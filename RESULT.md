@@ -60,8 +60,9 @@ invisible. `supported` means the width-four geometry and derived-bias contracts
 passed; a compiled-call exception is both supported and terminally errored.
 `dispatched` means the compiled candidate call returned its MLX graph value;
 the receipt deliberately does not force evaluation. A `fallback` means an
-instrumented width-four support or metadata guard returned to the stock graph
-before candidate dispatch.
+instrumented width-four support or metadata guard returned `None` to its caller
+before this candidate dispatched. The caller may then select another optimized
+path or eventually the stock graph.
 
 This distinction matters: the receipt proves Python adapter selection and
 candidate graph construction. Normal downstream evaluation must still consume
@@ -140,3 +141,9 @@ been exercised with real Kimi K3 weights, a two-rank JACCL service, completion
 parity, or an A/B/A benchmark. A service run may use the snapshot only as one
 dispatch receipt alongside its ordinary output consumption, rank receipts,
 topology attestation, and performance measurements.
+
+The generation is captured at each instrumented adapter attempt, not at request
+entry. A protected promotion bracket must therefore reset only at a fresh,
+quiescent request boundary, then require `stale_completions.total == 0` in the
+final snapshot. Any stale completion invalidates that bracket even though it is
+correctly excluded from the current generation's throughput totals.
