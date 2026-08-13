@@ -530,12 +530,39 @@ def supports_width4_down_reduce(
     """Validate the exact top-8 width-four fused down/reduce contract."""
 
     return (
+        activated.shape
+        == (1, K3_WIDTH4, K3_TOP_K, 1, K3_INTERMEDIATE)
+        and activated.dtype == mx.bfloat16
+        and supports_width4_down_reduce_projection(
+            indices,
+            router_weights,
+            down,
+            results_per_threadgroup=results_per_threadgroup,
+            simdgroups_per_threadgroup=simdgroups_per_threadgroup,
+        )
+    )
+
+
+def supports_width4_down_reduce_projection(
+    indices: mx.array,
+    router_weights: mx.array,
+    down: tuple[mx.array, mx.array, mx.array],
+    *,
+    results_per_threadgroup: int,
+    simdgroups_per_threadgroup: int,
+) -> bool:
+    """Validate width-four routes and down bank before running gate/up.
+
+    The model adapter uses this projection-level predicate before dispatching
+    the fused front.  Unsupported routing geometry therefore falls back to
+    the stock MLX-LM graph without constructing an intermediate activation or
+    allowing ``width4_down_reduce`` to raise.
+    """
+
+    return (
         results_per_threadgroup in (2, 4, 8, 16)
         and simdgroups_per_threadgroup in (4, 8)
         and K3_TOP_K % simdgroups_per_threadgroup == 0
-        and activated.shape
-        == (1, K3_WIDTH4, K3_TOP_K, 1, K3_INTERMEDIATE)
-        and activated.dtype == mx.bfloat16
         and indices.shape == (1, K3_WIDTH4, K3_TOP_K)
         and indices.dtype == mx.uint32
         and router_weights.shape == indices.shape

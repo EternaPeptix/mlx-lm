@@ -2,20 +2,25 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 
+from mlx_lm.models import kimi_k3_fused_expert as fused_expert_adapter
 from mlx_lm.models.kimi_k3_derived_bias import (
     DERIVE_AFFINE2_BIAS_ENV,
     derive_affine2_bias_enabled,
     derived_affine2_biases,
 )
 from mlx_lm.models.kimi_k3_fused_expert import (
+    FUSED_DOWN_REDUCE_ENV,
     FUSED_EXPERT_ENV,
     FUSED_EXPERT_WIDTH4_ENV,
+    fused_k3_down_reduce_enabled,
     fused_k3_expert_width4_enabled,
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
+    maybe_fused_k3_switch_glu_reduce,
 )
 from mlx_lm.models.kimi_k3_width4_fused_expert import (
     K3_EXPERTS,
@@ -25,6 +30,7 @@ from mlx_lm.models.kimi_k3_width4_fused_expert import (
     K3_WIDTH4,
     _metal_available,
     supports_width4_down,
+    supports_width4_down_reduce_projection,
     supports_width4_native_down_projection,
     supports_width4_switch_situ,
     width4_switch_glu,
@@ -140,6 +146,237 @@ class Width4SelectorTest(unittest.TestCase):
                 fused_k3_expert_width4_enabled.cache_clear()
                 with self.assertRaisesRegex(ValueError, "must be exactly"):
                     fused_k3_expert_width4_enabled()
+
+
+class _ArrayStub:
+    """Shape-only stand-in used to test adapter routing without Metal."""
+
+    def __init__(self, shape):
+        self.shape = shape
+        self.ndim = len(shape)
+
+
+class _ProjectionStub:
+    bits = 2
+    group_size = 128
+    mode = "affine"
+
+    def __init__(self, shape):
+        self.weight = _ArrayStub(shape)
+        self.scales = _ArrayStub(shape)
+        self.biases = _ArrayStub(shape)
+
+    def __contains__(self, name):
+        return False
+
+    def __getitem__(self, name):
+        return getattr(self, name)
+
+    def get(self, name):
+        return getattr(self, name, None)
+
+
+class _SwitchStub:
+    training = False
+    activation = _Activation()
+
+    def __init__(self):
+        self.up_proj = _ProjectionStub((K3_EXPERTS, K3_INTERMEDIATE, 1))
+        self.gate_proj = _ProjectionStub((K3_EXPERTS, K3_INTERMEDIATE, 1))
+        self.down_proj = _ProjectionStub((K3_EXPERTS, K3_HIDDEN, 1))
+
+
+class Width4AdapterRoutingTest(unittest.TestCase):
+    """Exercise fail-closed model routing without allocating Metal banks."""
+
+    def setUp(self):
+        self.switch = _SwitchStub()
+        self.x = _ArrayStub((1, K3_WIDTH4, K3_HIDDEN))
+        self.indices = _ArrayStub((1, K3_WIDTH4, K3_TOP_K))
+        self.router_weights = _ArrayStub((1, K3_WIDTH4, K3_TOP_K))
+
+    def tearDown(self):
+        for name in (
+            DERIVE_AFFINE2_BIAS_ENV,
+            FUSED_DOWN_REDUCE_ENV,
+            FUSED_EXPERT_ENV,
+            FUSED_EXPERT_WIDTH4_ENV,
+        ):
+            os.environ.pop(name, None)
+        derive_affine2_bias_enabled.cache_clear()
+        fused_k3_down_reduce_enabled.cache_clear()
+        fused_k3_expert_width4_enabled.cache_clear()
+        fused_k3_experts_enabled.cache_clear()
+
+    def _enable_all(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        os.environ[FUSED_DOWN_REDUCE_ENV] = "1"
+        os.environ[FUSED_EXPERT_ENV] = "1"
+        os.environ[FUSED_EXPERT_WIDTH4_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        fused_k3_down_reduce_enabled.cache_clear()
+        fused_k3_expert_width4_enabled.cache_clear()
+        fused_k3_experts_enabled.cache_clear()
+
+    def _adapter_patches(self):
+        return (
+            mock.patch.object(
+                fused_expert_adapter,
+                "supports_width4_switch_situ",
+                return_value=True,
+            ),
+            mock.patch.object(
+                fused_expert_adapter,
+                "supports_width4_down_reduce_projection",
+                return_value=True,
+            ),
+            mock.patch.object(
+                fused_expert_adapter,
+                "_all_projections_support_derived_bias",
+                return_value=True,
+            ),
+        )
+
+    def test_selector_chain_is_default_off_and_exact(self):
+        sentinel = object()
+        front_patch, down_patch, bias_patch = self._adapter_patches()
+        with (
+            front_patch,
+            down_patch,
+            bias_patch,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+                return_value=sentinel,
+            ) as dispatch,
+        ):
+            # Every selector is independently default-off.
+            self.assertIsNone(
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch, self.x, self.indices, self.router_weights
+                )
+            )
+            dispatch.assert_not_called()
+
+            self._enable_all()
+            os.environ[FUSED_DOWN_REDUCE_ENV] = "true"
+            fused_k3_down_reduce_enabled.cache_clear()
+            self.assertIsNone(
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch, self.x, self.indices, self.router_weights
+                )
+            )
+            dispatch.assert_not_called()
+
+            os.environ[FUSED_DOWN_REDUCE_ENV] = "1"
+            os.environ[FUSED_EXPERT_ENV] = "true"
+            fused_k3_down_reduce_enabled.cache_clear()
+            fused_k3_experts_enabled.cache_clear()
+            self.assertIsNone(
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch, self.x, self.indices, self.router_weights
+                )
+            )
+            dispatch.assert_not_called()
+
+            os.environ[FUSED_EXPERT_ENV] = "1"
+            os.environ[FUSED_EXPERT_WIDTH4_ENV] = "true"
+            fused_k3_experts_enabled.cache_clear()
+            fused_k3_expert_width4_enabled.cache_clear()
+            with self.assertRaisesRegex(ValueError, "must be exactly"):
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch, self.x, self.indices, self.router_weights
+                )
+
+            os.environ[FUSED_EXPERT_WIDTH4_ENV] = "1"
+            os.environ[DERIVE_AFFINE2_BIAS_ENV] = "true"
+            fused_k3_expert_width4_enabled.cache_clear()
+            derive_affine2_bias_enabled.cache_clear()
+            with self.assertRaisesRegex(ValueError, "must be exactly"):
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch, self.x, self.indices, self.router_weights
+                )
+            dispatch.assert_not_called()
+
+    def test_model_adapter_selects_only_the_exact_width4_path(self):
+        self._enable_all()
+        sentinel = object()
+        front_patch, down_patch, bias_patch = self._adapter_patches()
+        with (
+            front_patch,
+            down_patch as down_support,
+            bias_patch,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+                return_value=sentinel,
+            ) as dispatch,
+        ):
+            result = maybe_fused_k3_switch_glu_reduce(
+                self.switch,
+                self.x,
+                self.indices,
+                self.router_weights,
+            )
+        self.assertIs(result, sentinel)
+        down_support.assert_called_once_with(
+            self.indices,
+            self.router_weights,
+            (
+                self.switch.down_proj.weight,
+                self.switch.down_proj.scales,
+                self.switch.down_proj.biases,
+            ),
+            results_per_threadgroup=4,
+            simdgroups_per_threadgroup=8,
+        )
+        dispatch.assert_called_once()
+
+    def test_neighboring_geometry_falls_back_before_dispatch(self):
+        self._enable_all()
+        with (
+            mock.patch.object(
+                fused_expert_adapter,
+                "supports_width4_switch_situ",
+                return_value=False,
+            ),
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+            ) as dispatch,
+        ):
+            self.assertIsNone(
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch,
+                    self.x,
+                    _ArrayStub((1, K3_WIDTH4, K3_TOP_K + 1)),
+                    _ArrayStub((1, K3_WIDTH4, K3_TOP_K + 1)),
+                )
+            )
+            dispatch.assert_not_called()
+
+    def test_derived_bias_validation_fails_closed_before_dispatch(self):
+        self._enable_all()
+        front_patch, down_patch, _ = self._adapter_patches()
+        with (
+            front_patch,
+            down_patch,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_all_projections_support_derived_bias",
+                return_value=False,
+            ),
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+            ) as dispatch,
+        ):
+            self.assertIsNone(
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch, self.x, self.indices, self.router_weights
+                )
+            )
+            dispatch.assert_not_called()
 
 
 @unittest.skipUnless(_metal_available(), "requires Metal")
@@ -264,6 +501,15 @@ class Width4KernelTest(unittest.TestCase):
         self.assertFalse(
             supports_width4_native_down_projection(self.indices[:, :3], down)
         )
+        self.assertFalse(
+            supports_width4_down_reduce_projection(
+                self.indices[:, :3],
+                mx.zeros((1, 3, K3_TOP_K), dtype=mx.bfloat16),
+                down,
+                results_per_threadgroup=4,
+                simdgroups_per_threadgroup=8,
+            )
+        )
         os.environ[FUSED_EXPERT_ENV] = "1"
         os.environ[FUSED_EXPERT_WIDTH4_ENV] = "1"
         fused_k3_experts_enabled.cache_clear()
@@ -276,9 +522,11 @@ class Width4KernelTest(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop(DERIVE_AFFINE2_BIAS_ENV, None)
+        os.environ.pop(FUSED_DOWN_REDUCE_ENV, None)
         os.environ.pop(FUSED_EXPERT_ENV, None)
         os.environ.pop(FUSED_EXPERT_WIDTH4_ENV, None)
         derive_affine2_bias_enabled.cache_clear()
+        fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_experts_enabled.cache_clear()
         fused_k3_expert_width4_enabled.cache_clear()
 
@@ -309,6 +557,49 @@ class Width4KernelTest(unittest.TestCase):
         fused_k3_expert_width4_enabled.cache_clear()
         self.assertIsNone(
             maybe_fused_k3_switch_glu(self.switch, self.x, self.indices)
+        )
+
+    def test_reduce_adapter_dispatch_is_bit_exact(self):
+        os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
+        os.environ[FUSED_DOWN_REDUCE_ENV] = "1"
+        os.environ[FUSED_EXPERT_ENV] = "1"
+        os.environ[FUSED_EXPERT_WIDTH4_ENV] = "1"
+        derive_affine2_bias_enabled.cache_clear()
+        fused_k3_down_reduce_enabled.cache_clear()
+        fused_k3_experts_enabled.cache_clear()
+        fused_k3_expert_width4_enabled.cache_clear()
+        router_weights = mx.random.uniform(
+            shape=(1, K3_WIDTH4, K3_TOP_K),
+            dtype=mx.bfloat16,
+        )
+        reference = (
+            _stock(self.switch, self.x, self.indices) * router_weights[..., None]
+        ).sum(
+            axis=-2,
+        )
+        original = fused_expert_adapter._compiled_width4_switch_glu_reduce_all_derived
+        with mock.patch.object(
+            fused_expert_adapter,
+            "_compiled_width4_switch_glu_reduce_all_derived",
+            wraps=original,
+        ) as dispatch:
+            candidate = maybe_fused_k3_switch_glu_reduce(
+                self.switch,
+                self.x,
+                self.indices,
+                router_weights,
+            )
+        self.assertIsNotNone(candidate)
+        dispatch.assert_called_once()
+        mx.eval(reference, candidate)
+        self.assertEqual(candidate.shape, (1, K3_WIDTH4, K3_HIDDEN))
+        self.assertTrue(
+            bool(
+                mx.array_equal(
+                    reference.view(mx.uint8),
+                    candidate.view(mx.uint8),
+                ).item()
+            )
         )
 
 

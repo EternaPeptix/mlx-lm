@@ -26,9 +26,11 @@ from .kimi_k3_tuned_gather_qmv import (
     tuned_gather_qmv,
 )
 from .kimi_k3_width4_fused_expert import (
+    supports_width4_down_reduce_projection,
     supports_width4_native_down_projection,
     supports_width4_switch_situ,
     width4_switch_glu_native_down,
+    width4_switch_glu_reduce,
 )
 
 FUSED_EXPERT_ENV = "MLX_LM_KIMI_K3_FUSED_EXPERTS"
@@ -109,6 +111,38 @@ def _compiled_width4_switch_glu_all_derived(
         (down_weight, down_scales, down_biases),
         front_results_per_simdgroup=8,
         derive_front_bias=True,
+    )
+
+
+@partial(mx.compile, shapeless=False)
+def _compiled_width4_switch_glu_reduce_all_derived(
+    x: mx.array,
+    indices: mx.array,
+    router_weights: mx.array,
+    up_weight: mx.array,
+    up_scales: mx.array,
+    up_biases: mx.array,
+    gate_weight: mx.array,
+    gate_scales: mx.array,
+    gate_biases: mx.array,
+    down_weight: mx.array,
+    down_scales: mx.array,
+    down_biases: mx.array,
+) -> mx.array:
+    """Run the screened width-four front8/down-results4/SIMDs8 chain."""
+
+    return width4_switch_glu_reduce(
+        x,
+        indices,
+        router_weights,
+        (up_weight, up_scales, up_biases),
+        (gate_weight, gate_scales, gate_biases),
+        (down_weight, down_scales, down_biases),
+        front_results_per_simdgroup=8,
+        down_results_per_threadgroup=4,
+        down_simdgroups_per_threadgroup=8,
+        derive_front_bias=True,
+        derive_down_bias=True,
     )
 
 
@@ -380,6 +414,34 @@ def maybe_fused_k3_switch_glu_reduce(
         return None
     if down[0].shape[0] != up[0].shape[0]:
         return None
+    if x.ndim == 3 and x.shape[-2] == 4:
+        if not supports_width4_switch_situ(x, indices, up, gate):
+            return None
+        if not supports_width4_down_reduce_projection(
+            indices,
+            router_weights,
+            down,
+            results_per_threadgroup=4,
+            simdgroups_per_threadgroup=8,
+        ):
+            return None
+        derive_bias = derive_affine2_bias_enabled()
+        if not derive_bias or not _all_projections_support_derived_bias(
+            (
+                (switch_mlp.up_proj, up),
+                (switch_mlp.gate_proj, gate),
+                (switch_mlp.down_proj, down),
+            )
+        ):
+            return None
+        return _compiled_width4_switch_glu_reduce_all_derived(
+            x,
+            indices,
+            router_weights,
+            *up,
+            *gate,
+            *down,
+        )
     if not supports_fused_switch_situ(x, indices, up, gate):
         return None
     if not supports_fused_down_reduce_projection(
