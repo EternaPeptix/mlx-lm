@@ -16,11 +16,15 @@ from mlx_lm.models.kimi_k3_fused_expert import (
     FUSED_DOWN_REDUCE_ENV,
     FUSED_EXPERT_ENV,
     FUSED_EXPERT_WIDTH4_ENV,
+    WIDTH4_DISPATCH_RECEIPT_ENV,
     fused_k3_down_reduce_enabled,
     fused_k3_expert_width4_enabled,
     fused_k3_experts_enabled,
+    k3_width4_dispatch_receipt_enabled,
     maybe_fused_k3_switch_glu,
     maybe_fused_k3_switch_glu_reduce,
+    reset_k3_width4_dispatch_receipt,
+    snapshot_k3_width4_dispatch_receipt,
 )
 from mlx_lm.models.kimi_k3_width4_fused_expert import (
     K3_EXPERTS,
@@ -64,8 +68,7 @@ class _Projection:
         )
         scale = (
             mx.array(1 / 128, dtype=mx.float32)
-            + (expert % 13).astype(mx.float32)
-            * mx.array(1 / 4096, dtype=mx.float32)
+            + (expert % 13).astype(mx.float32) * mx.array(1 / 4096, dtype=mx.float32)
         ).astype(mx.bfloat16)
         self.scales = mx.contiguous(
             mx.broadcast_to(
@@ -117,10 +120,7 @@ def _stock(switch, x, indices):
     up = _qmm(expanded, indices, switch.up_proj).astype(mx.float32)
     gate = _qmm(expanded, indices, switch.gate_proj).astype(mx.float32)
     activated = (
-        4.0
-        * mx.tanh(gate / 4.0)
-        * mx.sigmoid(gate)
-        * (25.0 * mx.tanh(up / 25.0))
+        4.0 * mx.tanh(gate / 4.0) * mx.sigmoid(gate) * (25.0 * mx.tanh(up / 25.0))
     ).astype(mx.bfloat16)
     return _qmm(activated, indices, switch.down_proj).squeeze(-2)
 
@@ -128,7 +128,10 @@ def _stock(switch, x, indices):
 class Width4SelectorTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop(FUSED_EXPERT_WIDTH4_ENV, None)
+        os.environ.pop(WIDTH4_DISPATCH_RECEIPT_ENV, None)
         fused_k3_expert_width4_enabled.cache_clear()
+        k3_width4_dispatch_receipt_enabled.cache_clear()
+        reset_k3_width4_dispatch_receipt()
 
     def test_default_off_and_strict_values(self):
         os.environ.pop(FUSED_EXPERT_WIDTH4_ENV, None)
@@ -146,6 +149,15 @@ class Width4SelectorTest(unittest.TestCase):
                 fused_k3_expert_width4_enabled.cache_clear()
                 with self.assertRaisesRegex(ValueError, "must be exactly"):
                     fused_k3_expert_width4_enabled()
+
+    def test_receipt_selector_is_default_off_and_fail_closed(self):
+        self.assertFalse(k3_width4_dispatch_receipt_enabled())
+        for value in ("", "true", "01", "2", "-1"):
+            with self.subTest(value=value):
+                os.environ[WIDTH4_DISPATCH_RECEIPT_ENV] = value
+                k3_width4_dispatch_receipt_enabled.cache_clear()
+                with self.assertRaisesRegex(ValueError, "must be exactly"):
+                    k3_width4_dispatch_receipt_enabled()
 
 
 class _ArrayStub:
@@ -201,12 +213,15 @@ class Width4AdapterRoutingTest(unittest.TestCase):
             FUSED_DOWN_REDUCE_ENV,
             FUSED_EXPERT_ENV,
             FUSED_EXPERT_WIDTH4_ENV,
+            WIDTH4_DISPATCH_RECEIPT_ENV,
         ):
             os.environ.pop(name, None)
         derive_affine2_bias_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_expert_width4_enabled.cache_clear()
         fused_k3_experts_enabled.cache_clear()
+        k3_width4_dispatch_receipt_enabled.cache_clear()
+        reset_k3_width4_dispatch_receipt()
 
     def _enable_all(self):
         os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
@@ -217,6 +232,11 @@ class Width4AdapterRoutingTest(unittest.TestCase):
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_expert_width4_enabled.cache_clear()
         fused_k3_experts_enabled.cache_clear()
+
+    def _enable_receipt(self):
+        os.environ[WIDTH4_DISPATCH_RECEIPT_ENV] = "1"
+        k3_width4_dispatch_receipt_enabled.cache_clear()
+        reset_k3_width4_dispatch_receipt()
 
     def _adapter_patches(self):
         return (
@@ -378,6 +398,83 @@ class Width4AdapterRoutingTest(unittest.TestCase):
             )
             dispatch.assert_not_called()
 
+    def test_dispatch_receipt_proves_exact_candidate_path(self):
+        self._enable_all()
+        self._enable_receipt()
+        sentinel = object()
+        front_patch, down_patch, bias_patch = self._adapter_patches()
+        with (
+            front_patch,
+            down_patch,
+            bias_patch,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+                return_value=sentinel,
+            ),
+        ):
+            result = maybe_fused_k3_switch_glu_reduce(
+                self.switch,
+                self.x,
+                self.indices,
+                self.router_weights,
+            )
+
+        self.assertIs(result, sentinel)
+        receipt = snapshot_k3_width4_dispatch_receipt()
+        self.assertEqual(
+            receipt["totals"],
+            {"attempted": 1, "supported": 1, "dispatched": 1, "fallback": 0},
+        )
+        self.assertEqual(
+            receipt["paths"]["switch_glu_reduce"],
+            {"attempted": 1, "supported": 1, "dispatched": 1, "fallback": 0},
+        )
+        self.assertEqual(receipt["fallback_reason_classes"], {})
+        self.assertEqual(len(receipt["selector_states"]), 1)
+        self.assertEqual(receipt["selector_states"][0]["attempted"], 1)
+        self.assertEqual(
+            receipt["selector_states"][0]["selectors"],
+            {
+                WIDTH4_DISPATCH_RECEIPT_ENV: "1",
+                FUSED_EXPERT_ENV: "1",
+                FUSED_DOWN_REDUCE_ENV: "1",
+                FUSED_EXPERT_WIDTH4_ENV: "1",
+                DERIVE_AFFINE2_BIAS_ENV: "1",
+            },
+        )
+
+    def test_dispatch_receipt_classifies_unsupported_fallback(self):
+        self._enable_all()
+        self._enable_receipt()
+        with (
+            mock.patch.object(
+                fused_expert_adapter,
+                "supports_width4_switch_situ",
+                return_value=False,
+            ),
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+            ) as dispatch,
+        ):
+            self.assertIsNone(
+                maybe_fused_k3_switch_glu_reduce(
+                    self.switch,
+                    self.x,
+                    self.indices,
+                    self.router_weights,
+                )
+            )
+            dispatch.assert_not_called()
+
+        receipt = snapshot_k3_width4_dispatch_receipt()
+        self.assertEqual(
+            receipt["totals"],
+            {"attempted": 1, "supported": 0, "dispatched": 0, "fallback": 1},
+        )
+        self.assertEqual(receipt["fallback_reason_classes"], {"geometry": 1})
+
 
 @unittest.skipUnless(_metal_available(), "requires Metal")
 class Width4KernelTest(unittest.TestCase):
@@ -390,9 +487,9 @@ class Width4KernelTest(unittest.TestCase):
             dtype=mx.bfloat16,
         )
         base = mx.array([0, 17, 63, 255, 444, 511, 700, 895], dtype=mx.uint32)
-        cls.indices = mx.stack(
-            [mx.roll(base, shift) for shift in range(K3_WIDTH4)]
-        )[None]
+        cls.indices = mx.stack([mx.roll(base, shift) for shift in range(K3_WIDTH4)])[
+            None
+        ]
         mx.eval(
             cls.x,
             cls.indices,
@@ -516,9 +613,7 @@ class Width4KernelTest(unittest.TestCase):
         fused_k3_expert_width4_enabled.cache_clear()
         for x, indices in neighbors:
             with self.subTest(adapter_x_shape=x.shape, indices_shape=indices.shape):
-                self.assertIsNone(
-                    maybe_fused_k3_switch_glu(self.switch, x, indices)
-                )
+                self.assertIsNone(maybe_fused_k3_switch_glu(self.switch, x, indices))
 
     def tearDown(self):
         os.environ.pop(DERIVE_AFFINE2_BIAS_ENV, None)
@@ -555,9 +650,7 @@ class Width4KernelTest(unittest.TestCase):
         derive_affine2_bias_enabled.cache_clear()
         fused_k3_experts_enabled.cache_clear()
         fused_k3_expert_width4_enabled.cache_clear()
-        self.assertIsNone(
-            maybe_fused_k3_switch_glu(self.switch, self.x, self.indices)
-        )
+        self.assertIsNone(maybe_fused_k3_switch_glu(self.switch, self.x, self.indices))
 
     def test_reduce_adapter_dispatch_is_bit_exact(self):
         os.environ[DERIVE_AFFINE2_BIAS_ENV] = "1"
