@@ -14,6 +14,7 @@ from mlx_lm.models.kimi_k3_derived_bias import (
     derived_affine2_biases,
 )
 from mlx_lm.models.kimi_k3_fused_expert import (
+    EXPERT_TOP_K_ENV,
     FUSED_DOWN_REDUCE_ENV,
     FUSED_EXPERT_ENV,
     FUSED_EXPERT_WIDTH4_ENV,
@@ -212,6 +213,7 @@ class Width4AdapterRoutingTest(unittest.TestCase):
     def tearDown(self):
         for name in (
             DERIVE_AFFINE2_BIAS_ENV,
+            EXPERT_TOP_K_ENV,
             FUSED_DOWN_REDUCE_ENV,
             FUSED_EXPERT_ENV,
             FUSED_EXPERT_WIDTH4_ENV,
@@ -237,6 +239,7 @@ class Width4AdapterRoutingTest(unittest.TestCase):
 
     def _enable_receipt(self):
         os.environ[WIDTH4_DISPATCH_RECEIPT_ENV] = "1"
+        os.environ[EXPERT_TOP_K_ENV] = "8"
         k3_width4_dispatch_receipt_enabled.cache_clear()
         reset_k3_width4_dispatch_receipt()
 
@@ -484,7 +487,43 @@ class Width4AdapterRoutingTest(unittest.TestCase):
                 FUSED_DOWN_REDUCE_ENV: "1",
                 FUSED_EXPERT_WIDTH4_ENV: "1",
                 DERIVE_AFFINE2_BIAS_ENV: "1",
+                EXPERT_TOP_K_ENV: "8",
             },
+        )
+
+    def test_dispatch_receipt_observes_route_selector_mutation(self):
+        self._enable_all()
+        self._enable_receipt()
+        os.environ[EXPERT_TOP_K_ENV] = "16"
+        sentinel = object()
+        front_patch, down_patch, bias_patch = self._adapter_patches()
+        with (
+            front_patch,
+            down_patch,
+            bias_patch,
+            mock.patch.object(
+                fused_expert_adapter,
+                "_compiled_width4_switch_glu_reduce_all_derived",
+                return_value=sentinel,
+            ),
+        ):
+            result = maybe_fused_k3_switch_glu_reduce(
+                self.switch,
+                self.x,
+                self.indices,
+                self.router_weights,
+            )
+
+        self.assertIs(result, sentinel)
+        receipt = snapshot_k3_width4_dispatch_receipt()
+        self.assertEqual(receipt["current_selectors"][EXPERT_TOP_K_ENV], "16")
+        self.assertEqual(
+            receipt["terminal_records"][0]["selectors"][EXPERT_TOP_K_ENV],
+            "16",
+        )
+        self.assertEqual(
+            receipt["selector_states"][0]["selectors"][EXPERT_TOP_K_ENV],
+            "16",
         )
 
     def test_dispatch_receipt_accepts_selective_stored_down_path(self):
@@ -879,6 +918,7 @@ class Width4KernelTest(unittest.TestCase):
         os.environ.pop(FUSED_EXPERT_ENV, None)
         os.environ.pop(FUSED_EXPERT_WIDTH4_ENV, None)
         os.environ.pop(WIDTH4_DISPATCH_RECEIPT_ENV, None)
+        os.environ.pop(EXPERT_TOP_K_ENV, None)
         derive_affine2_bias_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_experts_enabled.cache_clear()
@@ -919,6 +959,7 @@ class Width4KernelTest(unittest.TestCase):
         os.environ[FUSED_EXPERT_ENV] = "1"
         os.environ[FUSED_EXPERT_WIDTH4_ENV] = "1"
         os.environ[WIDTH4_DISPATCH_RECEIPT_ENV] = "1"
+        os.environ[EXPERT_TOP_K_ENV] = "8"
         derive_affine2_bias_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_experts_enabled.cache_clear()
@@ -975,6 +1016,7 @@ class Width4KernelTest(unittest.TestCase):
         os.environ[FUSED_EXPERT_ENV] = "1"
         os.environ[FUSED_EXPERT_WIDTH4_ENV] = "1"
         os.environ[WIDTH4_DISPATCH_RECEIPT_ENV] = "1"
+        os.environ[EXPERT_TOP_K_ENV] = "8"
         derive_affine2_bias_enabled.cache_clear()
         fused_k3_down_reduce_enabled.cache_clear()
         fused_k3_experts_enabled.cache_clear()

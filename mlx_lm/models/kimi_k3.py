@@ -32,6 +32,7 @@ from .kimi_k3_derived_bias import (
     validate_k3_biases_for_load,
 )
 from .kimi_k3_fused_expert import (
+    EXPERT_TOP_K_ENV,
     fused_k3_experts_enabled,
     maybe_fused_k3_switch_glu,
     maybe_fused_k3_switch_glu_reduce,
@@ -71,7 +72,6 @@ BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV = (
 EXACT_WIDE_SHORT_CONV_ENV = "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV"
 MOK_ROUTED_SHARED_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_ROUTED_SHARED_OVERLAP"
 MOK_PREFILL_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_PREFILL_OVERLAP"
-EXPERT_TOP_K_ENV = "MLX_LM_KIMI_K3_EXPERT_TOP_K"
 _EXACT_WIDE_SHORT_CONV_MAX_WIDTH = 8
 _BATCHED_REPLAYSSM_COUNTER_LOCK = Lock()
 _BATCHED_REPLAYSSM_COUNTERS: Dict[str, int] = {
