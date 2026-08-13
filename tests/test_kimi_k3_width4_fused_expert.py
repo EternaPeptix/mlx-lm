@@ -457,7 +457,7 @@ class Width4AdapterRoutingTest(unittest.TestCase):
             },
         )
         self._assert_receipt_invariants(receipt)
-        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["schema_version"], 3)
         self.assertEqual(receipt["fallback_reason_classes"], {})
         self.assertEqual(receipt["error_reason_classes"], {})
         self.assertEqual(
@@ -524,7 +524,7 @@ class Width4AdapterRoutingTest(unittest.TestCase):
         self._assert_receipt_invariants(receipt)
         self.assertEqual(receipt["fallback_reason_classes"], {"geometry": 1})
 
-    def test_dispatch_receipt_is_atomic_across_snapshot_and_reset(self):
+    def test_reset_excludes_pre_reset_in_flight_completion(self):
         self._enable_all()
         self._enable_receipt()
         entered = Event()
@@ -570,11 +570,14 @@ class Width4AdapterRoutingTest(unittest.TestCase):
             in_flight = snapshot_k3_width4_dispatch_receipt()
             self._assert_receipt_invariants(in_flight)
             self.assertEqual(in_flight["totals"]["attempted"], 0)
+            generation = in_flight["generation"]
 
             reset_k3_width4_dispatch_receipt()
             after_reset = snapshot_k3_width4_dispatch_receipt()
             self._assert_receipt_invariants(after_reset)
+            self.assertEqual(after_reset["generation"], generation + 1)
             self.assertEqual(after_reset["totals"]["attempted"], 0)
+            self.assertEqual(after_reset["stale_completions"]["total"], 0)
 
             release.set()
             worker.join(5)
@@ -587,11 +590,19 @@ class Width4AdapterRoutingTest(unittest.TestCase):
         self.assertEqual(
             receipt["totals"],
             {
-                "attempted": 1,
-                "supported": 1,
-                "dispatched": 1,
+                "attempted": 0,
+                "supported": 0,
+                "dispatched": 0,
                 "fallback": 0,
                 "error": 0,
+            },
+        )
+        self.assertEqual(
+            receipt["stale_completions"],
+            {
+                "total": 1,
+                "outcomes": {"dispatched": 1, "fallback": 0, "error": 0},
+                "paths": {"switch_glu": 0, "switch_glu_reduce": 1},
             },
         )
 

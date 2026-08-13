@@ -65,6 +65,7 @@ _WIDTH4_RECEIPT_SELECTOR_ENVS = (
 class _Width4ReceiptAttempt:
     path: str
     selectors: tuple[tuple[str, str | None], ...]
+    generation: int
     committed: bool = False
 
 
@@ -79,6 +80,8 @@ class _Width4TerminalRecord:
 
 _width4_receipt_lock = Lock()
 _width4_terminal_records: Counter[_Width4TerminalRecord] = Counter()
+_width4_receipt_generation = 0
+_width4_stale_completions: Counter[tuple[str, str]] = Counter()
 
 
 @lru_cache(maxsize=1)
@@ -107,7 +110,12 @@ def _begin_width4_dispatch_receipt(
         return None
     if not k3_width4_dispatch_receipt_enabled():
         return None
-    return _Width4ReceiptAttempt(path, _width4_receipt_selector_state())
+    with _width4_receipt_lock:
+        return _Width4ReceiptAttempt(
+            path,
+            _width4_receipt_selector_state(),
+            _width4_receipt_generation,
+        )
 
 
 def _commit_width4_dispatch_receipt(
@@ -139,15 +147,21 @@ def _commit_width4_dispatch_receipt(
     with _width4_receipt_lock:
         if attempt.committed:
             raise RuntimeError("width-four receipt attempt is already terminal")
-        _width4_terminal_records[record] += 1
+        if attempt.generation == _width4_receipt_generation:
+            _width4_terminal_records[record] += 1
+        else:
+            _width4_stale_completions[(attempt.path, outcome)] += 1
         attempt.committed = True
 
 
 def reset_k3_width4_dispatch_receipt() -> None:
-    """Reset the current process's aggregate width-four receipt counters."""
+    """Start a new receipt generation and clear its aggregate diagnostics."""
 
+    global _width4_receipt_generation
     with _width4_receipt_lock:
+        _width4_receipt_generation += 1
         _width4_terminal_records.clear()
+        _width4_stale_completions.clear()
 
 
 def snapshot_k3_width4_dispatch_receipt() -> dict[str, Any]:
@@ -159,7 +173,9 @@ def snapshot_k3_width4_dispatch_receipt() -> dict[str, Any]:
     """
 
     with _width4_receipt_lock:
+        generation = _width4_receipt_generation
         terminal_records = tuple(_width4_terminal_records.items())
+        stale_completions = tuple(_width4_stale_completions.items())
 
     totals: Counter[str] = Counter()
     paths = {path: Counter() for path in _WIDTH4_RECEIPT_PATHS}
@@ -182,7 +198,8 @@ def snapshot_k3_width4_dispatch_receipt() -> dict[str, Any]:
         selector_states[(record.path, record.selectors)] += count
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
+        "generation": generation,
         "enabled": k3_width4_dispatch_receipt_enabled(),
         "current_selectors": dict(_width4_receipt_selector_state()),
         "totals": {metric: totals[metric] for metric in _WIDTH4_RECEIPT_METRICS},
@@ -217,6 +234,25 @@ def snapshot_k3_width4_dispatch_receipt() -> dict[str, Any]:
                 key=lambda item: repr(item[0]),
             )
         ],
+        "stale_completions": {
+            "total": sum(count for _, count in stale_completions),
+            "outcomes": {
+                outcome: sum(
+                    count
+                    for (_, completion_outcome), count in stale_completions
+                    if completion_outcome == outcome
+                )
+                for outcome in ("dispatched", "fallback", "error")
+            },
+            "paths": {
+                path: sum(
+                    count
+                    for (completion_path, _), count in stale_completions
+                    if completion_path == path
+                )
+                for path in _WIDTH4_RECEIPT_PATHS
+            },
+        },
     }
 
 

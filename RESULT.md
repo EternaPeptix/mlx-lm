@@ -27,8 +27,9 @@ The callable surface is:
 - `reset_k3_width4_dispatch_receipt()` clears all process-local counters; and
 - `k3_width4_dispatch_receipt_enabled()` exposes the strict cached selector.
 
-Snapshots use schema version 2 and contain:
+Snapshots use schema version 3 and contain:
 
+- the current receipt generation;
 - aggregate `attempted`, `supported`, `dispatched`, `fallback`, and `error`
   counters;
 - the same counters separated into `switch_glu` and `switch_glu_reduce` paths;
@@ -38,14 +39,20 @@ Snapshots use schema version 2 and contain:
   receipt, fused-expert, down-reduce, width-four, and derived-bias selectors;
 - aggregate terminal records with path, outcome, support state, reason class,
   selectors, and count; and
+- aggregate stale-completion diagnostics by outcome and path; and
 - the current selector state at snapshot time.
 
 The implementation captures an in-flight attempt without publishing partial
 counters. It commits exactly one terminal record under one lock when that
 attempt dispatches, falls back, or raises. Snapshots copy only committed records
-under that lock and derive every aggregate from the copy. Reset clears only
-committed records under the same lock; an attempt that completes after reset is
-therefore counted as one complete post-reset terminal record.
+under that lock and derive every aggregate from the copy.
+
+Reset is an epoch boundary: it increments the generation and clears the current
+terminal records and stale diagnostics under the same lock. Each attempt
+captures its generation at begin. If a pre-reset attempt completes afterward,
+its outcome is excluded from the new generation's totals and increments only
+the stale-completion diagnostic. This prevents pre-bracket work from
+contaminating a protected post-reset measurement.
 
 `attempted` is the number of terminal records, so the invariant is
 `attempted == dispatched + fallback + error`. In-flight work is intentionally
@@ -80,11 +87,11 @@ No cluster hosts, network, model files, or service were used.
 Final source/test SHA-256 values:
 
 - `mlx_lm/models/kimi_k3_fused_expert.py`:
-  `310a217405526823fbabfd50450bc758c961e9cdb5df13e26460971edb5646c5`;
+  `3e5e45337d521bf4e8f5e4b2578ab75cffe40d4fd7af39387acfb4c4e87bc95d`;
 - `mlx_lm/models/kimi_k3_width4_fused_expert.py`:
   `5e22a89e1c9b731eedfd342d6b18a3e3324574477e7991df8040658769e0a832`;
 - `tests/test_kimi_k3_width4_fused_expert.py`:
-  `5da76b7f15a255cbab8fbbb0f6f0e53a9d668b8883d784ef6800ec318a712376`.
+  `35a97c379d604acc5479768b2c5ba2cee148aa4b91ba35185b44e77eaa279c23`.
 
 ## Verification
 
@@ -97,10 +104,11 @@ rtk /Users/jeweled/Documents/Codex/2026-07-24/we/work/exo-k3-authoritative-pack/
 Result: **11/11 passed**. The receipt-specific coverage proves strict
 default-off parsing, exact candidate dispatch accounting, raw selector capture,
 classified unsupported-geometry fallback, atomic snapshot/reset behavior while
-a worker is held inside candidate dispatch, and terminal error accounting for a
-compiled-call exception. Existing width-four selector and adapter routing tests
-also remain green. These focused tests mock the compiled candidate and do not
-dispatch a Metal kernel.
+a worker is held inside candidate dispatch, generation-bound exclusion of that
+pre-reset completion, and terminal error accounting for a compiled-call
+exception. Existing width-four selector and adapter routing tests also remain
+green. These focused tests mock the compiled candidate and do not dispatch a
+Metal kernel.
 
 Full fused-expert regression with the sealed unified Python 3.13 MLX runtime:
 
