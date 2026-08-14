@@ -1,4 +1,4 @@
-# Kimi K3 full packed-front request receipt
+# Kimi K3 authoritative W1+W3 packed-front request receipt
 
 Status: default-off, offline diagnostic source. No service or cluster result is
 claimed by this revision.
@@ -11,13 +11,15 @@ and abort lifecycle publishes only a fixed schema string, bounded integers,
 and booleans. It never publishes prompt text, tokens, paths, tensor values,
 module identities, exception strings, or source-layout details.
 
-The receipt counts every authoritative helper call into exactly one terminal
-class: gate disabled, noncontract, exact width-three packed hit, unsupported
-source, or packed-dispatch fallback. Terminal ordinary/no-draft calls are
-normal noncontract calls. Exact hits additionally count their four returned
-projection tensors. Lazy installs are counted only when an otherwise eligible
-exact `(1, 3, 7168)` call creates the authoritative parent. Invalidation and
-stale-reset counters are independent side events and do not double-count a
+The authoritative implementation already accelerates exact width one as well
+as the new exact width three. The receipt therefore labels the candidate
+honestly as the combined W1+W3 route. It partitions every helper call into gate
+disabled, noncontract, packed hit, unsupported source, or packed-dispatch
+fallback; eligible calls, hits, returned tensors, installs, unsupported calls,
+and dispatch fallbacks are also partitioned independently for width one and
+width three. Aggregate identities are checked at finish. Ordinary/no-draft W1
+calls are never hidden under generic noncontract accounting. Invalidation and
+stale-reset counters remain independent side events and do not double-count a
 helper outcome.
 
 Begin and finish each require and traverse the exact

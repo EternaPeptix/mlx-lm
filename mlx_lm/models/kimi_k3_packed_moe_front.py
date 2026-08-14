@@ -44,7 +44,7 @@ AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_ENV = (
 )
 PACKED_MOE_FRONT_WIDTH8_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8"
 AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_SCHEMA = (
-    "kimi-k3-authoritative-packed-moe-front-receipt/v1"
+    "kimi-k3-authoritative-packed-moe-front-receipt/v2"
 )
 _UNSUPPORTED = object()
 _PACKED_ARRAY_NAMES = ("weight", "scales", "biases", "bias")
@@ -65,12 +65,24 @@ class _PackedFrontReceiptState:
     authoritative_gate_enabled: bool
     width3_gate_enabled: bool
     helper_calls: int = 0
+    eligible_width1_calls: int = 0
+    eligible_width3_calls: int = 0
+    packed_width1_hits: int = 0
+    packed_width3_hits: int = 0
     packed_hits: int = 0
+    packed_width1_output_tensors: int = 0
+    packed_width3_output_tensors: int = 0
     packed_output_tensors: int = 0
+    packed_width1_installs: int = 0
+    packed_width3_installs: int = 0
     lazy_installs: int = 0
     gate_disabled_calls: int = 0
     noncontract_calls: int = 0
+    width1_unsupported_calls: int = 0
+    width3_unsupported_calls: int = 0
     unsupported_calls: int = 0
+    width1_dispatch_fallback_calls: int = 0
+    width3_dispatch_fallback_calls: int = 0
     packed_dispatch_fallback_calls: int = 0
     invalidations: int = 0
     stale_resets: int = 0
@@ -83,12 +95,24 @@ _RECEIPT_STATE: ContextVar[_PackedFrontReceiptState | None] = ContextVar(
 _RECEIPT_COUNTER_FIELDS = frozenset(
     {
         "helper_calls",
+        "eligible_width1_calls",
+        "eligible_width3_calls",
+        "packed_width1_hits",
+        "packed_width3_hits",
         "packed_hits",
+        "packed_width1_output_tensors",
+        "packed_width3_output_tensors",
         "packed_output_tensors",
+        "packed_width1_installs",
+        "packed_width3_installs",
         "lazy_installs",
         "gate_disabled_calls",
         "noncontract_calls",
+        "width1_unsupported_calls",
+        "width3_unsupported_calls",
         "unsupported_calls",
+        "width1_dispatch_fallback_calls",
+        "width3_dispatch_fallback_calls",
         "packed_dispatch_fallback_calls",
         "invalidations",
         "stale_resets",
@@ -291,12 +315,12 @@ def _increment_receipt(**increments: int) -> None:
     _RECEIPT_STATE.set(replace(state, **changes))
 
 
-def _receipt_helper_started(sparse_moe: Any, x: mx.array, gate_enabled: bool) -> bool:
-    """Account one helper call and return whether it is exact width-three."""
+def _receipt_helper_started(sparse_moe: Any, x: mx.array, gate_enabled: bool) -> int:
+    """Account one helper call and return its eligible width, or zero."""
 
     state = _RECEIPT_STATE.get()
     if state is None:
-        return False
+        return 0
     current_gate = _strict_receipt_gate(AUTHORITATIVE_PACKED_MOE_FRONT_ENV)
     current_width3_gate = _strict_receipt_gate(
         AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV
@@ -310,20 +334,28 @@ def _receipt_helper_started(sparse_moe: Any, x: mx.array, gate_enabled: bool) ->
     _increment_receipt(helper_calls=1)
     if not current_gate:
         _increment_receipt(gate_disabled_calls=1)
-        return False
-    exact_width3 = (
+        return 0
+    common_contract = (
         not getattr(sparse_moe, "training", True)
-        and current_width3_gate
         and x.ndim == 3
-        and tuple(int(dim) for dim in x.shape) == (1, 3, _WIDTH3_INPUT_DIMS)
+        and int(x.shape[0]) == 1
+        and int(x.shape[2]) == _WIDTH3_INPUT_DIMS
         and x.dtype == mx.bfloat16
     )
-    if not exact_width3:
-        _increment_receipt(noncontract_calls=1)
-    return exact_width3
+    if common_contract:
+        width = int(x.shape[1])
+        if width == 1:
+            _increment_receipt(eligible_width1_calls=1)
+            return width
+        if width == 3 and current_width3_gate:
+            _increment_receipt(eligible_width3_calls=1)
+            return width
+    _increment_receipt(noncontract_calls=1)
+    return 0
 
 
-def _receipt_width3_outcome(
+def _receipt_eligible_outcome(
+    width: int,
     outcome: str,
     *,
     output_tensors: int = 0,
@@ -331,17 +363,33 @@ def _receipt_width3_outcome(
     state = _RECEIPT_STATE.get()
     if state is None:
         return
-    fields = {
-        "packed_hit": "packed_hits",
-        "unsupported": "unsupported_calls",
-        "packed_dispatch_fallback": "packed_dispatch_fallback_calls",
-    }
-    field = fields.get(outcome)
-    if field is None:
+    if width not in {1, 3}:
+        raise ValueError("packed-front receipt eligible width must be one or three")
+    if outcome not in {"packed_hit", "unsupported", "packed_dispatch_fallback"}:
         raise KeyError(f"unknown packed-front receipt outcome: {outcome}")
-    increments = {field: 1}
+    width_name = f"width{width}"
     if outcome == "packed_hit":
-        increments["packed_output_tensors"] = output_tensors
+        increments = {
+            "packed_hits": 1,
+            f"packed_{width_name}_hits": 1,
+        }
+    elif outcome == "unsupported":
+        increments = {
+            "unsupported_calls": 1,
+            f"{width_name}_unsupported_calls": 1,
+        }
+    else:
+        increments = {
+            "packed_dispatch_fallback_calls": 1,
+            f"{width_name}_dispatch_fallback_calls": 1,
+        }
+    if outcome == "packed_hit":
+        increments.update(
+            {
+                "packed_output_tensors": output_tensors,
+                f"packed_{width_name}_output_tensors": output_tensors,
+            }
+        )
     _increment_receipt(**increments)
 
 
@@ -367,6 +415,30 @@ def finish_authoritative_packed_moe_front_receipt(
     )
     if terminal_total != state.helper_calls:
         raise RuntimeError("packed-front receipt helper partition is incomplete")
+    if state.eligible_width1_calls != (
+        state.packed_width1_hits
+        + state.width1_unsupported_calls
+        + state.width1_dispatch_fallback_calls
+    ) or state.eligible_width3_calls != (
+        state.packed_width3_hits
+        + state.width3_unsupported_calls
+        + state.width3_dispatch_fallback_calls
+    ):
+        raise RuntimeError(
+            "packed-front receipt eligible-width partition is incomplete"
+        )
+    if (
+        state.packed_hits != state.packed_width1_hits + state.packed_width3_hits
+        or state.packed_output_tensors
+        != state.packed_width1_output_tensors + state.packed_width3_output_tensors
+        or state.lazy_installs
+        != state.packed_width1_installs + state.packed_width3_installs
+        or state.unsupported_calls
+        != state.width1_unsupported_calls + state.width3_unsupported_calls
+        or state.packed_dispatch_fallback_calls
+        != state.width1_dispatch_fallback_calls + state.width3_dispatch_fallback_calls
+    ):
+        raise RuntimeError("packed-front receipt aggregate partition is incomplete")
     return {
         "schema": AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_SCHEMA,
         "request_sequence": state.request_sequence,
@@ -376,12 +448,24 @@ def finish_authoritative_packed_moe_front_receipt(
         "authoritative_gate_enabled": state.authoritative_gate_enabled,
         "width3_gate_enabled": state.width3_gate_enabled,
         "helper_calls": state.helper_calls,
+        "eligible_width1_calls": state.eligible_width1_calls,
+        "eligible_width3_calls": state.eligible_width3_calls,
+        "packed_width1_hits": state.packed_width1_hits,
+        "packed_width3_hits": state.packed_width3_hits,
         "packed_hits": state.packed_hits,
+        "packed_width1_output_tensors": state.packed_width1_output_tensors,
+        "packed_width3_output_tensors": state.packed_width3_output_tensors,
         "packed_output_tensors": state.packed_output_tensors,
+        "packed_width1_installs": state.packed_width1_installs,
+        "packed_width3_installs": state.packed_width3_installs,
         "lazy_installs": state.lazy_installs,
         "gate_disabled_calls": state.gate_disabled_calls,
         "noncontract_calls": state.noncontract_calls,
+        "width1_unsupported_calls": state.width1_unsupported_calls,
+        "width3_unsupported_calls": state.width3_unsupported_calls,
         "unsupported_calls": state.unsupported_calls,
+        "width1_dispatch_fallback_calls": state.width1_dispatch_fallback_calls,
+        "width3_dispatch_fallback_calls": state.width3_dispatch_fallback_calls,
         "packed_dispatch_fallback_calls": state.packed_dispatch_fallback_calls,
         "invalidations": state.invalidations,
         "stale_resets": state.stale_resets,
@@ -890,7 +974,7 @@ def maybe_authoritative_packed_k3_moe_front(
     """Return one native packed QMV backed by authoritative source views."""
 
     gate_enabled = authoritative_packed_moe_front_enabled()
-    receipt_width3_call = _receipt_helper_started(sparse_moe, x, gate_enabled)
+    receipt_eligible_width = _receipt_helper_started(sparse_moe, x, gate_enabled)
     if not gate_enabled:
         return None
 
@@ -907,16 +991,16 @@ def maybe_authoritative_packed_k3_moe_front(
         modules = _front_modules(sparse_moe)
     except (AttributeError, PackedMoEFrontUnsupported):
         invalidate_packed_k3_moe_front(sparse_moe)
-        if receipt_width3_call:
-            _receipt_width3_outcome("unsupported")
+        if receipt_eligible_width:
+            _receipt_eligible_outcome(receipt_eligible_width, "unsupported")
         return None
     if int(x.shape[1]) == 3 and not _production_width3_source_layout_supported(modules):
         # A previously installed authoritative parent can outlive a later
         # source mutation.  Release it before falling back so an ineligible
         # width-three call never leaves hidden packed storage resident.
         invalidate_packed_k3_moe_front(sparse_moe)
-        if receipt_width3_call:
-            _receipt_width3_outcome("unsupported")
+        if receipt_eligible_width:
+            _receipt_eligible_outcome(receipt_eligible_width, "unsupported")
         return None
 
     packed = getattr(
@@ -933,8 +1017,8 @@ def maybe_authoritative_packed_k3_moe_front(
             (),
         )
         if _same_source_signature(unsupported_signature, current_signature):
-            if receipt_width3_call:
-                _receipt_width3_outcome("unsupported")
+            if receipt_eligible_width:
+                _receipt_eligible_outcome(receipt_eligible_width, "unsupported")
             return None
         _increment_receipt(stale_resets=1)
         _drop_authoritative_packed_k3_moe_front(sparse_moe)
@@ -983,25 +1067,35 @@ def maybe_authoritative_packed_k3_moe_front(
                 "_authoritative_packed_k3_moe_front_source_signature",
                 current_signature,
             )
-            if receipt_width3_call:
-                _receipt_width3_outcome("unsupported")
+            if receipt_eligible_width:
+                _receipt_eligible_outcome(receipt_eligible_width, "unsupported")
             return None
         object.__setattr__(
             sparse_moe,
             "_authoritative_packed_k3_moe_front",
             packed,
         )
-        if receipt_width3_call:
-            _increment_receipt(lazy_installs=1)
+        if receipt_eligible_width:
+            _increment_receipt(
+                lazy_installs=1,
+                **{f"packed_width{receipt_eligible_width}_installs": 1},
+            )
 
     try:
         outputs = packed(x)
     except PackedMoEFrontUnsupported:
-        if receipt_width3_call:
-            _receipt_width3_outcome("packed_dispatch_fallback")
+        if receipt_eligible_width:
+            _receipt_eligible_outcome(
+                receipt_eligible_width,
+                "packed_dispatch_fallback",
+            )
         return None
-    if receipt_width3_call:
-        _receipt_width3_outcome("packed_hit", output_tensors=len(outputs))
+    if receipt_eligible_width:
+        _receipt_eligible_outcome(
+            receipt_eligible_width,
+            "packed_hit",
+            output_tensors=len(outputs),
+        )
     return outputs
 
 

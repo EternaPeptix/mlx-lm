@@ -1397,12 +1397,24 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
                 "authoritative_gate_enabled",
                 "width3_gate_enabled",
                 "helper_calls",
+                "eligible_width1_calls",
+                "eligible_width3_calls",
+                "packed_width1_hits",
+                "packed_width3_hits",
                 "packed_hits",
+                "packed_width1_output_tensors",
+                "packed_width3_output_tensors",
                 "packed_output_tensors",
+                "packed_width1_installs",
+                "packed_width3_installs",
                 "lazy_installs",
                 "gate_disabled_calls",
                 "noncontract_calls",
+                "width1_unsupported_calls",
+                "width3_unsupported_calls",
                 "unsupported_calls",
+                "width1_dispatch_fallback_calls",
+                "width3_dispatch_fallback_calls",
                 "packed_dispatch_fallback_calls",
                 "invalidations",
                 "stale_resets",
@@ -1415,10 +1427,18 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
         )
         self.assertEqual(receipt["helper_calls"], 2)
         self.assertEqual(receipt["expected_layers"], 92)
-        self.assertEqual(receipt["packed_hits"], 1)
-        self.assertEqual(receipt["packed_output_tensors"], 4)
+        self.assertEqual(receipt["eligible_width1_calls"], 1)
+        self.assertEqual(receipt["eligible_width3_calls"], 1)
+        self.assertEqual(receipt["packed_width1_hits"], 1)
+        self.assertEqual(receipt["packed_width3_hits"], 1)
+        self.assertEqual(receipt["packed_hits"], 2)
+        self.assertEqual(receipt["packed_width1_output_tensors"], 4)
+        self.assertEqual(receipt["packed_width3_output_tensors"], 4)
+        self.assertEqual(receipt["packed_output_tensors"], 8)
+        self.assertEqual(receipt["packed_width1_installs"], 0)
+        self.assertEqual(receipt["packed_width3_installs"], 1)
         self.assertEqual(receipt["lazy_installs"], 1)
-        self.assertEqual(receipt["noncontract_calls"], 1)
+        self.assertEqual(receipt["noncontract_calls"], 0)
         self.assertEqual(receipt["pack_count_before"], 0)
         self.assertEqual(receipt["pack_count_after"], 1)
         round_trip = json.loads(json.dumps(receipt, sort_keys=True))
@@ -1452,11 +1472,23 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
         self.assertEqual(receipt["helper_calls"], 2)
         self.assertEqual(receipt["gate_disabled_calls"], 2)
         for name in (
+            "eligible_width1_calls",
+            "eligible_width3_calls",
+            "packed_width1_hits",
+            "packed_width3_hits",
             "packed_hits",
+            "packed_width1_output_tensors",
+            "packed_width3_output_tensors",
             "packed_output_tensors",
+            "packed_width1_installs",
+            "packed_width3_installs",
             "lazy_installs",
             "noncontract_calls",
+            "width1_unsupported_calls",
+            "width3_unsupported_calls",
             "unsupported_calls",
+            "width1_dispatch_fallback_calls",
+            "width3_dispatch_fallback_calls",
             "packed_dispatch_fallback_calls",
             "pack_count_before",
             "pack_count_after",
@@ -1521,8 +1553,12 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
             first = begin_authoritative_packed_moe_front_receipt(31, object())
             packed_front_module._increment_receipt(
                 helper_calls=92,
+                eligible_width3_calls=92,
+                packed_width3_hits=92,
                 packed_hits=92,
+                packed_width3_output_tensors=368,
                 packed_output_tensors=368,
+                packed_width3_installs=92,
                 lazy_installs=92,
             )
             startup = finish_authoritative_packed_moe_front_receipt(*first, object())
@@ -1530,7 +1566,10 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
             second = begin_authoritative_packed_moe_front_receipt(32, object())
             packed_front_module._increment_receipt(
                 helper_calls=92,
+                eligible_width3_calls=92,
+                packed_width3_hits=92,
                 packed_hits=92,
+                packed_width3_output_tensors=368,
                 packed_output_tensors=368,
             )
             later = finish_authoritative_packed_moe_front_receipt(*second, object())
@@ -1612,7 +1651,10 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
                 return_value=FallbackPacked(),
             ):
                 self.assertIsNone(
-                    maybe_authoritative_packed_k3_moe_front(sparse_moe, x)
+                    maybe_authoritative_packed_k3_moe_front(
+                        sparse_moe,
+                        mx.zeros((1, 1, 7168), dtype=mx.bfloat16),
+                    )
                 )
             fallback = finish_authoritative_packed_moe_front_receipt(
                 *fallback_handle,
@@ -1620,9 +1662,15 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
             )
 
         self.assertEqual(unsupported["unsupported_calls"], 1)
+        self.assertEqual(unsupported["width3_unsupported_calls"], 1)
+        self.assertEqual(unsupported["width1_unsupported_calls"], 0)
         self.assertEqual(unsupported["packed_dispatch_fallback_calls"], 0)
         self.assertEqual(fallback["unsupported_calls"], 0)
         self.assertEqual(fallback["packed_dispatch_fallback_calls"], 1)
+        self.assertEqual(fallback["width1_dispatch_fallback_calls"], 1)
+        self.assertEqual(fallback["width3_dispatch_fallback_calls"], 0)
+        self.assertEqual(fallback["packed_width1_installs"], 1)
+        self.assertEqual(fallback["packed_width3_installs"], 0)
         self.assertEqual(fallback["lazy_installs"], 1)
 
     def test_invalidation_and_stale_reset_side_events_are_counted_once(self):
