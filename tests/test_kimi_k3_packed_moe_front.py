@@ -1243,13 +1243,43 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
             ),
         ):
             self.assertEqual(
-                packed_front_module._count_model_authoritative_width3_packs(model),
+                packed_front_module._count_model_authoritative_width3_packs(
+                    model,
+                    expected_layers=3,
+                ),
                 1,
             )
             layers[1].mlp._authoritative_packed_k3_moe_front.matches = True
             self.assertEqual(
-                packed_front_module._count_model_authoritative_width3_packs(model),
+                packed_front_module._count_model_authoritative_width3_packs(
+                    model,
+                    expected_layers=3,
+                ),
                 2,
+            )
+
+    def test_model_scan_rejects_wrong_wrapper_and_sparse_layer_cardinality(self):
+        with self.assertRaisesRegex(
+            TypeError,
+            "model.language_model.model.layers",
+        ):
+            packed_front_module._count_model_authoritative_width3_packs(
+                object(),
+                expected_layers=1,
+            )
+
+        model = SimpleNamespace(
+            language_model=SimpleNamespace(
+                model=SimpleNamespace(layers=(SimpleNamespace(mlp=object()),)),
+            )
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "expected 1 production sparse layers, found 0",
+        ):
+            packed_front_module._count_model_authoritative_width3_packs(
+                model,
+                expected_layers=1,
             )
 
     def test_model_scan_traverses_a_minimal_real_kimi_model_shape(self):
@@ -1284,14 +1314,21 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            packed_front_module._count_model_authoritative_width3_packs(model),
+            packed_front_module._count_model_authoritative_width3_packs(
+                model,
+                expected_layers=1,
+            ),
             1,
         )
         source.gate.bits = 4
-        self.assertEqual(
-            packed_front_module._count_model_authoritative_width3_packs(model),
-            0,
-        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "expected 1 production sparse layers, found 0",
+        ):
+            packed_front_module._count_model_authoritative_width3_packs(
+                model,
+                expected_layers=1,
+            )
 
     def test_exact_receipt_schema_is_scalar_only_and_partitions_calls(self):
         sparse_moe = SimpleNamespace(training=False)
@@ -1355,6 +1392,7 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
                 "schema",
                 "request_sequence",
                 "request_token",
+                "expected_layers",
                 "finalized",
                 "authoritative_gate_enabled",
                 "width3_gate_enabled",
@@ -1376,6 +1414,7 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
             receipt["schema"], AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_SCHEMA
         )
         self.assertEqual(receipt["helper_calls"], 2)
+        self.assertEqual(receipt["expected_layers"], 92)
         self.assertEqual(receipt["packed_hits"], 1)
         self.assertEqual(receipt["packed_output_tensors"], 4)
         self.assertEqual(receipt["lazy_installs"], 1)
@@ -1585,6 +1624,78 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
         self.assertEqual(fallback["unsupported_calls"], 0)
         self.assertEqual(fallback["packed_dispatch_fallback_calls"], 1)
         self.assertEqual(fallback["lazy_installs"], 1)
+
+    def test_invalidation_and_stale_reset_side_events_are_counted_once(self):
+        x = mx.zeros((1, 3, 7168), dtype=mx.bfloat16)
+        modules = (object(), object(), object(), object())
+
+        class FakePacked:
+            def __call__(self, inputs):
+                return tuple(
+                    mx.zeros((1, int(inputs.shape[1]), size), dtype=inputs.dtype)
+                    for size in (3072, 3072, 896, 3584)
+                )
+
+        with (
+            patch.dict(os.environ, self._candidate_environment(), clear=True),
+            patch.object(
+                packed_front_module,
+                "_count_model_authoritative_width3_packs",
+                return_value=92,
+            ),
+        ):
+            invalidate_handle = begin_authoritative_packed_moe_front_receipt(
+                51,
+                object(),
+            )
+            invalidate_packed_k3_moe_front(SimpleNamespace())
+            invalidated = finish_authoritative_packed_moe_front_receipt(
+                *invalidate_handle,
+                object(),
+            )
+
+            sparse_moe = SimpleNamespace(
+                training=False,
+                _authoritative_packed_k3_moe_front=packed_front_module._UNSUPPORTED,
+                _authoritative_packed_k3_moe_front_source_signature=((1,),),
+            )
+            stale_handle = begin_authoritative_packed_moe_front_receipt(52, object())
+            with (
+                patch.object(
+                    packed_front_module,
+                    "_front_modules",
+                    return_value=modules,
+                ),
+                patch.object(
+                    packed_front_module,
+                    "_production_width3_source_layout_supported",
+                    return_value=True,
+                ),
+                patch.object(
+                    packed_front_module,
+                    "_source_signature",
+                    return_value=((2,),),
+                ),
+                patch.object(
+                    packed_front_module,
+                    "_build_authoritative_packed_front",
+                    return_value=FakePacked(),
+                ),
+            ):
+                outputs = maybe_authoritative_packed_k3_moe_front(sparse_moe, x)
+            stale = finish_authoritative_packed_moe_front_receipt(
+                *stale_handle,
+                object(),
+            )
+
+        self.assertEqual(invalidated["invalidations"], 1)
+        self.assertEqual(invalidated["stale_resets"], 0)
+        self.assertEqual(invalidated["helper_calls"], 0)
+        self.assertIsNotNone(outputs)
+        self.assertEqual(stale["stale_resets"], 1)
+        self.assertEqual(stale["invalidations"], 0)
+        self.assertEqual(stale["packed_hits"], 1)
+        self.assertEqual(stale["lazy_installs"], 1)
 
 
 if __name__ == "__main__":

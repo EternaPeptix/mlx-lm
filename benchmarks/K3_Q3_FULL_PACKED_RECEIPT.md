@@ -20,14 +20,18 @@ exact `(1, 3, 7168)` call creates the authoritative parent. Invalidation and
 stale-reset counters are independent side events and do not double-count a
 helper outcome.
 
-Begin and finish each traverse `language_model.model.layers` read-only. They
-count only installed `AuthoritativePackedK3MoEFront` parents that still match
-the exact four production source banks. This makes startup `0 -> 92` and later
-`92 -> 92` claims observations rather than inference from calls seen during a
-request. The Python layer cannot observe whether Metal internally selected its
-specialized kernel or a generic implementation, so the receipt deliberately
-does not invent a native-fallback counter. Native core, `libmlx`, metallib,
-JACCL, and selector-map identity remain obligations of the signed arm receipt.
+Begin and finish each require and traverse the exact
+`language_model.model.layers` path read-only. The caller supplies an expected
+sparse-layer count (92 in the EXO contract); traversal fails unless exactly
+that many layers expose the production four-bank layout. It counts only
+installed `AuthoritativePackedK3MoEFront` parents that still match those source
+banks. This makes startup `0 -> 92` and later `92 -> 92` claims observations
+rather than inference from calls seen during a request, and prevents a wrong
+model wrapper from masquerading as a clean zero. The Python layer cannot
+observe whether Metal internally selected its specialized kernel or a generic
+implementation, so the receipt deliberately does not invent a native-fallback
+counter. Native core, `libmlx`, metallib, JACCL, and selector-map identity
+remain obligations of the signed arm receipt.
 
 Instrumentation is structurally symmetric: matched A/B arms both enable the
 receipt selector and pay the same context lifecycle, helper-call accounting,

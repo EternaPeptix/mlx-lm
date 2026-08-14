@@ -60,6 +60,7 @@ _RECEIPT_SEQUENCE_LOCK = Lock()
 class _PackedFrontReceiptState:
     request_sequence: int
     request_token: int
+    expected_layers: int
     pack_count_before: int
     authoritative_gate_enabled: bool
     width3_gate_enabled: bool
@@ -78,6 +79,20 @@ class _PackedFrontReceiptState:
 _RECEIPT_STATE: ContextVar[_PackedFrontReceiptState | None] = ContextVar(
     "kimi_k3_authoritative_packed_moe_front_receipt",
     default=None,
+)
+_RECEIPT_COUNTER_FIELDS = frozenset(
+    {
+        "helper_calls",
+        "packed_hits",
+        "packed_output_tensors",
+        "lazy_installs",
+        "gate_disabled_calls",
+        "noncontract_calls",
+        "unsupported_calls",
+        "packed_dispatch_fallback_calls",
+        "invalidations",
+        "stale_resets",
+    }
 )
 
 
@@ -120,20 +135,50 @@ def _validate_request_binding(request_sequence: int, request_token: int) -> None
         raise ValueError("packed-front receipt token must fit nonnegative int64")
 
 
-def _count_model_authoritative_width3_packs(model: Any) -> int:
-    """Read the exact currently installed production-width3 parent count."""
+def _validate_expected_receipt_layers(expected_layers: int) -> None:
+    if (
+        type(expected_layers) is not int
+        or not 1 <= expected_layers <= _RECEIPT_COUNTER_LIMIT
+    ):
+        raise ValueError("packed-front receipt expected layers must be a positive int")
 
-    language_model = getattr(model, "language_model", None)
-    inner_model = getattr(language_model, "model", None)
-    layers = getattr(inner_model, "layers", ())
+
+def _count_model_authoritative_width3_packs(
+    model: Any,
+    *,
+    expected_layers: int,
+) -> int:
+    """Read installed parents after proving the exact sparse-layer traversal."""
+
+    _validate_expected_receipt_layers(expected_layers)
+    try:
+        layers = model.language_model.model.layers
+    except AttributeError as error:
+        raise TypeError(
+            "packed-front receipt requires model.language_model.model.layers"
+        ) from error
     try:
         iterator = iter(layers)
     except TypeError as error:
         raise TypeError("packed-front receipt model layers are not iterable") from error
 
     count = 0
+    relevant_layers = 0
     for layer in iterator:
         sparse_moe = getattr(layer, "mlp", None)
+        try:
+            modules = _front_modules(sparse_moe)
+        except (AttributeError, PackedMoEFrontUnsupported):
+            continue
+        try:
+            production_layout = _production_width3_source_layout_supported(modules)
+        except (AttributeError, TypeError, ValueError):
+            production_layout = False
+        if not production_layout:
+            continue
+        relevant_layers += 1
+        if relevant_layers > expected_layers:
+            break
         packed = getattr(
             sparse_moe,
             "_authoritative_packed_k3_moe_front",
@@ -142,12 +187,10 @@ def _count_model_authoritative_width3_packs(model: Any) -> int:
         if not isinstance(packed, AuthoritativePackedK3MoEFront):
             continue
         try:
-            modules = _front_modules(sparse_moe)
             active = (
                 packed._input_dims == _WIDTH3_INPUT_DIMS
                 and packed._output_dims == _WIDTH3_OUTPUT_DIMS
                 and packed._production_width3_source_layout
-                and _production_width3_source_layout_supported(modules)
                 and packed.matches_sources(modules)
             )
         except (AttributeError, PackedMoEFrontUnsupported, TypeError, ValueError):
@@ -158,12 +201,19 @@ def _count_model_authoritative_width3_packs(model: Any) -> int:
                 raise OverflowError(
                     "packed-front receipt pack count exceeded its bound"
                 )
+    if relevant_layers != expected_layers:
+        raise ValueError(
+            "packed-front receipt expected "
+            f"{expected_layers} production sparse layers, found {relevant_layers}"
+        )
     return count
 
 
 def begin_authoritative_packed_moe_front_receipt(
     request_token: int,
     model: Any,
+    *,
+    expected_layers: int = 92,
 ) -> tuple[int, int]:
     """Begin one context-local receipt and snapshot installed parents."""
 
@@ -173,6 +223,7 @@ def begin_authoritative_packed_moe_front_receipt(
     if not authoritative_packed_moe_front_receipt_enabled():
         raise RuntimeError("packed-front receipt capture is disabled")
     _validate_request_binding(1, request_token)
+    _validate_expected_receipt_layers(expected_layers)
     request_sequence = _next_receipt_sequence()
     authoritative_gate_enabled = _strict_receipt_gate(
         AUTHORITATIVE_PACKED_MOE_FRONT_ENV
@@ -188,7 +239,11 @@ def begin_authoritative_packed_moe_front_receipt(
     state = _PackedFrontReceiptState(
         request_sequence=request_sequence,
         request_token=request_token,
-        pack_count_before=_count_model_authoritative_width3_packs(model),
+        expected_layers=expected_layers,
+        pack_count_before=_count_model_authoritative_width3_packs(
+            model,
+            expected_layers=expected_layers,
+        ),
         authoritative_gate_enabled=authoritative_gate_enabled,
         width3_gate_enabled=width3_gate_enabled,
     )
@@ -227,7 +282,7 @@ def _increment_receipt(**increments: int) -> None:
         return
     changes: dict[str, int] = {}
     for name, amount in increments.items():
-        if name not in _PackedFrontReceiptState.__dataclass_fields__:
+        if name not in _RECEIPT_COUNTER_FIELDS:
             raise KeyError(f"unknown packed-front receipt counter: {name}")
         current = getattr(state, name)
         if type(current) is not int:
@@ -299,7 +354,10 @@ def finish_authoritative_packed_moe_front_receipt(
 
     state = _receipt_state_for_binding(request_sequence, request_token)
     _RECEIPT_STATE.set(None)
-    pack_count_after = _count_model_authoritative_width3_packs(model)
+    pack_count_after = _count_model_authoritative_width3_packs(
+        model,
+        expected_layers=state.expected_layers,
+    )
     terminal_total = (
         state.gate_disabled_calls
         + state.noncontract_calls
@@ -313,6 +371,7 @@ def finish_authoritative_packed_moe_front_receipt(
         "schema": AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_SCHEMA,
         "request_sequence": state.request_sequence,
         "request_token": state.request_token,
+        "expected_layers": state.expected_layers,
         "finalized": True,
         "authoritative_gate_enabled": state.authoritative_gate_enabled,
         "width3_gate_enabled": state.width3_gate_enabled,
