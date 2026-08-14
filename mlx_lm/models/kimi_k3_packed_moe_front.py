@@ -521,11 +521,19 @@ def _packed_input_supported(x: mx.array) -> bool:
 
 
 def _authoritative_packed_input_supported(x: mx.array) -> bool:
-    if _packed_input_supported(x):
+    if _RECEIPT_STATE.get() is None and _packed_input_supported(x):
+        # Preserve the pre-receipt default-off helper contract. The exact K3
+        # diagnostic path below is active only inside a bound receipt.
+        return True
+    if (
+        x.ndim == 3
+        and tuple(int(dim) for dim in x.shape) == (1, 1, _WIDTH3_INPUT_DIMS)
+        and x.dtype == mx.bfloat16
+    ):
         return True
     return (
         x.ndim == 3
-        and tuple(int(dim) for dim in x.shape) == (1, 3, 7168)
+        and tuple(int(dim) for dim in x.shape) == (1, 3, _WIDTH3_INPUT_DIMS)
         and x.dtype == mx.bfloat16
         and authoritative_packed_moe_front_width3_enabled()
     )
@@ -994,7 +1002,10 @@ def maybe_authoritative_packed_k3_moe_front(
         if receipt_eligible_width:
             _receipt_eligible_outcome(receipt_eligible_width, "unsupported")
         return None
-    if int(x.shape[1]) == 3 and not _production_width3_source_layout_supported(modules):
+    exact_receipt_width1 = _RECEIPT_STATE.get() is not None and int(x.shape[1]) == 1
+    if (
+        int(x.shape[1]) == 3 or exact_receipt_width1
+    ) and not _production_width3_source_layout_supported(modules):
         # A previously installed authoritative parent can outlive a later
         # source mutation.  Release it before falling back so an ineligible
         # width-three call never leaves hidden packed storage resident.

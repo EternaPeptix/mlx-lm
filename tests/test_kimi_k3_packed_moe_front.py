@@ -380,6 +380,7 @@ class PackedK3MoEFrontTests(unittest.TestCase):
 
 class AuthoritativePackedK3MoEFrontTests(unittest.TestCase):
     def setUp(self):
+        packed_front_module._RECEIPT_STATE.set(None)
         multibank_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_width3_enabled.cache_clear()
@@ -387,13 +388,14 @@ class AuthoritativePackedK3MoEFrontTests(unittest.TestCase):
         packed_moe_front_width8_enabled.cache_clear()
 
     def tearDown(self):
+        packed_front_module._RECEIPT_STATE.set(None)
         multibank_moe_front_enabled.cache_clear()
         packed_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_width3_enabled.cache_clear()
         packed_moe_front_width8_enabled.cache_clear()
 
-    def test_width_eight_authoritative_sparse_moe_is_bit_exact(self):
+    def test_width_eight_never_enters_exact_authoritative_route(self):
         mx.random.seed(30)
         module = _small_sparse_moe()
         x = mx.random.normal((1, 8, 128)).astype(mx.bfloat16)
@@ -410,21 +412,85 @@ class AuthoritativePackedK3MoEFrontTests(unittest.TestCase):
             expected = module(x)
             mx.eval(expected)
 
-        with patch.dict(
-            os.environ,
-            {
-                MULTIBANK_MOE_FRONT_ENV: "0",
-                AUTHORITATIVE_PACKED_MOE_FRONT_ENV: "1",
-                PACKED_MOE_FRONT_WIDTH8_ENV: "1",
-            },
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    MULTIBANK_MOE_FRONT_ENV: "0",
+                    AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_ENV: "1",
+                    AUTHORITATIVE_PACKED_MOE_FRONT_ENV: "1",
+                    AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV: "1",
+                    PACKED_MOE_FRONT_WIDTH8_ENV: "1",
+                },
+            ),
+            patch.object(
+                packed_front_module,
+                "_count_model_authoritative_width3_packs",
+                return_value=0,
+            ),
         ):
             authoritative_packed_moe_front_enabled.cache_clear()
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
             packed_moe_front_width8_enabled.cache_clear()
+            handle = begin_authoritative_packed_moe_front_receipt(4, object())
             actual = module(x)
             mx.eval(actual)
+            receipt = finish_authoritative_packed_moe_front_receipt(
+                *handle,
+                object(),
+            )
 
         self.assertTrue(bool(mx.array_equal(expected, actual).item()))
-        self.assertTrue(hasattr(module, "_authoritative_packed_k3_moe_front"))
+        self.assertFalse(hasattr(module, "_authoritative_packed_k3_moe_front"))
+        self.assertEqual(receipt["noncontract_calls"], 1)
+        self.assertEqual(receipt["packed_hits"], 0)
+
+    def test_width_one_model_eligibility_requires_exact_k3_geometry(self):
+        x = mx.zeros((1, 1, 7168), dtype=mx.bfloat16)
+        environment = {
+            AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_ENV: "1",
+            AUTHORITATIVE_PACKED_MOE_FRONT_ENV: "1",
+            AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV: "1",
+        }
+        exact = _FrontOnlySparse()
+        fake = _FakeAuthoritativePackedFront(exact)
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                packed_front_module,
+                "_count_model_authoritative_width3_packs",
+                return_value=0,
+            ),
+            patch(
+                "mlx_lm.models.kimi_k3_packed_moe_front."
+                "_build_authoritative_packed_front",
+                return_value=fake,
+            ) as build,
+        ):
+            authoritative_packed_moe_front_enabled.cache_clear()
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            handle = begin_authoritative_packed_moe_front_receipt(5, object())
+            outputs = maybe_authoritative_packed_k3_moe_front(exact, x)
+            for ineligible in (
+                mx.zeros((1, 1, 7167), dtype=mx.bfloat16),
+                mx.zeros((1, 1, 7168), dtype=mx.float16),
+            ):
+                self.assertIsNone(
+                    maybe_authoritative_packed_k3_moe_front(exact, ineligible)
+                )
+            altered = _FrontOnlySparse(output_dims=(3072, 3072, 895, 3584))
+            self.assertIsNone(maybe_authoritative_packed_k3_moe_front(altered, x))
+            receipt = finish_authoritative_packed_moe_front_receipt(
+                *handle,
+                object(),
+            )
+
+        self.assertIsNotNone(outputs)
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(receipt["eligible_width1_calls"], 2)
+        self.assertEqual(receipt["packed_width1_hits"], 1)
+        self.assertEqual(receipt["width1_unsupported_calls"], 1)
+        self.assertEqual(receipt["noncontract_calls"], 2)
 
     def test_width_three_full_pack_is_exact_only_at_production_input_shape(self):
         mx.random.seed(31)
@@ -1462,7 +1528,12 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
             authoritative_packed_moe_front_enabled.cache_clear()
             sequence, token = begin_authoritative_packed_moe_front_receipt(19, object())
             self.assertIsNone(maybe_authoritative_packed_k3_moe_front(sparse_moe, x))
-            self.assertIsNone(maybe_authoritative_packed_k3_moe_front(sparse_moe, x))
+            self.assertIsNone(
+                maybe_authoritative_packed_k3_moe_front(
+                    sparse_moe,
+                    mx.zeros((1, 1, 7168), dtype=mx.bfloat16),
+                )
+            )
             receipt = finish_authoritative_packed_moe_front_receipt(
                 sequence,
                 token,
@@ -1494,6 +1565,34 @@ class AuthoritativePackedK3MoEFrontReceiptTests(unittest.TestCase):
             "pack_count_after",
         ):
             self.assertEqual(receipt[name], 0)
+
+    def test_width_one_wrong_layout_is_unsupported_without_a_packed_hit(self):
+        sparse_moe = _FrontOnlySparse(output_dims=(3072, 3072, 895, 3584))
+        x = mx.zeros((1, 1, 7168), dtype=mx.bfloat16)
+        with (
+            patch.dict(os.environ, self._candidate_environment(), clear=True),
+            patch.object(
+                packed_front_module,
+                "_count_model_authoritative_width3_packs",
+                return_value=0,
+            ),
+        ):
+            authoritative_packed_moe_front_enabled.cache_clear()
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            handle = begin_authoritative_packed_moe_front_receipt(20, object())
+            self.assertIsNone(maybe_authoritative_packed_k3_moe_front(sparse_moe, x))
+            receipt = finish_authoritative_packed_moe_front_receipt(
+                *handle,
+                object(),
+            )
+
+        self.assertEqual(receipt["helper_calls"], 1)
+        self.assertEqual(receipt["eligible_width1_calls"], 1)
+        self.assertEqual(receipt["width1_unsupported_calls"], 1)
+        self.assertEqual(receipt["unsupported_calls"], 1)
+        self.assertEqual(receipt["packed_width1_hits"], 0)
+        self.assertEqual(receipt["packed_hits"], 0)
+        self.assertEqual(receipt["noncontract_calls"], 0)
 
     def test_receipt_abort_and_context_copy_do_not_leak_counters(self):
         with (
