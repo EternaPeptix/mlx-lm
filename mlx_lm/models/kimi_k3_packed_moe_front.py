@@ -24,24 +24,323 @@ has been validated; every other multi-token call remains on the stock path.
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from itertools import accumulate
+from threading import Lock
 from typing import Any, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
-
 
 PACKED_MOE_FRONT_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT"
 AUTHORITATIVE_PACKED_MOE_FRONT_ENV = "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT"
 AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV = (
     "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3"
 )
+AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_ENV = (
+    "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT"
+)
 PACKED_MOE_FRONT_WIDTH8_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8"
+AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_SCHEMA = (
+    "kimi-k3-authoritative-packed-moe-front-receipt/v1"
+)
 _UNSUPPORTED = object()
 _PACKED_ARRAY_NAMES = ("weight", "scales", "biases", "bias")
 _WIDTH3_INPUT_DIMS = 7168
 _WIDTH3_OUTPUT_DIMS = (3072, 3072, 896, 3584)
+_RECEIPT_COUNTER_LIMIT = 1_000_000_000
+_RECEIPT_SEQUENCE_LIMIT = 0x7FFFFFFFFFFFFFFF
+_RECEIPT_SEQUENCE = 0
+_RECEIPT_SEQUENCE_LOCK = Lock()
+
+
+@dataclass(frozen=True)
+class _PackedFrontReceiptState:
+    request_sequence: int
+    request_token: int
+    pack_count_before: int
+    authoritative_gate_enabled: bool
+    width3_gate_enabled: bool
+    helper_calls: int = 0
+    packed_hits: int = 0
+    packed_output_tensors: int = 0
+    lazy_installs: int = 0
+    gate_disabled_calls: int = 0
+    noncontract_calls: int = 0
+    unsupported_calls: int = 0
+    packed_dispatch_fallback_calls: int = 0
+    invalidations: int = 0
+    stale_resets: int = 0
+
+
+_RECEIPT_STATE: ContextVar[_PackedFrontReceiptState | None] = ContextVar(
+    "kimi_k3_authoritative_packed_moe_front_receipt",
+    default=None,
+)
+
+
+def authoritative_packed_moe_front_receipt_enabled() -> bool:
+    """Parse the strict, default-off request receipt selector."""
+
+    value = os.environ.get(AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_ENV} must be 0 or 1")
+    return value == "1"
+
+
+def _strict_receipt_gate(name: str) -> bool:
+    value = os.environ.get(name, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{name} must be 0 or 1 while receipt capture is active")
+    return value == "1"
+
+
+def _next_receipt_sequence() -> int:
+    global _RECEIPT_SEQUENCE
+
+    with _RECEIPT_SEQUENCE_LOCK:
+        if _RECEIPT_SEQUENCE >= _RECEIPT_SEQUENCE_LIMIT:
+            raise OverflowError("packed-front receipt sequence exhausted")
+        _RECEIPT_SEQUENCE += 1
+        return _RECEIPT_SEQUENCE
+
+
+def _validate_request_binding(request_sequence: int, request_token: int) -> None:
+    if (
+        type(request_sequence) is not int
+        or not 1 <= request_sequence <= _RECEIPT_SEQUENCE_LIMIT
+    ):
+        raise ValueError("packed-front receipt sequence must fit positive int64")
+    if (
+        type(request_token) is not int
+        or not 0 <= request_token <= _RECEIPT_SEQUENCE_LIMIT
+    ):
+        raise ValueError("packed-front receipt token must fit nonnegative int64")
+
+
+def _count_model_authoritative_width3_packs(model: Any) -> int:
+    """Read the exact currently installed production-width3 parent count."""
+
+    language_model = getattr(model, "language_model", None)
+    inner_model = getattr(language_model, "model", None)
+    layers = getattr(inner_model, "layers", ())
+    try:
+        iterator = iter(layers)
+    except TypeError as error:
+        raise TypeError("packed-front receipt model layers are not iterable") from error
+
+    count = 0
+    for layer in iterator:
+        sparse_moe = getattr(layer, "mlp", None)
+        packed = getattr(
+            sparse_moe,
+            "_authoritative_packed_k3_moe_front",
+            None,
+        )
+        if not isinstance(packed, AuthoritativePackedK3MoEFront):
+            continue
+        try:
+            modules = _front_modules(sparse_moe)
+            active = (
+                packed._input_dims == _WIDTH3_INPUT_DIMS
+                and packed._output_dims == _WIDTH3_OUTPUT_DIMS
+                and packed._production_width3_source_layout
+                and _production_width3_source_layout_supported(modules)
+                and packed.matches_sources(modules)
+            )
+        except (AttributeError, PackedMoEFrontUnsupported, TypeError, ValueError):
+            active = False
+        if active:
+            count += 1
+            if count > _RECEIPT_COUNTER_LIMIT:
+                raise OverflowError(
+                    "packed-front receipt pack count exceeded its bound"
+                )
+    return count
+
+
+def begin_authoritative_packed_moe_front_receipt(
+    request_token: int,
+    model: Any,
+) -> tuple[int, int]:
+    """Begin one context-local receipt and snapshot installed parents."""
+
+    # Clear first so malformed configuration or model traversal cannot revive
+    # counters from an abandoned generator in a reused execution context.
+    _RECEIPT_STATE.set(None)
+    if not authoritative_packed_moe_front_receipt_enabled():
+        raise RuntimeError("packed-front receipt capture is disabled")
+    _validate_request_binding(1, request_token)
+    request_sequence = _next_receipt_sequence()
+    authoritative_gate_enabled = _strict_receipt_gate(
+        AUTHORITATIVE_PACKED_MOE_FRONT_ENV
+    )
+    width3_gate_enabled = _strict_receipt_gate(
+        AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV
+    )
+    if authoritative_gate_enabled != width3_gate_enabled:
+        raise ValueError(
+            "packed-front receipt requires authoritative and width3 gates "
+            "to be jointly disabled or jointly enabled"
+        )
+    state = _PackedFrontReceiptState(
+        request_sequence=request_sequence,
+        request_token=request_token,
+        pack_count_before=_count_model_authoritative_width3_packs(model),
+        authoritative_gate_enabled=authoritative_gate_enabled,
+        width3_gate_enabled=width3_gate_enabled,
+    )
+    _RECEIPT_STATE.set(state)
+    return request_sequence, request_token
+
+
+def _receipt_state_for_binding(
+    request_sequence: int,
+    request_token: int,
+) -> _PackedFrontReceiptState:
+    _validate_request_binding(request_sequence, request_token)
+    state = _RECEIPT_STATE.get()
+    if state is None:
+        raise RuntimeError("no packed-front receipt is active")
+    if (
+        state.request_sequence != request_sequence
+        or state.request_token != request_token
+    ):
+        raise RuntimeError("packed-front receipt request binding does not match")
+    return state
+
+
+def _bounded_receipt_sum(current: int, amount: int) -> int:
+    if type(amount) is not int or amount < 0:
+        raise ValueError("packed-front receipt increments must be nonnegative ints")
+    updated = current + amount
+    if updated > _RECEIPT_COUNTER_LIMIT:
+        raise OverflowError("packed-front receipt counter exceeded its bound")
+    return updated
+
+
+def _increment_receipt(**increments: int) -> None:
+    state = _RECEIPT_STATE.get()
+    if state is None:
+        return
+    changes: dict[str, int] = {}
+    for name, amount in increments.items():
+        if name not in _PackedFrontReceiptState.__dataclass_fields__:
+            raise KeyError(f"unknown packed-front receipt counter: {name}")
+        current = getattr(state, name)
+        if type(current) is not int:
+            raise TypeError(f"packed-front receipt field {name} is not a counter")
+        changes[name] = _bounded_receipt_sum(current, amount)
+    _RECEIPT_STATE.set(replace(state, **changes))
+
+
+def _receipt_helper_started(sparse_moe: Any, x: mx.array, gate_enabled: bool) -> bool:
+    """Account one helper call and return whether it is exact width-three."""
+
+    state = _RECEIPT_STATE.get()
+    if state is None:
+        return False
+    current_gate = _strict_receipt_gate(AUTHORITATIVE_PACKED_MOE_FRONT_ENV)
+    current_width3_gate = _strict_receipt_gate(
+        AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV
+    )
+    if (
+        gate_enabled != current_gate
+        or current_gate != state.authoritative_gate_enabled
+        or current_width3_gate != state.width3_gate_enabled
+    ):
+        raise RuntimeError("packed-front selectors changed during receipt capture")
+    _increment_receipt(helper_calls=1)
+    if not current_gate:
+        _increment_receipt(gate_disabled_calls=1)
+        return False
+    exact_width3 = (
+        not getattr(sparse_moe, "training", True)
+        and current_width3_gate
+        and x.ndim == 3
+        and tuple(int(dim) for dim in x.shape) == (1, 3, _WIDTH3_INPUT_DIMS)
+        and x.dtype == mx.bfloat16
+    )
+    if not exact_width3:
+        _increment_receipt(noncontract_calls=1)
+    return exact_width3
+
+
+def _receipt_width3_outcome(
+    outcome: str,
+    *,
+    output_tensors: int = 0,
+) -> None:
+    state = _RECEIPT_STATE.get()
+    if state is None:
+        return
+    fields = {
+        "packed_hit": "packed_hits",
+        "unsupported": "unsupported_calls",
+        "packed_dispatch_fallback": "packed_dispatch_fallback_calls",
+    }
+    field = fields.get(outcome)
+    if field is None:
+        raise KeyError(f"unknown packed-front receipt outcome: {outcome}")
+    increments = {field: 1}
+    if outcome == "packed_hit":
+        increments["packed_output_tensors"] = output_tensors
+    _increment_receipt(**increments)
+
+
+def finish_authoritative_packed_moe_front_receipt(
+    request_sequence: int,
+    request_token: int,
+    model: Any,
+) -> dict[str, str | int | bool]:
+    """Finalize, deactivate, and return one exact scalar-only receipt."""
+
+    state = _receipt_state_for_binding(request_sequence, request_token)
+    _RECEIPT_STATE.set(None)
+    pack_count_after = _count_model_authoritative_width3_packs(model)
+    terminal_total = (
+        state.gate_disabled_calls
+        + state.noncontract_calls
+        + state.packed_hits
+        + state.unsupported_calls
+        + state.packed_dispatch_fallback_calls
+    )
+    if terminal_total != state.helper_calls:
+        raise RuntimeError("packed-front receipt helper partition is incomplete")
+    return {
+        "schema": AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_SCHEMA,
+        "request_sequence": state.request_sequence,
+        "request_token": state.request_token,
+        "finalized": True,
+        "authoritative_gate_enabled": state.authoritative_gate_enabled,
+        "width3_gate_enabled": state.width3_gate_enabled,
+        "helper_calls": state.helper_calls,
+        "packed_hits": state.packed_hits,
+        "packed_output_tensors": state.packed_output_tensors,
+        "lazy_installs": state.lazy_installs,
+        "gate_disabled_calls": state.gate_disabled_calls,
+        "noncontract_calls": state.noncontract_calls,
+        "unsupported_calls": state.unsupported_calls,
+        "packed_dispatch_fallback_calls": state.packed_dispatch_fallback_calls,
+        "invalidations": state.invalidations,
+        "stale_resets": state.stale_resets,
+        "pack_count_before": state.pack_count_before,
+        "pack_count_after": pack_count_after,
+    }
+
+
+def abort_authoritative_packed_moe_front_receipt(
+    request_sequence: int,
+    request_token: int,
+) -> None:
+    """Deactivate one receipt without publishing positive telemetry."""
+
+    try:
+        _receipt_state_for_binding(request_sequence, request_token)
+    finally:
+        _RECEIPT_STATE.set(None)
 
 
 class PackedMoEFrontUnsupported(ValueError):
@@ -383,9 +682,7 @@ class AuthoritativePackedK3MoEFront(PackedK3MoEFront):
 
     def __init__(self, modules: Sequence[Any]):
         modules = tuple(modules)
-        production_width3_layout = _production_width3_source_layout_supported(
-            modules
-        )
+        production_width3_layout = _production_width3_source_layout_supported(modules)
         super().__init__(modules)
         object.__setattr__(
             self,
@@ -515,6 +812,7 @@ def _drop_duplicating_packed_k3_moe_front(sparse_moe: Any) -> None:
 def invalidate_packed_k3_moe_front(sparse_moe: Any) -> None:
     """Drop hidden packed state before sharding or other weight mutation."""
 
+    _increment_receipt(invalidations=1)
     authoritative = getattr(
         sparse_moe,
         "_authoritative_packed_k3_moe_front",
@@ -532,7 +830,9 @@ def maybe_authoritative_packed_k3_moe_front(
 ) -> tuple[mx.array, ...] | None:
     """Return one native packed QMV backed by authoritative source views."""
 
-    if not authoritative_packed_moe_front_enabled():
+    gate_enabled = authoritative_packed_moe_front_enabled()
+    receipt_width3_call = _receipt_helper_started(sparse_moe, x, gate_enabled)
+    if not gate_enabled:
         return None
 
     # Runtime experiment toggles must not leave the older duplicate cache
@@ -548,12 +848,16 @@ def maybe_authoritative_packed_k3_moe_front(
         modules = _front_modules(sparse_moe)
     except (AttributeError, PackedMoEFrontUnsupported):
         invalidate_packed_k3_moe_front(sparse_moe)
+        if receipt_width3_call:
+            _receipt_width3_outcome("unsupported")
         return None
     if int(x.shape[1]) == 3 and not _production_width3_source_layout_supported(modules):
         # A previously installed authoritative parent can outlive a later
         # source mutation.  Release it before falling back so an ineligible
         # width-three call never leaves hidden packed storage resident.
         invalidate_packed_k3_moe_front(sparse_moe)
+        if receipt_width3_call:
+            _receipt_width3_outcome("unsupported")
         return None
 
     packed = getattr(
@@ -570,7 +874,10 @@ def maybe_authoritative_packed_k3_moe_front(
             (),
         )
         if _same_source_signature(unsupported_signature, current_signature):
+            if receipt_width3_call:
+                _receipt_width3_outcome("unsupported")
             return None
+        _increment_receipt(stale_resets=1)
         _drop_authoritative_packed_k3_moe_front(sparse_moe)
         packed = None
     elif packed is not None:
@@ -580,11 +887,13 @@ def maybe_authoritative_packed_k3_moe_front(
                 # can consume them directly, then atomically replace all four
                 # banks and release the old parent allocation.
                 stale_packed = packed
+                _increment_receipt(stale_resets=1)
                 _drop_authoritative_packed_k3_moe_front(sparse_moe)
                 packed = None
         except (AttributeError, TypeError, ValueError):
             if isinstance(packed, AuthoritativePackedK3MoEFront):
                 stale_packed = packed
+            _increment_receipt(stale_resets=1)
             _drop_authoritative_packed_k3_moe_front(sparse_moe)
             packed = None
 
@@ -615,17 +924,26 @@ def maybe_authoritative_packed_k3_moe_front(
                 "_authoritative_packed_k3_moe_front_source_signature",
                 current_signature,
             )
+            if receipt_width3_call:
+                _receipt_width3_outcome("unsupported")
             return None
         object.__setattr__(
             sparse_moe,
             "_authoritative_packed_k3_moe_front",
             packed,
         )
+        if receipt_width3_call:
+            _increment_receipt(lazy_installs=1)
 
     try:
-        return packed(x)
+        outputs = packed(x)
     except PackedMoEFrontUnsupported:
+        if receipt_width3_call:
+            _receipt_width3_outcome("packed_dispatch_fallback")
         return None
+    if receipt_width3_call:
+        _receipt_width3_outcome("packed_hit", output_tensors=len(outputs))
+    return outputs
 
 
 def maybe_packed_k3_moe_front(
