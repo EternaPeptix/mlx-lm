@@ -4,19 +4,21 @@ import gc
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from mlx_lm.models.kimi_k3 import KimiK3SparseMoE, TextArgs
+from mlx_lm.models.kimi_k3 import KimiK3SparseMoE, Model, TextArgs
 from mlx_lm.models.kimi_k3_multibank_moe_front import (
     MULTIBANK_MOE_FRONT_ENV,
     multibank_moe_front_enabled,
 )
 from mlx_lm.models.kimi_k3_packed_moe_front import (
     AUTHORITATIVE_PACKED_MOE_FRONT_ENV,
+    AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV,
     PACKED_MOE_FRONT_ENV,
     PACKED_MOE_FRONT_WIDTH8_ENV,
     AuthoritativePackedK3MoEFront,
@@ -24,10 +26,14 @@ from mlx_lm.models.kimi_k3_packed_moe_front import (
     PackedMoEFrontUnsupported,
     _build_authoritative_packed_front,
     _build_packed_front,
+    _production_width3_source_layout_supported,
     authoritative_packed_moe_front_enabled,
+    authoritative_packed_moe_front_width3_enabled,
     invalidate_packed_k3_moe_front,
+    maybe_authoritative_packed_k3_moe_front,
     packed_moe_front_enabled,
     packed_moe_front_width8_enabled,
+    production_width3_authoritative_front_active,
 )
 
 
@@ -67,14 +73,74 @@ class _QuantizedProjection:
         )
 
 
+class _PackedProjection(_QuantizedProjection):
+    def __init__(self, input_dims: int, output_dims: int, pattern: int):
+        self.bits = 8
+        self.group_size = 64
+        self.mode = "affine"
+        self.weight = mx.full(
+            (output_dims, input_dims * self.bits // 32),
+            pattern,
+            dtype=mx.uint32,
+        )
+        self.scales = mx.full(
+            (output_dims, input_dims // self.group_size),
+            0.00390625,
+            dtype=mx.bfloat16,
+        )
+        self.biases = mx.full(
+            self.scales.shape,
+            -0.25,
+            dtype=mx.bfloat16,
+        )
+
+
+class _FrontOnlySparse:
+    def __init__(self, output_dims=(3072, 3072, 896, 3584)):
+        projections = tuple(
+            _PackedProjection(7168, size, pattern)
+            for pattern, size in enumerate(output_dims, start=1)
+        )
+        self.shared_experts = SimpleNamespace(
+            gate_proj=projections[0],
+            up_proj=projections[1],
+        )
+        self.gate = projections[2]
+        self.routed_expert_down_proj = projections[3]
+        self.training = False
+
+
+class _FakeAuthoritativePackedFront:
+    _input_dims = 7168
+    _output_dims = (3072, 3072, 896, 3584)
+    _production_width3_source_layout = True
+
+    def __init__(self, sparse_moe):
+        self.modules = (
+            sparse_moe.shared_experts.gate_proj,
+            sparse_moe.shared_experts.up_proj,
+            sparse_moe.gate,
+            sparse_moe.routed_expert_down_proj,
+        )
+
+    def matches_sources(self, modules):
+        return tuple(modules) == self.modules
+
+    def __call__(self, x):
+        return tuple(
+            mx.zeros((1, 3, size), dtype=x.dtype) for size in self._output_dims
+        )
+
+
 def _small_sparse_moe(
     *,
     bits: int = 8,
+    hidden_size: int = 128,
     shared_experts: int = 1,
     latent_size: int | None = 64,
 ) -> KimiK3SparseMoE:
     args = TextArgs(
-        hidden_size=128,
+        hidden_size=hidden_size,
         intermediate_size=256,
         num_experts=8,
         num_experts_per_token=2,
@@ -106,6 +172,7 @@ class PackedK3MoEFrontTests(unittest.TestCase):
     def setUp(self):
         multibank_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
+        authoritative_packed_moe_front_width3_enabled.cache_clear()
         packed_moe_front_enabled.cache_clear()
         packed_moe_front_width8_enabled.cache_clear()
 
@@ -113,6 +180,7 @@ class PackedK3MoEFrontTests(unittest.TestCase):
         multibank_moe_front_enabled.cache_clear()
         packed_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
+        authoritative_packed_moe_front_width3_enabled.cache_clear()
         packed_moe_front_width8_enabled.cache_clear()
 
     def test_single_token_rows_are_bit_exact(self):
@@ -305,6 +373,7 @@ class AuthoritativePackedK3MoEFrontTests(unittest.TestCase):
     def setUp(self):
         multibank_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
+        authoritative_packed_moe_front_width3_enabled.cache_clear()
         packed_moe_front_enabled.cache_clear()
         packed_moe_front_width8_enabled.cache_clear()
 
@@ -312,6 +381,7 @@ class AuthoritativePackedK3MoEFrontTests(unittest.TestCase):
         multibank_moe_front_enabled.cache_clear()
         packed_moe_front_enabled.cache_clear()
         authoritative_packed_moe_front_enabled.cache_clear()
+        authoritative_packed_moe_front_width3_enabled.cache_clear()
         packed_moe_front_width8_enabled.cache_clear()
 
     def test_width_eight_authoritative_sparse_moe_is_bit_exact(self):
@@ -346,6 +416,189 @@ class AuthoritativePackedK3MoEFrontTests(unittest.TestCase):
 
         self.assertTrue(bool(mx.array_equal(expected, actual).item()))
         self.assertTrue(hasattr(module, "_authoritative_packed_k3_moe_front"))
+
+    def test_width_three_full_pack_is_exact_only_at_production_input_shape(self):
+        mx.random.seed(31)
+        output_dims = (3072, 3072, 896, 3584)
+        projections = tuple(
+            _PackedProjection(7168, size, pattern)
+            for pattern, size in enumerate(output_dims, start=1)
+        )
+        packed = AuthoritativePackedK3MoEFront(projections)
+        x = mx.random.normal((1, 3, 7168)).astype(mx.bfloat16)
+        expected = tuple(projection(x) for projection in projections)
+
+        environment = {AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV: "1"}
+        with patch.dict(os.environ, environment):
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            actual = packed(x)
+            mx.eval(*expected, *actual)
+
+        self.assertEqual(len(actual), 4)
+        for want, got in zip(expected, actual, strict=True):
+            self.assertTrue(bool(mx.array_equal(want, got).item()))
+
+        with patch.dict(
+            os.environ,
+            {AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV: "0"},
+        ):
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            with self.assertRaises(PackedMoEFrontUnsupported):
+                packed(x)
+
+        with patch.dict(os.environ, environment):
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            for shape in (
+                (1, 2, 7168),
+                (1, 3, 128),
+                (1, 3, 7167),
+                (1, 4, 7168),
+                (2, 3, 7168),
+            ):
+                with self.subTest(shape=shape):
+                    with self.assertRaises(PackedMoEFrontUnsupported):
+                        packed(mx.zeros(shape, dtype=mx.bfloat16))
+
+        wrong_layout = AuthoritativePackedK3MoEFront(
+            tuple(_QuantizedProjection(7168, 64) for _ in range(4))
+        )
+        with patch.dict(os.environ, environment):
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            with self.assertRaisesRegex(
+                PackedMoEFrontUnsupported,
+                "exact released TP2 front layout",
+            ):
+                wrong_layout(x)
+
+    def test_width_three_gate_is_strict_and_default_off(self):
+        os.environ.pop(AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV, None)
+        authoritative_packed_moe_front_width3_enabled.cache_clear()
+        self.assertFalse(authoritative_packed_moe_front_width3_enabled())
+
+        with patch.dict(
+            os.environ,
+            {AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV: "true"},
+        ):
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+                authoritative_packed_moe_front_width3_enabled()
+
+    def test_width_three_model_eligibility_requires_exact_source_geometry(self):
+        x = mx.zeros((1, 3, 7168), dtype=mx.bfloat16)
+        environment = {
+            AUTHORITATIVE_PACKED_MOE_FRONT_ENV: "1",
+            AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV: "1",
+        }
+        exact = _FrontOnlySparse()
+        fake = _FakeAuthoritativePackedFront(exact)
+        with (
+            patch.dict(os.environ, environment),
+            patch(
+                "mlx_lm.models.kimi_k3_packed_moe_front."
+                "_build_authoritative_packed_front",
+                return_value=fake,
+            ) as build,
+        ):
+            authoritative_packed_moe_front_enabled.cache_clear()
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            outputs = maybe_authoritative_packed_k3_moe_front(exact, x)
+
+        self.assertEqual(build.call_count, 1)
+        self.assertTrue(_production_width3_source_layout_supported(fake.modules))
+        self.assertTrue(production_width3_authoritative_front_active(exact, x, outputs))
+
+        for dtype in (mx.float16, mx.float32):
+            with self.subTest(dtype=dtype):
+                ineligible = mx.zeros((1, 3, 7168), dtype=dtype)
+                with (
+                    patch.dict(os.environ, environment),
+                    patch(
+                        "mlx_lm.models.kimi_k3_packed_moe_front."
+                        "_build_authoritative_packed_front"
+                    ) as dtype_build,
+                ):
+                    authoritative_packed_moe_front_enabled.cache_clear()
+                    authoritative_packed_moe_front_width3_enabled.cache_clear()
+                    self.assertIsNone(
+                        maybe_authoritative_packed_k3_moe_front(exact, ineligible)
+                    )
+                dtype_build.assert_not_called()
+                self.assertFalse(
+                    production_width3_authoritative_front_active(
+                        exact,
+                        ineligible,
+                        outputs,
+                    )
+                )
+
+        for output_dims in (
+            (3072, 3072, 895, 3584),
+            (3072, 3072, 896, 3583),
+        ):
+            with self.subTest(output_dims=output_dims):
+                altered = _FrontOnlySparse(output_dims=output_dims)
+                with (
+                    patch.dict(os.environ, environment),
+                    patch(
+                        "mlx_lm.models.kimi_k3_packed_moe_front."
+                        "_build_authoritative_packed_front"
+                    ) as altered_build,
+                ):
+                    authoritative_packed_moe_front_enabled.cache_clear()
+                    authoritative_packed_moe_front_width3_enabled.cache_clear()
+                    self.assertIsNone(
+                        maybe_authoritative_packed_k3_moe_front(altered, x)
+                    )
+                altered_build.assert_not_called()
+
+        with_output_bias = _FrontOnlySparse()
+        with_output_bias.gate.bias = mx.zeros((896,), dtype=mx.bfloat16)
+        with (
+            patch.dict(os.environ, environment),
+            patch(
+                "mlx_lm.models.kimi_k3_packed_moe_front."
+                "_build_authoritative_packed_front"
+            ) as biased_build,
+        ):
+            authoritative_packed_moe_front_enabled.cache_clear()
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            self.assertIsNone(
+                maybe_authoritative_packed_k3_moe_front(with_output_bias, x)
+            )
+        biased_build.assert_not_called()
+
+        # If a formerly eligible source changes layout, the next width-three
+        # call must release its old authoritative parent before falling back.
+        self.assertIs(exact._authoritative_packed_k3_moe_front, fake)
+        exact.gate.bits = 4
+        with patch.dict(os.environ, environment):
+            authoritative_packed_moe_front_enabled.cache_clear()
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            self.assertIsNone(maybe_authoritative_packed_k3_moe_front(exact, x))
+        self.assertFalse(hasattr(exact, "_authoritative_packed_k3_moe_front"))
+
+        missing_front = _FrontOnlySparse()
+        missing_fake = _FakeAuthoritativePackedFront(missing_front)
+        with (
+            patch.dict(os.environ, environment),
+            patch(
+                "mlx_lm.models.kimi_k3_packed_moe_front."
+                "_build_authoritative_packed_front",
+                return_value=missing_fake,
+            ),
+        ):
+            authoritative_packed_moe_front_enabled.cache_clear()
+            authoritative_packed_moe_front_width3_enabled.cache_clear()
+            self.assertIsNotNone(
+                maybe_authoritative_packed_k3_moe_front(missing_front, x)
+            )
+            missing_front.shared_experts = None
+            self.assertIsNone(
+                maybe_authoritative_packed_k3_moe_front(missing_front, x)
+            )
+        self.assertFalse(
+            hasattr(missing_front, "_authoritative_packed_k3_moe_front")
+        )
 
     def test_rows_are_bit_exact_and_original_arrays_are_not_retained(self):
         mx.random.seed(29)
@@ -653,6 +906,59 @@ class AuthoritativePackedK3MoEFrontTests(unittest.TestCase):
                     bool(mx.array_equal(value, restored_values[name]).item()),
                     name,
                 )
+
+    def test_model_load_invalidates_all_packs_before_parameter_replacement(self):
+        mx.random.seed(45)
+        module = _small_sparse_moe()
+        x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+        with patch.dict(
+            os.environ,
+            {
+                MULTIBANK_MOE_FRONT_ENV: "0",
+                AUTHORITATIVE_PACKED_MOE_FRONT_ENV: "1",
+            },
+        ):
+            authoritative_packed_moe_front_enabled.cache_clear()
+            packed_output = module(x)
+            mx.eval(packed_output)
+        self.assertTrue(hasattr(module, "_authoritative_packed_k3_moe_front"))
+        object.__setattr__(module, "_packed_k3_moe_front", object())
+
+        # Model.pipeline can replace non-local layers with None.  Use that
+        # topology here while directly proving invalidation happens before the
+        # superclass is allowed to replace any parameter arrays.
+        model = Model.__new__(Model)
+        layers = [None, SimpleNamespace(mlp=module)]
+        object.__setattr__(
+            model,
+            "language_model",
+            SimpleNamespace(model=SimpleNamespace(layers=layers)),
+        )
+        events = []
+
+        def replace_parameters(loaded_model, file_or_weights, strict=True):
+            self.assertIs(loaded_model, model)
+            self.assertEqual(file_or_weights, [])
+            self.assertFalse(
+                hasattr(module, "_authoritative_packed_k3_moe_front")
+            )
+            self.assertFalse(hasattr(module, "_packed_k3_moe_front"))
+            events.append(("load", strict))
+
+        def validate_biases(observed_layers):
+            self.assertIs(observed_layers, layers)
+            events.append(("biases", None))
+
+        with (
+            patch.object(nn.Module, "load_weights", new=replace_parameters),
+            patch(
+                "mlx_lm.models.kimi_k3.elide_validated_k3_biases",
+                side_effect=validate_biases,
+            ),
+        ):
+            self.assertIs(model.load_weights([], strict=False), model)
+
+        self.assertEqual(events, [("load", False), ("biases", None)])
 
     def test_invalidation_detaches_source_views_before_sharding(self):
         mx.random.seed(47)

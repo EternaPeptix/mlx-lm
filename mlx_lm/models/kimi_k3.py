@@ -50,6 +50,7 @@ from .kimi_k3_packed_moe_front import (
     invalidate_packed_k3_moe_front,
     maybe_authoritative_packed_k3_moe_front,
     maybe_packed_k3_moe_front,
+    production_width3_authoritative_front_active,
 )
 from .kimi_k3_prefill_route_combine import (
     maybe_fused_k3_prefill_switch_glu_reduce,
@@ -1975,8 +1976,12 @@ class KimiK3SparseMoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         optimized_front = maybe_multibank_k3_moe_front(self, x)
+        authoritative_full_front = None
         if optimized_front is None:
-            optimized_front = maybe_authoritative_packed_k3_moe_front(self, x)
+            authoritative_full_front = maybe_authoritative_packed_k3_moe_front(
+                self, x
+            )
+            optimized_front = authoritative_full_front
         if optimized_front is None:
             optimized_front = maybe_packed_k3_moe_front(self, x)
         if optimized_front is None:
@@ -2038,7 +2043,17 @@ class KimiK3SparseMoE(nn.Module):
             and not self.training
             and self.sharding_group is not None
             and self.shared_experts is not None
-            and optimized_front is None
+            # The authoritative full pack joins only the front projection.
+            # Keep routed/shared reductions separate afterward; otherwise its
+            # Q3 dispatch saving would forfeit the larger MOK overlap window.
+            and (
+                optimized_front is None
+                or production_width3_authoritative_front_active(
+                    self,
+                    x,
+                    authoritative_full_front,
+                )
+            )
             and x.ndim == 3
             and x.shape[0] == 1
         )
@@ -4040,8 +4055,12 @@ class Model(nn.Module):
         self.language_model = LanguageModel(args.text_config)
 
     def load_weights(self, file_or_weights, strict: bool = True):
-        """Load first, then release only fully validated affine2 bias banks."""
+        """Invalidate derived packs, load, then validate affine2 bias banks."""
 
+        for layer in self.language_model.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, KimiK3SparseMoE):
+                invalidate_packed_k3_moe_front(mlp)
         super().load_weights(file_or_weights, strict=strict)
         elide_validated_k3_biases(self.language_model.model.layers)
         return self

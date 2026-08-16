@@ -10,6 +10,12 @@ vector before its routed and shared experts:
 
 At the single-token decode shape, concatenating their already-quantized output
 rows lets MLX issue one QMV instead of four while preserving every output bit.
+An independent authoritative-only gate admits the exact ``(1, 3, 7168)`` K3
+target-verification shape for a full-pack experiment.  This is intentionally
+separate from split packing: the full pack evaluates both the shared and routed
+front projections in one QMM.  The branches share that front dependency, but
+the model keeps their routed and shared reductions independent afterward so
+the shared down projection can still overlap routed communication.
 No weight is dequantized or requantized.  An independent, default-off gate can
 admit the exact width-eight K3 target-verification shape after its QMM kernel
 has been validated; every other multi-token call remains on the stock path.
@@ -28,9 +34,14 @@ import mlx.nn as nn
 
 PACKED_MOE_FRONT_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT"
 AUTHORITATIVE_PACKED_MOE_FRONT_ENV = "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT"
+AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV = (
+    "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3"
+)
 PACKED_MOE_FRONT_WIDTH8_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8"
 _UNSUPPORTED = object()
 _PACKED_ARRAY_NAMES = ("weight", "scales", "biases", "bias")
+_WIDTH3_INPUT_DIMS = 7168
+_WIDTH3_OUTPUT_DIMS = (3072, 3072, 896, 3584)
 
 
 class PackedMoEFrontUnsupported(ValueError):
@@ -48,6 +59,14 @@ def authoritative_packed_moe_front_enabled() -> bool:
 
 
 @lru_cache(maxsize=1)
+def authoritative_packed_moe_front_width3_enabled() -> bool:
+    value = os.environ.get(AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV} must be 0 or 1")
+    return value == "1"
+
+
+@lru_cache(maxsize=1)
 def packed_moe_front_width8_enabled() -> bool:
     return os.environ.get(PACKED_MOE_FRONT_WIDTH8_ENV, "0") == "1"
 
@@ -57,6 +76,100 @@ def _packed_input_supported(x: mx.array) -> bool:
         return False
     width = int(x.shape[1])
     return width == 1 or (width == 8 and packed_moe_front_width8_enabled())
+
+
+def _authoritative_packed_input_supported(x: mx.array) -> bool:
+    if _packed_input_supported(x):
+        return True
+    return (
+        x.ndim == 3
+        and tuple(int(dim) for dim in x.shape) == (1, 3, 7168)
+        and x.dtype == mx.bfloat16
+        and authoritative_packed_moe_front_width3_enabled()
+    )
+
+
+def _production_width3_source_layout_supported(modules: Sequence[Any]) -> bool:
+    """Return whether four sources match the released TP2 affine8 front."""
+
+    if len(modules) != len(_WIDTH3_OUTPUT_DIMS):
+        return False
+    for module, output_dims in zip(modules, _WIDTH3_OUTPUT_DIMS, strict=True):
+        weight = _array_parameter(module, "weight")
+        scales = _array_parameter(module, "scales")
+        biases = _array_parameter(module, "biases")
+        if weight is None or scales is None or biases is None:
+            return False
+        if _array_parameter(module, "bias") is not None:
+            return False
+        if (
+            int(getattr(module, "group_size", 0)) != 64
+            or int(getattr(module, "bits", 0)) != 8
+            or str(getattr(module, "mode", "")) != "affine"
+            or weight.dtype != mx.uint32
+            or scales.dtype != mx.bfloat16
+            or biases.dtype != mx.bfloat16
+        ):
+            return False
+        if tuple(int(dim) for dim in weight.shape) != (
+            output_dims,
+            _WIDTH3_INPUT_DIMS * 8 // 32,
+        ):
+            return False
+        expected_affine_shape = (output_dims, _WIDTH3_INPUT_DIMS // 64)
+        if tuple(int(dim) for dim in scales.shape) != expected_affine_shape:
+            return False
+        if tuple(int(dim) for dim in biases.shape) != expected_affine_shape:
+            return False
+    return True
+
+
+def production_width3_authoritative_front_active(
+    sparse_moe: Any,
+    x: mx.array,
+    optimized_front: Any,
+) -> bool:
+    """Prove the exact width-three full-pack contract used by MOK overlap."""
+
+    if (
+        not isinstance(optimized_front, tuple)
+        or len(optimized_front) != len(_WIDTH3_OUTPUT_DIMS)
+        or x.ndim != 3
+        or tuple(int(dim) for dim in x.shape) != (1, 3, _WIDTH3_INPUT_DIMS)
+        or x.dtype != mx.bfloat16
+        or not authoritative_packed_moe_front_width3_enabled()
+    ):
+        return False
+    for output, output_dims in zip(
+        optimized_front,
+        _WIDTH3_OUTPUT_DIMS,
+        strict=True,
+    ):
+        if not isinstance(output, mx.array) or tuple(
+            int(dim) for dim in output.shape
+        ) != (1, 3, output_dims):
+            return False
+    try:
+        modules = _front_modules(sparse_moe)
+    except (AttributeError, PackedMoEFrontUnsupported):
+        return False
+    if not _production_width3_source_layout_supported(modules):
+        return False
+    packed = getattr(
+        sparse_moe,
+        "_authoritative_packed_k3_moe_front",
+        None,
+    )
+    try:
+        return (
+            packed is not None
+            and packed._input_dims == _WIDTH3_INPUT_DIMS
+            and packed._output_dims == _WIDTH3_OUTPUT_DIMS
+            and packed._production_width3_source_layout
+            and packed.matches_sources(modules)
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def _array_parameter(module: Any, name: str) -> mx.array | None:
@@ -201,6 +314,7 @@ class PackedK3MoEFront(nn.Module):
             "_split_indices",
             tuple(accumulate(output_dims))[:-1],
         )
+        object.__setattr__(self, "_output_dims", tuple(output_dims))
         object.__setattr__(
             self,
             "_packed_nbytes",
@@ -226,12 +340,7 @@ class PackedK3MoEFront(nn.Module):
             _source_signature(modules),
         )
 
-    def __call__(self, x: mx.array) -> tuple[mx.array, ...]:
-        if not _packed_input_supported(x):
-            raise PackedMoEFrontUnsupported(
-                "packed K3 MoE front requires one decode token or an enabled "
-                "width-eight target block"
-            )
+    def _project(self, x: mx.array) -> tuple[mx.array, ...]:
         if int(x.shape[-1]) != self._input_dims:
             raise PackedMoEFrontUnsupported(
                 f"input width {x.shape[-1]} != packed width {self._input_dims}"
@@ -252,6 +361,14 @@ class PackedK3MoEFront(nn.Module):
             output = output + bias
         return tuple(mx.split(output, self._split_indices, axis=-1))
 
+    def __call__(self, x: mx.array) -> tuple[mx.array, ...]:
+        if not _packed_input_supported(x):
+            raise PackedMoEFrontUnsupported(
+                "packed K3 MoE front requires one decode token or an enabled "
+                "width-eight target block"
+            )
+        return self._project(x)
+
 
 class AuthoritativePackedK3MoEFront(PackedK3MoEFront):
     """A packed QMV whose row views are the source modules' parameters.
@@ -266,7 +383,15 @@ class AuthoritativePackedK3MoEFront(PackedK3MoEFront):
 
     def __init__(self, modules: Sequence[Any]):
         modules = tuple(modules)
+        production_width3_layout = _production_width3_source_layout_supported(
+            modules
+        )
         super().__init__(modules)
+        object.__setattr__(
+            self,
+            "_production_width3_source_layout",
+            production_width3_layout,
+        )
 
         # Force the concatenations to finish while all source arrays are valid.
         # Packing is a one-time operation, and evaluating here bounds transient
@@ -291,6 +416,24 @@ class AuthoritativePackedK3MoEFront(PackedK3MoEFront):
         # super().__init__ captured the pre-pack arrays. Replace that signature
         # so no reference keeps the superseded allocations alive.
         object.__setattr__(self, "_source_signature", _source_signature(modules))
+
+    def __call__(self, x: mx.array) -> tuple[mx.array, ...]:
+        if not _authoritative_packed_input_supported(x):
+            raise PackedMoEFrontUnsupported(
+                "authoritative packed K3 MoE front requires one decode token, "
+                "an enabled exact width-three target block, or an enabled "
+                "width-eight target block"
+            )
+        if int(x.shape[1]) == 3 and (
+            self._input_dims != _WIDTH3_INPUT_DIMS
+            or self._output_dims != _WIDTH3_OUTPUT_DIMS
+            or not self._production_width3_source_layout
+        ):
+            raise PackedMoEFrontUnsupported(
+                "width-three authoritative packing requires the exact released "
+                "TP2 front layout"
+            )
+        return self._project(x)
 
     def detach_source_views(self) -> None:
         """Give installed source views independent, byte-identical storage.
@@ -396,15 +539,21 @@ def maybe_authoritative_packed_k3_moe_front(
     # resident beside the authoritative allocation.
     _drop_duplicating_packed_k3_moe_front(sparse_moe)
 
-    if (
-        getattr(sparse_moe, "training", True)
-        or not _packed_input_supported(x)
-    ):
+    if getattr(
+        sparse_moe, "training", True
+    ) or not _authoritative_packed_input_supported(x):
         return None
 
     try:
         modules = _front_modules(sparse_moe)
     except (AttributeError, PackedMoEFrontUnsupported):
+        invalidate_packed_k3_moe_front(sparse_moe)
+        return None
+    if int(x.shape[1]) == 3 and not _production_width3_source_layout_supported(modules):
+        # A previously installed authoritative parent can outlive a later
+        # source mutation.  Release it before falling back so an ineligible
+        # width-three call never leaves hidden packed storage resident.
+        invalidate_packed_k3_moe_front(sparse_moe)
         return None
 
     packed = getattr(
