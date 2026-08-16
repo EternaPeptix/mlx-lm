@@ -42,10 +42,21 @@ AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV = (
 AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_ENV = (
     "MLX_LM_KIMI_K3_AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT"
 )
+K3_W3_COMPOSITION_RECEIPT_ENV = "MLX_LM_KIMI_K3_W3_COMPOSITION_RECEIPT"
 PACKED_MOE_FRONT_WIDTH8_ENV = "MLX_LM_KIMI_K3_PACKED_MOE_FRONT_WIDTH8"
 AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_SCHEMA = (
     "kimi-k3-authoritative-packed-moe-front-receipt/v2"
 )
+K3_W3_COMPOSITION_RECEIPT_SCHEMA = "kimi-k3-w3-composition-receipt/v1"
+_K3_W3_PREWORK_HISTORY_ENV = "MLX_LM_KIMI_K3_W3_PREWORK_HISTORY"
+_REPLAYSSM_SPECULATIVE_ENV = "MLX_LM_KIMI_K3_REPLAYSSM_SPECULATIVE"
+_PROJECTED_KV_CACHE_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE"
+_PROJECTED_KV_CACHE_MAX_TOKENS_ENV = "MLX_LM_KIMI_K3_PROJECTED_KV_CACHE_MAX_TOKENS"
+_ASYNC_DECODE_BOUNDARIES_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_BOUNDARIES"
+_ASYNC_DECODE_STATE_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_STATE"
+_ASYNC_DECODE_WIDTH3_ENV = "MLX_LM_KIMI_K3_ASYNC_DECODE_WIDTH3"
+_NATIVE_Q3_TRIPLET_ENV = "MLX_METAL_K3_AFFINE8_Q3_TRIPLET"
+_NATIVE_Q3_DISPATCH_RECEIPT_ENV = "MLX_METAL_K3_AFFINE8_Q3_DISPATCH_RECEIPT"
 _UNSUPPORTED = object()
 _PACKED_ARRAY_NAMES = ("weight", "scales", "biases", "bias")
 _WIDTH3_INPUT_DIMS = 7168
@@ -61,9 +72,20 @@ class _PackedFrontReceiptState:
     request_sequence: int
     request_token: int
     expected_layers: int
+    expected_kda_layers: int
     pack_count_before: int
+    composition: bool
     authoritative_gate_enabled: bool
     width3_gate_enabled: bool
+    kda_prework_enabled: bool
+    replayssm_speculative_enabled: bool
+    projected_kv_cache_enabled: bool
+    projected_kv_cache_max_tokens: int
+    async_decode_boundaries: str
+    async_decode_state: str
+    async_decode_width3_enabled: bool
+    native_q3_triplet_enabled: bool
+    native_q3_dispatch_receipt_enabled: bool
     helper_calls: int = 0
     eligible_width1_calls: int = 0
     eligible_width3_calls: int = 0
@@ -86,6 +108,13 @@ class _PackedFrontReceiptState:
     packed_dispatch_fallback_calls: int = 0
     invalidations: int = 0
     stale_resets: int = 0
+    kda_helper_calls: int = 0
+    kda_gate_disabled_calls: int = 0
+    kda_noncontract_calls: int = 0
+    kda_admitted_calls: int = 0
+    kda_success_calls: int = 0
+    kda_fallback_calls: int = 0
+    kda_pending_calls: int = 0
 
 
 _RECEIPT_STATE: ContextVar[_PackedFrontReceiptState | None] = ContextVar(
@@ -116,6 +145,13 @@ _RECEIPT_COUNTER_FIELDS = frozenset(
         "packed_dispatch_fallback_calls",
         "invalidations",
         "stale_resets",
+        "kda_helper_calls",
+        "kda_gate_disabled_calls",
+        "kda_noncontract_calls",
+        "kda_admitted_calls",
+        "kda_success_calls",
+        "kda_fallback_calls",
+        "kda_pending_calls",
     }
 )
 
@@ -129,11 +165,90 @@ def authoritative_packed_moe_front_receipt_enabled() -> bool:
     return value == "1"
 
 
+def k3_w3_composition_receipt_enabled() -> bool:
+    """Parse the strict, default-off combined diagnostic selector."""
+
+    value = os.environ.get(K3_W3_COMPOSITION_RECEIPT_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{K3_W3_COMPOSITION_RECEIPT_ENV} must be 0 or 1")
+    return value == "1"
+
+
 def _strict_receipt_gate(name: str) -> bool:
     value = os.environ.get(name, "0")
     if value not in {"0", "1"}:
         raise ValueError(f"{name} must be 0 or 1 while receipt capture is active")
     return value == "1"
+
+
+def _strict_receipt_positive_int(name: str, default: str) -> int:
+    value = os.environ.get(name, default)
+    if not value or any(character not in "0123456789" for character in value):
+        raise ValueError(f"{name} must contain canonical ASCII digits")
+    parsed = int(value)
+    if str(parsed) != value:
+        raise ValueError(f"{name} must use its canonical decimal spelling")
+    if parsed < 1 or parsed > _RECEIPT_COUNTER_LIMIT:
+        raise ValueError(f"{name} must be a bounded positive integer")
+    return parsed
+
+
+def _composition_selector_snapshot() -> dict[str, str | int | bool]:
+    boundaries = os.environ.get(_ASYNC_DECODE_BOUNDARIES_ENV, "none")
+    state = os.environ.get(_ASYNC_DECODE_STATE_ENV, "hidden")
+    if not isinstance(boundaries, str) or not boundaries:
+        raise ValueError(f"{_ASYNC_DECODE_BOUNDARIES_ENV} must be nonempty")
+    if not isinstance(state, str) or not state:
+        raise ValueError(f"{_ASYNC_DECODE_STATE_ENV} must be nonempty")
+    return {
+        "authoritative_gate_enabled": _strict_receipt_gate(
+            AUTHORITATIVE_PACKED_MOE_FRONT_ENV
+        ),
+        "width3_gate_enabled": _strict_receipt_gate(
+            AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV
+        ),
+        "kda_prework_enabled": _strict_receipt_gate(_K3_W3_PREWORK_HISTORY_ENV),
+        "replayssm_speculative_enabled": _strict_receipt_gate(
+            _REPLAYSSM_SPECULATIVE_ENV
+        ),
+        "projected_kv_cache_enabled": _strict_receipt_gate(_PROJECTED_KV_CACHE_ENV),
+        "projected_kv_cache_max_tokens": _strict_receipt_positive_int(
+            _PROJECTED_KV_CACHE_MAX_TOKENS_ENV,
+            "32768",
+        ),
+        "async_decode_boundaries": boundaries,
+        "async_decode_state": state,
+        "async_decode_width3_enabled": _strict_receipt_gate(_ASYNC_DECODE_WIDTH3_ENV),
+        "native_q3_triplet_enabled": _strict_receipt_gate(_NATIVE_Q3_TRIPLET_ENV),
+        "native_q3_dispatch_receipt_enabled": _strict_receipt_gate(
+            _NATIVE_Q3_DISPATCH_RECEIPT_ENV
+        ),
+    }
+
+
+def _validate_composition_selector_snapshot(
+    state: _PackedFrontReceiptState,
+) -> None:
+    if not state.composition:
+        return
+    current = _composition_selector_snapshot()
+    expected = {
+        "authoritative_gate_enabled": state.authoritative_gate_enabled,
+        "width3_gate_enabled": state.width3_gate_enabled,
+        "kda_prework_enabled": state.kda_prework_enabled,
+        "replayssm_speculative_enabled": state.replayssm_speculative_enabled,
+        "projected_kv_cache_enabled": state.projected_kv_cache_enabled,
+        "projected_kv_cache_max_tokens": state.projected_kv_cache_max_tokens,
+        "async_decode_boundaries": state.async_decode_boundaries,
+        "async_decode_state": state.async_decode_state,
+        "async_decode_width3_enabled": state.async_decode_width3_enabled,
+        "native_q3_triplet_enabled": state.native_q3_triplet_enabled,
+        "native_q3_dispatch_receipt_enabled": (
+            state.native_q3_dispatch_receipt_enabled
+        ),
+    }
+    if current != expected:
+        raise RuntimeError("K3 W3 composition selectors changed during receipt capture")
 
 
 def _next_receipt_sequence() -> int:
@@ -167,6 +282,20 @@ def _validate_expected_receipt_layers(expected_layers: int) -> None:
         raise ValueError("packed-front receipt expected layers must be a positive int")
 
 
+def _model_receipt_layers(model: Any) -> Any:
+    try:
+        layers = model.language_model.model.layers
+    except AttributeError as error:
+        raise TypeError(
+            "K3 receipt requires model.language_model.model.layers"
+        ) from error
+    try:
+        iter(layers)
+    except TypeError as error:
+        raise TypeError("K3 receipt model layers are not iterable") from error
+    return layers
+
+
 def _count_model_authoritative_width3_packs(
     model: Any,
     *,
@@ -175,16 +304,7 @@ def _count_model_authoritative_width3_packs(
     """Read installed parents after proving the exact sparse-layer traversal."""
 
     _validate_expected_receipt_layers(expected_layers)
-    try:
-        layers = model.language_model.model.layers
-    except AttributeError as error:
-        raise TypeError(
-            "packed-front receipt requires model.language_model.model.layers"
-        ) from error
-    try:
-        iterator = iter(layers)
-    except TypeError as error:
-        raise TypeError("packed-front receipt model layers are not iterable") from error
+    iterator = iter(_model_receipt_layers(model))
 
     count = 0
     relevant_layers = 0
@@ -233,6 +353,145 @@ def _count_model_authoritative_width3_packs(
     return count
 
 
+def _count_model_k3_w3_kda_layers(
+    model: Any,
+    *,
+    expected_layers: int,
+) -> int:
+    """Prove the released rank-local KDA layer geometry without reading tensors."""
+
+    _validate_expected_receipt_layers(expected_layers)
+    count = 0
+    for layer in iter(_model_receipt_layers(model)):
+        if getattr(layer, "is_linear", False) is not True:
+            continue
+        attention = getattr(layer, "self_attn", None)
+        if attention is None:
+            continue
+        production_geometry = (
+            type(getattr(attention, "num_heads", None)) is int
+            and attention.num_heads == 48
+            and type(getattr(attention, "head_dim", None)) is int
+            and attention.head_dim == 128
+            and type(getattr(attention, "conv_kernel", None)) is int
+            and attention.conv_kernel == 4
+            and getattr(attention, "use_full_rank_gate", None) is True
+            and type(getattr(attention, "lower_bound", None)) is float
+            and attention.lower_bound == -5.0
+        )
+        if production_geometry:
+            count += 1
+            if count > expected_layers:
+                break
+    if count != expected_layers:
+        raise ValueError(
+            "K3 W3 composition receipt expected "
+            f"{expected_layers} production KDA layers, found {count}"
+        )
+    return count
+
+
+def _begin_receipt(
+    request_token: int,
+    model: Any,
+    *,
+    expected_layers: int,
+    expected_kda_layers: int,
+    composition: bool,
+) -> tuple[int, int]:
+    # Clear first so malformed configuration or model traversal cannot revive
+    # counters from an abandoned generator in a reused execution context.
+    _RECEIPT_STATE.set(None)
+    _validate_request_binding(1, request_token)
+    _validate_expected_receipt_layers(expected_layers)
+    if expected_kda_layers:
+        _validate_expected_receipt_layers(expected_kda_layers)
+
+    if composition:
+        selector_snapshot = _composition_selector_snapshot()
+    else:
+        # Preserve the mature packed-only receipt's selector isolation.  An
+        # unrelated combined selector must not change its legacy lifecycle.
+        selector_snapshot = {
+            "authoritative_gate_enabled": _strict_receipt_gate(
+                AUTHORITATIVE_PACKED_MOE_FRONT_ENV
+            ),
+            "width3_gate_enabled": _strict_receipt_gate(
+                AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV
+            ),
+            "kda_prework_enabled": False,
+            "replayssm_speculative_enabled": False,
+            "projected_kv_cache_enabled": False,
+            "projected_kv_cache_max_tokens": 32768,
+            "async_decode_boundaries": "none",
+            "async_decode_state": "hidden",
+            "async_decode_width3_enabled": False,
+            "native_q3_triplet_enabled": False,
+            "native_q3_dispatch_receipt_enabled": False,
+        }
+    authoritative_gate_enabled = bool(selector_snapshot["authoritative_gate_enabled"])
+    width3_gate_enabled = bool(selector_snapshot["width3_gate_enabled"])
+    if authoritative_gate_enabled != width3_gate_enabled:
+        raise ValueError(
+            "packed-front receipt requires authoritative and width3 gates "
+            "to be jointly disabled or jointly enabled"
+        )
+    if (
+        composition
+        and authoritative_gate_enabled
+        and (
+            not selector_snapshot["native_q3_triplet_enabled"]
+            or not selector_snapshot["native_q3_dispatch_receipt_enabled"]
+        )
+    ):
+        raise ValueError(
+            "K3 W3 composition receipt requires both native Q3 route and "
+            "dispatch-receipt selectors when width-three packing is enabled"
+        )
+
+    pack_count_before = _count_model_authoritative_width3_packs(
+        model,
+        expected_layers=expected_layers,
+    )
+    if expected_kda_layers:
+        _count_model_k3_w3_kda_layers(
+            model,
+            expected_layers=expected_kda_layers,
+        )
+    request_sequence = _next_receipt_sequence()
+    state = _PackedFrontReceiptState(
+        request_sequence=request_sequence,
+        request_token=request_token,
+        expected_layers=expected_layers,
+        expected_kda_layers=expected_kda_layers,
+        pack_count_before=pack_count_before,
+        composition=composition,
+        authoritative_gate_enabled=authoritative_gate_enabled,
+        width3_gate_enabled=width3_gate_enabled,
+        kda_prework_enabled=bool(selector_snapshot["kda_prework_enabled"]),
+        replayssm_speculative_enabled=bool(
+            selector_snapshot["replayssm_speculative_enabled"]
+        ),
+        projected_kv_cache_enabled=bool(
+            selector_snapshot["projected_kv_cache_enabled"]
+        ),
+        projected_kv_cache_max_tokens=int(
+            selector_snapshot["projected_kv_cache_max_tokens"]
+        ),
+        async_decode_boundaries=str(selector_snapshot["async_decode_boundaries"]),
+        async_decode_state=str(selector_snapshot["async_decode_state"]),
+        async_decode_width3_enabled=bool(
+            selector_snapshot["async_decode_width3_enabled"]
+        ),
+        native_q3_triplet_enabled=bool(selector_snapshot["native_q3_triplet_enabled"]),
+        native_q3_dispatch_receipt_enabled=bool(
+            selector_snapshot["native_q3_dispatch_receipt_enabled"]
+        ),
+    )
+    _RECEIPT_STATE.set(state)
+    return request_sequence, request_token
+
+
 def begin_authoritative_packed_moe_front_receipt(
     request_token: int,
     model: Any,
@@ -241,38 +500,36 @@ def begin_authoritative_packed_moe_front_receipt(
 ) -> tuple[int, int]:
     """Begin one context-local receipt and snapshot installed parents."""
 
-    # Clear first so malformed configuration or model traversal cannot revive
-    # counters from an abandoned generator in a reused execution context.
-    _RECEIPT_STATE.set(None)
     if not authoritative_packed_moe_front_receipt_enabled():
         raise RuntimeError("packed-front receipt capture is disabled")
-    _validate_request_binding(1, request_token)
-    _validate_expected_receipt_layers(expected_layers)
-    request_sequence = _next_receipt_sequence()
-    authoritative_gate_enabled = _strict_receipt_gate(
-        AUTHORITATIVE_PACKED_MOE_FRONT_ENV
-    )
-    width3_gate_enabled = _strict_receipt_gate(
-        AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV
-    )
-    if authoritative_gate_enabled != width3_gate_enabled:
-        raise ValueError(
-            "packed-front receipt requires authoritative and width3 gates "
-            "to be jointly disabled or jointly enabled"
-        )
-    state = _PackedFrontReceiptState(
-        request_sequence=request_sequence,
-        request_token=request_token,
+    return _begin_receipt(
+        request_token,
+        model,
         expected_layers=expected_layers,
-        pack_count_before=_count_model_authoritative_width3_packs(
-            model,
-            expected_layers=expected_layers,
-        ),
-        authoritative_gate_enabled=authoritative_gate_enabled,
-        width3_gate_enabled=width3_gate_enabled,
+        expected_kda_layers=0,
+        composition=False,
     )
-    _RECEIPT_STATE.set(state)
-    return request_sequence, request_token
+
+
+def begin_k3_w3_composition_receipt(
+    request_token: int,
+    model: Any,
+    *,
+    expected_sparse_layers: int = 92,
+    expected_kda_layers: int = 69,
+) -> tuple[int, int]:
+    """Begin one request-local combined receipt after exact model traversal."""
+
+    if not k3_w3_composition_receipt_enabled():
+        _RECEIPT_STATE.set(None)
+        raise RuntimeError("K3 W3 composition receipt capture is disabled")
+    return _begin_receipt(
+        request_token,
+        model,
+        expected_layers=expected_sparse_layers,
+        expected_kda_layers=expected_kda_layers,
+        composition=True,
+    )
 
 
 def _receipt_state_for_binding(
@@ -321,6 +578,7 @@ def _receipt_helper_started(sparse_moe: Any, x: mx.array, gate_enabled: bool) ->
     state = _RECEIPT_STATE.get()
     if state is None:
         return 0
+    _validate_composition_selector_snapshot(state)
     current_gate = _strict_receipt_gate(AUTHORITATIVE_PACKED_MOE_FRONT_ENV)
     current_width3_gate = _strict_receipt_gate(
         AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV
@@ -393,19 +651,57 @@ def _receipt_eligible_outcome(
     _increment_receipt(**increments)
 
 
-def finish_authoritative_packed_moe_front_receipt(
-    request_sequence: int,
-    request_token: int,
-    model: Any,
-) -> dict[str, str | int | bool]:
-    """Finalize, deactivate, and return one exact scalar-only receipt."""
+def record_k3_w3_prework_receipt_decision(
+    x: mx.array,
+    *,
+    gate_enabled: bool,
+    admitted: bool,
+) -> None:
+    """Partition one production T>1 KDA helper decision inside a receipt."""
 
-    state = _receipt_state_for_binding(request_sequence, request_token)
-    _RECEIPT_STATE.set(None)
-    pack_count_after = _count_model_authoritative_width3_packs(
-        model,
-        expected_layers=state.expected_layers,
-    )
+    state = _RECEIPT_STATE.get()
+    if state is None or not state.composition:
+        return
+    _validate_composition_selector_snapshot(state)
+    if type(gate_enabled) is not bool or type(admitted) is not bool:
+        raise TypeError("K3 W3 receipt decisions require exact booleans")
+    if x.ndim != 3 or int(x.shape[1]) <= 1:
+        return
+    if gate_enabled != state.kda_prework_enabled:
+        raise RuntimeError("K3 W3 prework selector changed during receipt capture")
+    _increment_receipt(kda_helper_calls=1)
+    if not gate_enabled:
+        if admitted:
+            raise RuntimeError("disabled K3 W3 prework cannot be admitted")
+        _increment_receipt(kda_gate_disabled_calls=1)
+    elif not admitted:
+        _increment_receipt(kda_noncontract_calls=1)
+    else:
+        _increment_receipt(kda_admitted_calls=1, kda_pending_calls=1)
+
+
+def record_k3_w3_prework_receipt_outcome(*, success: bool) -> None:
+    """Settle one admitted KDA call after its fused helper has returned."""
+
+    state = _RECEIPT_STATE.get()
+    if state is None or not state.composition:
+        return
+    _validate_composition_selector_snapshot(state)
+    if type(success) is not bool:
+        raise TypeError("K3 W3 receipt outcomes require an exact boolean")
+    if state.kda_pending_calls < 1:
+        raise RuntimeError("K3 W3 receipt has no pending KDA admission")
+    changes = {
+        "kda_pending_calls": state.kda_pending_calls - 1,
+        "kda_success_calls": state.kda_success_calls + int(success),
+        "kda_fallback_calls": state.kda_fallback_calls + int(not success),
+    }
+    if any(value > _RECEIPT_COUNTER_LIMIT for value in changes.values()):
+        raise OverflowError("K3 W3 receipt counter exceeded its bound")
+    _RECEIPT_STATE.set(replace(state, **changes))
+
+
+def _validate_packed_receipt_partitions(state: _PackedFrontReceiptState) -> None:
     terminal_total = (
         state.gate_disabled_calls
         + state.noncontract_calls
@@ -439,6 +735,37 @@ def finish_authoritative_packed_moe_front_receipt(
         != state.width1_dispatch_fallback_calls + state.width3_dispatch_fallback_calls
     ):
         raise RuntimeError("packed-front receipt aggregate partition is incomplete")
+
+
+def _validate_kda_receipt_partitions(state: _PackedFrontReceiptState) -> None:
+    if state.kda_helper_calls != (
+        state.kda_gate_disabled_calls
+        + state.kda_noncontract_calls
+        + state.kda_admitted_calls
+    ):
+        raise RuntimeError("K3 W3 receipt KDA helper partition is incomplete")
+    if state.kda_admitted_calls != (
+        state.kda_success_calls + state.kda_fallback_calls + state.kda_pending_calls
+    ):
+        raise RuntimeError("K3 W3 receipt KDA admission partition is incomplete")
+    if state.kda_pending_calls:
+        raise RuntimeError("K3 W3 receipt has unsettled KDA admissions")
+
+
+def finish_authoritative_packed_moe_front_receipt(
+    request_sequence: int,
+    request_token: int,
+    model: Any,
+) -> dict[str, str | int | bool]:
+    """Finalize, deactivate, and return one exact scalar-only receipt."""
+
+    state = _receipt_state_for_binding(request_sequence, request_token)
+    _RECEIPT_STATE.set(None)
+    pack_count_after = _count_model_authoritative_width3_packs(
+        model,
+        expected_layers=state.expected_layers,
+    )
+    _validate_packed_receipt_partitions(state)
     return {
         "schema": AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_SCHEMA,
         "request_sequence": state.request_sequence,
@@ -482,6 +809,100 @@ def abort_authoritative_packed_moe_front_receipt(
 
     try:
         _receipt_state_for_binding(request_sequence, request_token)
+    finally:
+        _RECEIPT_STATE.set(None)
+
+
+def finish_k3_w3_composition_receipt(
+    request_sequence: int,
+    request_token: int,
+    model: Any,
+) -> dict[str, str | int | bool]:
+    """Finalize one combined receipt, rejecting mutation or partial accounting."""
+
+    state = _receipt_state_for_binding(request_sequence, request_token)
+    try:
+        if not state.composition:
+            raise RuntimeError("active receipt is not a K3 W3 composition receipt")
+        _validate_composition_selector_snapshot(state)
+        pack_count_after = _count_model_authoritative_width3_packs(
+            model,
+            expected_layers=state.expected_layers,
+        )
+        _count_model_k3_w3_kda_layers(
+            model,
+            expected_layers=state.expected_kda_layers,
+        )
+        _validate_packed_receipt_partitions(state)
+        _validate_kda_receipt_partitions(state)
+        return {
+            "schema": K3_W3_COMPOSITION_RECEIPT_SCHEMA,
+            "request_sequence": state.request_sequence,
+            "request_token": state.request_token,
+            "expected_sparse_layers": state.expected_layers,
+            "expected_kda_layers": state.expected_kda_layers,
+            "finalized": True,
+            "aborted": False,
+            "poisoned": False,
+            "packed_authoritative_enabled": state.authoritative_gate_enabled,
+            "packed_width3_enabled": state.width3_gate_enabled,
+            "kda_prework_enabled": state.kda_prework_enabled,
+            "replayssm_speculative_enabled": state.replayssm_speculative_enabled,
+            "projected_kv_cache_enabled": state.projected_kv_cache_enabled,
+            "projected_kv_cache_max_tokens": (state.projected_kv_cache_max_tokens),
+            "async_decode_boundaries": state.async_decode_boundaries,
+            "async_decode_state": state.async_decode_state,
+            "async_decode_width3_enabled": state.async_decode_width3_enabled,
+            "native_q3_triplet_enabled": state.native_q3_triplet_enabled,
+            "native_q3_dispatch_receipt_enabled": (
+                state.native_q3_dispatch_receipt_enabled
+            ),
+            "helper_calls": state.helper_calls,
+            "eligible_width1_calls": state.eligible_width1_calls,
+            "eligible_width3_calls": state.eligible_width3_calls,
+            "packed_width1_hits": state.packed_width1_hits,
+            "packed_width3_hits": state.packed_width3_hits,
+            "packed_hits": state.packed_hits,
+            "packed_width1_output_tensors": state.packed_width1_output_tensors,
+            "packed_width3_output_tensors": state.packed_width3_output_tensors,
+            "packed_output_tensors": state.packed_output_tensors,
+            "packed_width1_installs": state.packed_width1_installs,
+            "packed_width3_installs": state.packed_width3_installs,
+            "lazy_installs": state.lazy_installs,
+            "gate_disabled_calls": state.gate_disabled_calls,
+            "noncontract_calls": state.noncontract_calls,
+            "width1_unsupported_calls": state.width1_unsupported_calls,
+            "width3_unsupported_calls": state.width3_unsupported_calls,
+            "unsupported_calls": state.unsupported_calls,
+            "width1_dispatch_fallback_calls": (state.width1_dispatch_fallback_calls),
+            "width3_dispatch_fallback_calls": (state.width3_dispatch_fallback_calls),
+            "packed_dispatch_fallback_calls": (state.packed_dispatch_fallback_calls),
+            "invalidations": state.invalidations,
+            "stale_resets": state.stale_resets,
+            "pack_count_before": state.pack_count_before,
+            "pack_count_after": pack_count_after,
+            "kda_helper_calls": state.kda_helper_calls,
+            "kda_gate_disabled_calls": state.kda_gate_disabled_calls,
+            "kda_noncontract_calls": state.kda_noncontract_calls,
+            "kda_admitted_calls": state.kda_admitted_calls,
+            "kda_success_calls": state.kda_success_calls,
+            "kda_fallback_calls": state.kda_fallback_calls,
+            "kda_pending_calls": state.kda_pending_calls,
+        }
+    finally:
+        _RECEIPT_STATE.set(None)
+
+
+def abort_k3_w3_composition_receipt(
+    request_sequence: int,
+    request_token: int,
+) -> None:
+    """Deactivate one combined receipt without publishing partial telemetry."""
+
+    try:
+        state = _receipt_state_for_binding(request_sequence, request_token)
+        if not state.composition:
+            raise RuntimeError("active receipt is not a K3 W3 composition receipt")
     finally:
         _RECEIPT_STATE.set(None)
 

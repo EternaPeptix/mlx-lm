@@ -51,12 +51,15 @@ from .kimi_k3_packed_moe_front import (
     maybe_authoritative_packed_k3_moe_front,
     maybe_packed_k3_moe_front,
     production_width3_authoritative_front_active,
+    record_k3_w3_prework_receipt_decision,
+    record_k3_w3_prework_receipt_outcome,
 )
 from .kimi_k3_prefill_route_combine import (
     maybe_fused_k3_prefill_switch_glu_reduce,
 )
 from .kimi_k3_w3_prework import (
     can_use_k3_w3_prework_history,
+    k3_w3_prework_history_enabled,
     maybe_fused_k3_w3_prework_history,
 )
 from .kimi_linear import ShortConv1d
@@ -1557,18 +1560,23 @@ class KimiK3DeltaAttention(nn.Module):
         if conv_state is None:
             conv_state = mx.zeros((B, self.conv_kernel - 1, 3 * P), dtype=dtype)
 
+        prework_contract_admitted = can_use_k3_w3_prework_history(
+            self,
+            x,
+            conv_state,
+            short_conv_type=KimiK3ShortConv,
+            inner_conv_type=nn.Conv1d,
+            mask=mask,
+            lengths=lengths,
+            capture_speculative=capture_speculative,
+        )
         use_fused_prework = (
-            can_use_k3_w3_prework_history(
-                self,
-                x,
-                conv_state,
-                short_conv_type=KimiK3ShortConv,
-                inner_conv_type=nn.Conv1d,
-                mask=mask,
-                lengths=lengths,
-                capture_speculative=capture_speculative,
-            )
-            and replayssm_speculative_enabled()
+            prework_contract_admitted and replayssm_speculative_enabled()
+        )
+        record_k3_w3_prework_receipt_decision(
+            x,
+            gate_enabled=k3_w3_prework_history_enabled(),
+            admitted=use_fused_prework,
         )
         if use_fused_prework:
             # This candidate deliberately begins after both projection calls.
@@ -1584,6 +1592,9 @@ class KimiK3DeltaAttention(nn.Module):
                 projected_qkv,
                 conv_state,
                 a_logits,
+            )
+            record_k3_w3_prework_receipt_outcome(
+                success=fused_prework is not None,
             )
             if fused_prework is None:
                 raise RuntimeError(

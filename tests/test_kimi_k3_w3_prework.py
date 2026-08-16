@@ -409,14 +409,66 @@ class K3W3PreworkMetalTests(unittest.TestCase):
             clear=False,
         ):
             k3_w3_prework_history_enabled.cache_clear()
-            with mock.patch(
-                "mlx_lm.models.kimi_k3.maybe_fused_k3_w3_prework_history",
-                return_value=None,
-            ) as fused_mock, self.assertRaisesRegex(
-                RuntimeError, "after selector admission"
+            with (
+                mock.patch(
+                    "mlx_lm.models.kimi_k3.maybe_fused_k3_w3_prework_history",
+                    return_value=None,
+                ) as fused_mock,
+                mock.patch(
+                    "mlx_lm.models.kimi_k3.record_k3_w3_prework_receipt_decision"
+                ) as decision_mock,
+                mock.patch(
+                    "mlx_lm.models.kimi_k3.record_k3_w3_prework_receipt_outcome"
+                ) as outcome_mock,
+                self.assertRaisesRegex(RuntimeError, "after selector admission"),
             ):
                 attention(x, cache=cache)
             fused_mock.assert_called_once()
+            decision_mock.assert_called_once_with(
+                x,
+                gate_enabled=True,
+                admitted=True,
+            )
+            outcome_mock.assert_called_once_with(success=False)
+
+    def test_receipt_success_is_not_recorded_when_fused_helper_raises(self):
+        mx.random.seed(2026081612)
+        attention = _attention()
+        x = mx.random.normal((1, 3, 64), dtype=mx.bfloat16)
+        conv_state = mx.random.normal((1, 3, 3 * 48 * 128), dtype=mx.bfloat16)
+        ssm_state = mx.random.normal((1, 48, 128, 128), dtype=mx.float32)
+        cache = _make_cache(conv_state, ssm_state)
+        mx.eval(attention.parameters(), x, conv_state, ssm_state)
+        with mock.patch.dict(
+            os.environ,
+            {
+                REPLAYSSM_SPECULATIVE_ENV: "1",
+                K3_W3_PREWORK_HISTORY_ENV: "1",
+            },
+            clear=False,
+        ):
+            k3_w3_prework_history_enabled.cache_clear()
+            with (
+                mock.patch(
+                    "mlx_lm.models.kimi_k3.maybe_fused_k3_w3_prework_history",
+                    side_effect=RuntimeError("synthetic fused-helper failure"),
+                ) as fused_mock,
+                mock.patch(
+                    "mlx_lm.models.kimi_k3.record_k3_w3_prework_receipt_decision"
+                ) as decision_mock,
+                mock.patch(
+                    "mlx_lm.models.kimi_k3.record_k3_w3_prework_receipt_outcome"
+                ) as outcome_mock,
+                self.assertRaisesRegex(RuntimeError, "synthetic fused-helper failure"),
+            ):
+                attention(x, cache=cache)
+            fused_mock.assert_called_once()
+            decision_mock.assert_called_once_with(
+                x,
+                gate_enabled=True,
+                admitted=True,
+            )
+            outcome_mock.assert_not_called()
 
     def test_attention_output_raw_replay_and_prefixes_are_byte_exact(self):
         mx.random.seed(2026081602)
