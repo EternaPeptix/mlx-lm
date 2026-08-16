@@ -1571,9 +1571,10 @@ class KimiK3DeltaAttention(nn.Module):
             and replayssm_speculative_enabled()
         )
         if use_fused_prework:
-            # This candidate deliberately begins after both stock projections.
-            # The default-off and unsupported branches below retain the literal
-            # original operation order and do not touch packed projection code.
+            # This candidate deliberately begins after both projection calls.
+            # Its graph is independent of the MoE-front pack later in the
+            # decoder layer and of deferred capture after the layer completes.
+            # Default-off and unsupported branches retain literal stock order.
             projected_qkv = self.qkv_proj(x)
             a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
                 B, T, self.num_heads, self.head_dim

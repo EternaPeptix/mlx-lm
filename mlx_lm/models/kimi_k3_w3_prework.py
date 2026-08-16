@@ -1,9 +1,11 @@
 """Exact, width-three Kimi K3 KDA prework/history experiment.
 
-This module deliberately starts after the stock QKV and ``a`` projections.
-It does not compose with packed projections, speculative scheduling, cache
-ownership, or any DSpark primitive.  The sole candidate kernel replaces the
-released TP2 rank-local sequence
+This module deliberately starts after the QKV and ``a`` projection boundary.
+It composes with the independent authoritative MoE-front pack and deferred
+width-three scheduling because neither changes its input or cache ownership.
+It does not absorb projection work, speculative transaction ownership, or any
+DSpark primitive.  The sole candidate kernel replaces the released TP2
+rank-local sequence
 
 ``short-conv/history -> Q/K RMSNorm+scale -> bounded g``
 
