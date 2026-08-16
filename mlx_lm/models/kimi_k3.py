@@ -55,6 +55,10 @@ from .kimi_k3_packed_moe_front import (
 from .kimi_k3_prefill_route_combine import (
     maybe_fused_k3_prefill_switch_glu_reduce,
 )
+from .kimi_k3_w3_prework import (
+    can_use_k3_w3_prework_history,
+    maybe_fused_k3_w3_prework_history,
+)
 from .kimi_linear import ShortConv1d
 from .mla import MultiLinear, QuantizedMultiLinear
 from .switch_layers import SwitchGLU
@@ -1552,56 +1556,51 @@ class KimiK3DeltaAttention(nn.Module):
         if conv_state is None:
             conv_state = mx.zeros((B, self.conv_kernel - 1, 3 * P), dtype=dtype)
 
-        projected_qkv = self.qkv_proj(x)
-        if capture_speculative:
-            qkv, conv_state, conv_state_history = self.qkv_conv(
-                projected_qkv,
+        use_fused_prework = (
+            can_use_k3_w3_prework_history(
+                self,
+                x,
                 conv_state,
-                mask,
-                lengths,
-                return_state_history=True,
+                short_conv_type=KimiK3ShortConv,
+                inner_conv_type=nn.Conv1d,
+                mask=mask,
+                lengths=lengths,
+                capture_speculative=capture_speculative,
             )
-        else:
-            qkv, conv_state = self.qkv_conv(
-                projected_qkv,
-                conv_state,
-                mask,
-                lengths,
-            )
-
-        if cache is not None:
-            cache[0] = conv_state
-
-        q = qkv[..., :P].reshape(B, T, self.num_heads, self.head_dim)
-        raw_k = qkv[..., P : 2 * P].reshape(B, T, self.num_heads, self.head_dim)
-        v = qkv[..., 2 * P :].reshape(B, T, self.num_heads, self.head_dim)
-
-        inv_scale = self.scale
-        eps = 1e-6 / self.head_dim
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
-        k = inv_scale * mx.fast.rms_norm(raw_k, None, eps)
-
-        a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
-            B, T, self.num_heads, self.head_dim
+            and replayssm_speculative_enabled()
         )
-        b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
-
-        replay_speculative = capture_speculative and replayssm_speculative_enabled()
-        if replay_speculative:
+        if use_fused_prework:
+            # This candidate deliberately begins after both stock projections.
+            # The default-off and unsupported branches below retain the literal
+            # original operation order and do not touch packed projection code.
+            projected_qkv = self.qkv_proj(x)
+            a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
+                B, T, self.num_heads, self.head_dim
+            )
+            fused_prework = maybe_fused_k3_w3_prework_history(
+                self,
+                projected_qkv,
+                conv_state,
+                a_logits,
+            )
+            if fused_prework is None:
+                raise RuntimeError(
+                    "Kimi K3 W3 prework contract changed after selector admission"
+                )
+            (
+                q,
+                k,
+                raw_k,
+                v,
+                gk,
+                conv_state,
+                conv_state_history,
+            ) = fused_prework
+            if cache is not None:
+                cache[0] = conv_state
+            b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
             beta = mx.sigmoid(b_logits)
-            if self.lower_bound is None:
-                gk = compute_g(
-                    self.A_log.reshape(self.num_heads, 1),
-                    a_logits,
-                    self.dt_bias.reshape(self.num_heads, self.head_dim),
-                )
-            else:
-                gk = compute_g_safe(
-                    self.A_log.reshape(self.num_heads, 1),
-                    a_logits,
-                    self.dt_bias.reshape(self.num_heads, self.head_dim),
-                    self.lower_bound,
-                )
+            replay_speculative = True
             out, ssm_state = gated_delta_kernel(
                 q,
                 k,
@@ -1612,24 +1611,84 @@ class KimiK3DeltaAttention(nn.Module):
                 mask,
             )
         else:
-            gated_delta_result = gated_delta_update(
-                q,
-                k,
-                v,
-                a_logits,
-                b_logits,
-                self.A_log.reshape(self.num_heads, 1),
-                self.dt_bias.reshape(self.num_heads, self.head_dim),
-                state=ssm_state,
-                mask=mask,
-                use_kernel=not self.training,
-                lower_bound=self.lower_bound,
-                return_state_history=capture_speculative,
-            )
+            projected_qkv = self.qkv_proj(x)
             if capture_speculative:
-                out, ssm_state, ssm_state_history = gated_delta_result
+                qkv, conv_state, conv_state_history = self.qkv_conv(
+                    projected_qkv,
+                    conv_state,
+                    mask,
+                    lengths,
+                    return_state_history=True,
+                )
             else:
-                out, ssm_state = gated_delta_result
+                qkv, conv_state = self.qkv_conv(
+                    projected_qkv,
+                    conv_state,
+                    mask,
+                    lengths,
+                )
+
+            if cache is not None:
+                cache[0] = conv_state
+
+            q = qkv[..., :P].reshape(B, T, self.num_heads, self.head_dim)
+            raw_k = qkv[..., P : 2 * P].reshape(B, T, self.num_heads, self.head_dim)
+            v = qkv[..., 2 * P :].reshape(B, T, self.num_heads, self.head_dim)
+
+            inv_scale = self.scale
+            eps = 1e-6 / self.head_dim
+            q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+            k = inv_scale * mx.fast.rms_norm(raw_k, None, eps)
+
+            a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
+                B, T, self.num_heads, self.head_dim
+            )
+            b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
+
+            replay_speculative = capture_speculative and replayssm_speculative_enabled()
+            if replay_speculative:
+                beta = mx.sigmoid(b_logits)
+                if self.lower_bound is None:
+                    gk = compute_g(
+                        self.A_log.reshape(self.num_heads, 1),
+                        a_logits,
+                        self.dt_bias.reshape(self.num_heads, self.head_dim),
+                    )
+                else:
+                    gk = compute_g_safe(
+                        self.A_log.reshape(self.num_heads, 1),
+                        a_logits,
+                        self.dt_bias.reshape(self.num_heads, self.head_dim),
+                        self.lower_bound,
+                    )
+                out, ssm_state = gated_delta_kernel(
+                    q,
+                    k,
+                    v,
+                    gk,
+                    beta,
+                    ssm_state,
+                    mask,
+                )
+            else:
+                gated_delta_result = gated_delta_update(
+                    q,
+                    k,
+                    v,
+                    a_logits,
+                    b_logits,
+                    self.A_log.reshape(self.num_heads, 1),
+                    self.dt_bias.reshape(self.num_heads, self.head_dim),
+                    state=ssm_state,
+                    mask=mask,
+                    use_kernel=not self.training,
+                    lower_bound=self.lower_bound,
+                    return_state_history=capture_speculative,
+                )
+                if capture_speculative:
+                    out, ssm_state, ssm_state_history = gated_delta_result
+                else:
+                    out, ssm_state = gated_delta_result
 
         if cache is not None:
             cache[1] = ssm_state
