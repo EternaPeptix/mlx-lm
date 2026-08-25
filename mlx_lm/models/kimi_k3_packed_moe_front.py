@@ -500,6 +500,7 @@ def begin_authoritative_packed_moe_front_receipt(
 ) -> tuple[int, int]:
     """Begin one context-local receipt and snapshot installed parents."""
 
+    _RECEIPT_STATE.set(None)
     if not authoritative_packed_moe_front_receipt_enabled():
         raise RuntimeError("packed-front receipt capture is disabled")
     return _begin_receipt(
@@ -520,8 +521,8 @@ def begin_k3_w3_composition_receipt(
 ) -> tuple[int, int]:
     """Begin one request-local combined receipt after exact model traversal."""
 
+    _RECEIPT_STATE.set(None)
     if not k3_w3_composition_receipt_enabled():
-        _RECEIPT_STATE.set(None)
         raise RuntimeError("K3 W3 composition receipt capture is disabled")
     return _begin_receipt(
         request_token,

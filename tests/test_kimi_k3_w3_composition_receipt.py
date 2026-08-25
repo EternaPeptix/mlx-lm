@@ -78,6 +78,83 @@ def _record_packed_call(*, packed: bool, width: int = 3, install: bool = False):
 
 
 class K3W3CompositionReceiptTests(unittest.TestCase):
+    def _assert_failed_legacy_restart_clears_context(
+        self,
+        selector: str,
+        error_type: type[Exception],
+        error_pattern: str,
+    ) -> None:
+        environment = {
+            AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_ENV: "1",
+            AUTHORITATIVE_PACKED_MOE_FRONT_ENV: "0",
+            AUTHORITATIVE_PACKED_MOE_FRONT_WIDTH3_ENV: "0",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                receipt_module,
+                "_count_model_authoritative_width3_packs",
+                return_value=0,
+            ),
+        ):
+            abandoned = begin_authoritative_packed_moe_front_receipt(
+                71,
+                object(),
+                expected_layers=1,
+            )
+            os.environ[AUTHORITATIVE_PACKED_MOE_FRONT_RECEIPT_ENV] = selector
+            with self.assertRaisesRegex(error_type, error_pattern):
+                begin_authoritative_packed_moe_front_receipt(
+                    72,
+                    object(),
+                    expected_layers=1,
+                )
+            with self.assertRaisesRegex(RuntimeError, "no packed-front receipt"):
+                finish_authoritative_packed_moe_front_receipt(
+                    *abandoned,
+                    object(),
+                )
+
+    def _assert_failed_combined_restart_clears_context(
+        self,
+        selector: str,
+        error_type: type[Exception],
+        error_pattern: str,
+    ) -> None:
+        environment = _environment(packed=False, kda=False)
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                receipt_module,
+                "_count_model_authoritative_width3_packs",
+                return_value=0,
+            ),
+            patch.object(
+                receipt_module,
+                "_count_model_k3_w3_kda_layers",
+                return_value=1,
+            ),
+        ):
+            abandoned = begin_k3_w3_composition_receipt(
+                73,
+                object(),
+                expected_sparse_layers=1,
+                expected_kda_layers=1,
+            )
+            os.environ[K3_W3_COMPOSITION_RECEIPT_ENV] = selector
+            with self.assertRaisesRegex(error_type, error_pattern):
+                begin_k3_w3_composition_receipt(
+                    74,
+                    object(),
+                    expected_sparse_layers=1,
+                    expected_kda_layers=1,
+                )
+            with self.assertRaisesRegex(RuntimeError, "no packed-front receipt"):
+                finish_k3_w3_composition_receipt(
+                    *abandoned,
+                    object(),
+                )
+
     def test_selector_is_strict_and_default_off(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(k3_w3_composition_receipt_enabled())
@@ -90,6 +167,34 @@ class K3W3CompositionReceiptTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
                 k3_w3_composition_receipt_enabled()
+
+    def test_disabled_legacy_begin_clears_abandoned_context(self):
+        self._assert_failed_legacy_restart_clears_context(
+            "0",
+            RuntimeError,
+            "capture is disabled",
+        )
+
+    def test_malformed_legacy_begin_clears_abandoned_context(self):
+        self._assert_failed_legacy_restart_clears_context(
+            "malformed",
+            ValueError,
+            "must be 0 or 1",
+        )
+
+    def test_disabled_combined_begin_clears_abandoned_context(self):
+        self._assert_failed_combined_restart_clears_context(
+            "0",
+            RuntimeError,
+            "capture is disabled",
+        )
+
+    def test_malformed_combined_begin_clears_abandoned_context(self):
+        self._assert_failed_combined_restart_clears_context(
+            "malformed",
+            ValueError,
+            "must be 0 or 1",
+        )
 
     def test_combined_selectors_do_not_change_legacy_receipt_semantics(self):
         environment = {

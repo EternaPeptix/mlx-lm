@@ -78,6 +78,7 @@ BATCHED_REPLAYSSM_COMMIT_ENV = "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_COMMIT"
 BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV = (
     "MLX_LM_KIMI_K3_BATCHED_REPLAYSSM_EXPECTED_LAYERS"
 )
+FULL_ACCEPT_IDENTITY_COMMIT_ENV = "MLX_LM_KIMI_K3_COMMIT_IDENTITY_AT_FULL"
 EXACT_WIDE_SHORT_CONV_ENV = "MLX_LM_KIMI_K3_EXACT_WIDE_SHORT_CONV"
 MOK_ROUTED_SHARED_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_ROUTED_SHARED_OVERLAP"
 MOK_PREFILL_OVERLAP_ENV = "MLX_LM_KIMI_K3_MOK_PREFILL_OVERLAP"
@@ -87,10 +88,14 @@ _BATCHED_REPLAYSSM_COUNTERS: Dict[str, int] = {
     "attempted_prepares": 0,
     "batched_prepares": 0,
     "batched_commits": 0,
+    "identity_prepares": 0,
+    "identity_commits": 0,
     "fallback_prepares": 0,
     "fallback_commits": 0,
     "batched_errors": 0,
+    "identity_errors": 0,
     "layers_batched": 0,
+    "layers_identity_committed": 0,
 }
 _BATCHED_REPLAYSSM_TELEMETRY_SCHEMA = "kimi-k3-batched-replayssm-telemetry-v1"
 _BATCHED_REPLAYSSM_TELEMETRY_REVISION = 0
@@ -134,6 +139,15 @@ def batched_replayssm_commit_enabled() -> bool:
     value = os.environ.get(BATCHED_REPLAYSSM_COMMIT_ENV, "0")
     if value not in {"0", "1"}:
         raise ValueError(f"{BATCHED_REPLAYSSM_COMMIT_ENV} must be 0 or 1")
+    return value == "1"
+
+
+def full_accept_identity_commit_enabled() -> bool:
+    """Parse the default-off full-acceptance identity-commit opt-in."""
+
+    value = os.environ.get(FULL_ACCEPT_IDENTITY_COMMIT_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{FULL_ACCEPT_IDENTITY_COMMIT_ENV} must be 0 or 1")
     return value == "1"
 
 
@@ -3790,6 +3804,7 @@ class LanguageModel(nn.Module):
         transaction: KimiK3SpeculativeCacheTransaction,
         consumed: int,
     ):
+        identity_used = False
         batched_used = False
         fallback_used = False
         try:
@@ -3797,6 +3812,14 @@ class LanguageModel(nn.Module):
             width = transaction.width
             if consumed < 1 or consumed > width:
                 raise ValueError("invalid Kimi K3 speculative cache resolution")
+
+            identity_requested = full_accept_identity_commit_enabled()
+            batched_requested = batched_replayssm_commit_enabled()
+            if identity_requested and not batched_requested:
+                raise ValueError(
+                    f"{FULL_ACCEPT_IDENTITY_COMMIT_ENV}=1 requires "
+                    f"{BATCHED_REPLAYSSM_COMMIT_ENV}=1"
+                )
 
             for _, layer_cache, _ in transaction.array_states:
                 if (
@@ -3807,7 +3830,78 @@ class LanguageModel(nn.Module):
                         "Kimi K3 speculative KDA checkpoints are incomplete"
                     )
 
-            if batched_replayssm_commit_enabled():
+            if identity_requested and consumed == width:
+                # At full acceptance the live KDA cache already contains the
+                # exact terminal states produced by the wide verifier. Under
+                # the sealed runtime contract, the common mx.eval below is the
+                # materialization boundary before any logical cache mutation.
+                # This raw-reference exception requires the existing batched
+                # selector and exact expected-layer contract, remains
+                # default-off, and is explicitly attested.
+                expected_layers = _batched_replayssm_expected_layers()
+                observed_layers = len(transaction.array_states)
+                if observed_layers != expected_layers:
+                    raise ValueError(
+                        "Kimi K3 full-acceptance identity commit requires "
+                        f"exactly {expected_layers} KDA layers, got {observed_layers}"
+                    )
+                prepared = []
+                for _, layer_cache, _ in transaction.array_states:
+                    history, initial = layer_cache.speculative_prepare_snapshot(
+                        consumed
+                    )
+                    states = list(layer_cache.cache)
+                    if len(states) != len(history) or len(states) != len(initial):
+                        raise ValueError(
+                            "Kimi K3 full-acceptance identity state count changed"
+                        )
+                    for state, initial_state, recorded in zip(
+                        states, initial, history, strict=True
+                    ):
+                        if (
+                            state.shape != initial_state.shape
+                            or state.dtype != initial_state.dtype
+                        ):
+                            raise ValueError(
+                                "Kimi K3 full-acceptance identity state is incompatible"
+                            )
+                        if isinstance(recorded, SpeculativeReplayState):
+                            recorded.validate(width, state)
+                        elif (
+                            recorded.shape[0] != width
+                            or recorded[-1].shape != state.shape
+                            or recorded[-1].dtype != state.dtype
+                        ):
+                            raise ValueError(
+                                "Kimi K3 full-acceptance history is incompatible"
+                            )
+                    prepared.append((layer_cache, states))
+                identity_used = True
+                transaction.batched_replayssm_attestation = {
+                    "schema": "kimi-k3-full-accept-identity-commit-v1",
+                    "requested": True,
+                    "used_batched_path": False,
+                    "used_identity_path": True,
+                    "status": "identity_prepared",
+                    "fallback_reason": None,
+                    "width": int(width),
+                    "consumed": int(consumed),
+                    "expected_layers": expected_layers,
+                    "observed_layers": observed_layers,
+                    "state_references_reused": sum(
+                        len(states) for _, states in prepared
+                    ),
+                    "detach_nodes": 0,
+                    "raw_reference_commit": True,
+                }
+                _update_batched_replayssm_telemetry(
+                    {
+                        "attempted_prepares": 1,
+                        "identity_prepares": 1,
+                    },
+                    attestation=transaction.batched_replayssm_attestation,
+                )
+            elif batched_requested:
                 prepared, attestation = _prepare_batched_replayssm_commit(
                     transaction.array_states,
                     width,
@@ -3892,7 +3986,10 @@ class LanguageModel(nn.Module):
                 layer_cache.clear_projected_transaction()
         except BaseException:
             if transaction.batched_replayssm_attestation is not None:
-                if batched_used:
+                if identity_used:
+                    error_status = "identity_error_rolled_back"
+                    error_counters = {"identity_errors": 1}
+                elif batched_used:
                     error_status = "batched_error_rolled_back"
                     error_counters = {"batched_errors": 1}
                 elif fallback_used:
@@ -3917,7 +4014,19 @@ class LanguageModel(nn.Module):
                 self.cancel_speculative_cache(transaction)
             raise
 
-        if batched_used:
+        if identity_used:
+            transaction.batched_replayssm_attestation = {
+                **transaction.batched_replayssm_attestation,
+                "status": "identity_committed",
+            }
+            _update_batched_replayssm_telemetry(
+                {
+                    "identity_commits": 1,
+                    "layers_identity_committed": len(transaction.array_states),
+                },
+                attestation=transaction.batched_replayssm_attestation,
+            )
+        elif batched_used:
             transaction.batched_replayssm_attestation = {
                 **transaction.batched_replayssm_attestation,
                 "status": "batched_committed",

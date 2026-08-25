@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,7 @@ from mlx_lm.models.cache import ArraysCache, SpeculativeReplayState
 from mlx_lm.models.kimi_k3 import (
     BATCHED_REPLAYSSM_COMMIT_ENV,
     BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV,
+    FULL_ACCEPT_IDENTITY_COMMIT_ENV,
     REPLAYSSM_SPECULATIVE_ENV,
     KimiK3DeltaAttention,
     Model,
@@ -21,6 +23,7 @@ from mlx_lm.models.kimi_k3 import (
     _prepare_batched_replayssm_commit,
     batched_replayssm_commit_counters,
     batched_replayssm_commit_telemetry,
+    full_accept_identity_commit_enabled,
     reset_batched_replayssm_commit_counters,
 )
 
@@ -147,6 +150,19 @@ def _cache_arrays(cache):
     return [value for _, value in tree_flatten([entry.state for entry in cache])]
 
 
+def _assert_raw_bits_equal(
+    test: unittest.TestCase,
+    expected: mx.array,
+    actual: mx.array,
+) -> None:
+    mx.eval(expected, actual)
+    test.assertEqual(actual.shape, expected.shape)
+    test.assertEqual(actual.dtype, expected.dtype)
+    test.assertTrue(
+        bool(mx.array_equal(expected.view(mx.uint8), actual.view(mx.uint8)).item())
+    )
+
+
 @unittest.skipUnless(mx.metal.is_available(), "requires Metal")
 class BatchedReplaySSMTest(unittest.TestCase):
     def setUp(self):
@@ -188,6 +204,223 @@ class BatchedReplaySSMTest(unittest.TestCase):
 
         for _, cache, _ in array_states:
             cache.cancel_speculative()
+
+    def test_full_accept_identity_commit_reuses_terminal_states_and_is_exact(self):
+        model = _tiny_model()
+        stock_cache = model.make_cache()
+        identity_cache = model.make_cache()
+        prompt = mx.array([[1, 2]], dtype=mx.uint32)
+        stock_prefill = model(prompt, cache=stock_cache)
+        identity_prefill = model(prompt, cache=identity_cache)
+        mx.eval(
+            stock_prefill,
+            identity_prefill,
+            _cache_arrays(stock_cache),
+            _cache_arrays(identity_cache),
+        )
+
+        verify_tokens = mx.array([[3, 4, 5]], dtype=mx.uint32)
+        common_env = {
+            REPLAYSSM_SPECULATIVE_ENV: "1",
+            BATCHED_REPLAYSSM_COMMIT_ENV: "1",
+            BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV: "3",
+        }
+        with mock.patch.dict(
+            os.environ,
+            {**common_env, FULL_ACCEPT_IDENTITY_COMMIT_ENV: "0"},
+            clear=False,
+        ):
+            stock_transaction = model.begin_speculative_cache(stock_cache, 3)
+            stock_wide = model(verify_tokens, cache=stock_cache)
+            mx.eval(stock_wide)
+            model.resolve_speculative_cache(stock_transaction, consumed=3)
+
+        with mock.patch.dict(
+            os.environ,
+            {**common_env, FULL_ACCEPT_IDENTITY_COMMIT_ENV: "1"},
+            clear=False,
+        ):
+            identity_transaction = model.begin_speculative_cache(identity_cache, 3)
+            identity_wide = model(verify_tokens, cache=identity_cache)
+            mx.eval(identity_wide)
+            terminal_states = {
+                index: tuple(entry.cache)
+                for index, entry in enumerate(identity_cache)
+                if isinstance(entry, ArraysCache)
+            }
+            model.resolve_speculative_cache(identity_transaction, consumed=3)
+
+        attestation = identity_transaction.batched_replayssm_attestation
+        self.assertEqual(
+            attestation["schema"], "kimi-k3-full-accept-identity-commit-v1"
+        )
+        self.assertEqual(attestation["status"], "identity_committed")
+        self.assertTrue(attestation["used_identity_path"])
+        self.assertEqual(attestation["expected_layers"], 3)
+        self.assertEqual(attestation["observed_layers"], 3)
+        self.assertEqual(attestation["state_references_reused"], 6)
+        self.assertEqual(attestation["detach_nodes"], 0)
+        self.assertTrue(attestation["raw_reference_commit"])
+        for index, states in terminal_states.items():
+            for expected_object, committed_object in zip(
+                states, identity_cache[index].cache, strict=True
+            ):
+                self.assertIs(committed_object, expected_object)
+
+        stock_arrays = _cache_arrays(stock_cache)
+        identity_arrays = _cache_arrays(identity_cache)
+        mx.eval(stock_arrays, identity_arrays)
+        _assert_raw_bits_equal(self, stock_wide, identity_wide)
+        for expected, actual in zip(stock_arrays, identity_arrays, strict=True):
+            _assert_raw_bits_equal(self, expected, actual)
+
+        next_token = mx.array([[6]], dtype=mx.uint32)
+        stock_next = model(next_token, cache=stock_cache)
+        identity_next = model(next_token, cache=identity_cache)
+        mx.eval(stock_next, identity_next)
+        _assert_raw_bits_equal(self, stock_next, identity_next)
+
+        counters = batched_replayssm_commit_counters()
+        self.assertEqual(counters["attempted_prepares"], 2)
+        self.assertEqual(counters["batched_commits"], 1)
+        self.assertEqual(counters["identity_prepares"], 1)
+        self.assertEqual(counters["identity_commits"], 1)
+        self.assertEqual(counters["layers_identity_committed"], 3)
+
+    def test_identity_commit_is_not_used_for_partial_acceptance(self):
+        model = _tiny_model()
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2]], dtype=mx.uint32), cache=cache)
+        mx.eval(prefill, _cache_arrays(cache))
+        with mock.patch.dict(
+            os.environ,
+            {
+                REPLAYSSM_SPECULATIVE_ENV: "1",
+                BATCHED_REPLAYSSM_COMMIT_ENV: "1",
+                BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV: "3",
+                FULL_ACCEPT_IDENTITY_COMMIT_ENV: "1",
+            },
+            clear=False,
+        ):
+            transaction = model.begin_speculative_cache(cache, 3)
+            wide = model(mx.array([[3, 4, 5]], dtype=mx.uint32), cache=cache)
+            mx.eval(wide)
+            model.resolve_speculative_cache(transaction, consumed=2)
+        self.assertEqual(
+            transaction.batched_replayssm_attestation["status"],
+            "batched_committed",
+        )
+
+    def test_identity_commit_requires_batched_selector_and_expected_layers(self):
+        cases = (
+            (
+                "missing batched selector",
+                {
+                    BATCHED_REPLAYSSM_COMMIT_ENV: "0",
+                    BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV: "3",
+                },
+                f"{BATCHED_REPLAYSSM_COMMIT_ENV}=1",
+            ),
+            (
+                "unexpected layer count",
+                {
+                    BATCHED_REPLAYSSM_COMMIT_ENV: "1",
+                    BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV: "4",
+                },
+                "requires exactly 4 KDA layers, got 3",
+            ),
+        )
+        for label, selector_environment, error_pattern in cases:
+            with self.subTest(label=label):
+                model = _tiny_model()
+                cache = model.make_cache()
+                prefill = model(mx.array([[1, 2]], dtype=mx.uint32), cache=cache)
+                mx.eval(prefill, _cache_arrays(cache))
+                initial_array_states = {
+                    index: list(entry.cache)
+                    for index, entry in enumerate(cache)
+                    if isinstance(entry, ArraysCache)
+                }
+                environment = {
+                    REPLAYSSM_SPECULATIVE_ENV: "1",
+                    FULL_ACCEPT_IDENTITY_COMMIT_ENV: "1",
+                    **selector_environment,
+                }
+                with mock.patch.dict(os.environ, environment, clear=False):
+                    transaction = model.begin_speculative_cache(cache, 3)
+                    wide = model(mx.array([[3, 4, 5]], dtype=mx.uint32), cache=cache)
+                    mx.eval(wide)
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        model.resolve_speculative_cache(transaction, consumed=3)
+
+                self.assertFalse(transaction.active)
+                self.assertIsNone(transaction.batched_replayssm_attestation)
+                for index, expected in initial_array_states.items():
+                    for actual_state, expected_state in zip(
+                        cache[index].cache, expected, strict=True
+                    ):
+                        self.assertIs(actual_state, expected_state)
+
+        counters = batched_replayssm_commit_counters()
+        self.assertEqual(counters["identity_prepares"], 0)
+        self.assertEqual(counters["identity_commits"], 0)
+        self.assertEqual(counters["identity_errors"], 0)
+
+    def test_full_accept_identity_commit_has_flat_active_memory(self):
+        model = _tiny_model()
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2]], dtype=mx.uint32), cache=cache)
+        mx.eval(prefill, _cache_arrays(cache))
+        environment = {
+            REPLAYSSM_SPECULATIVE_ENV: "1",
+            BATCHED_REPLAYSSM_COMMIT_ENV: "1",
+            BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV: "3",
+            FULL_ACCEPT_IDENTITY_COMMIT_ENV: "1",
+        }
+
+        def full_accept_round(start: int) -> None:
+            transaction = model.begin_speculative_cache(cache, 3)
+            tokens = mx.array([[start, start + 1, start + 2]], dtype=mx.uint32)
+            wide = model(tokens, cache=cache)
+            mx.eval(wide)
+            model.resolve_speculative_cache(transaction, consumed=3)
+
+        with mock.patch.dict(os.environ, environment, clear=False):
+            for start in range(3, 15, 3):
+                full_accept_round(start)
+            gc.collect()
+            mx.clear_cache()
+
+            active_samples = []
+            for start in range(15, 51, 3):
+                full_accept_round(start)
+                gc.collect()
+                mx.clear_cache()
+                active_samples.append(mx.get_active_memory())
+
+        # The MLA cache stays inside its first allocation block at these
+        # lengths.  Retaining a wide graph therefore appears as monotonic
+        # active-memory growth; a detached terminal state stays flat apart
+        # from one small allocator page.
+        tolerance = 256 * 1024
+        self.assertLessEqual(
+            max(active_samples) - min(active_samples),
+            tolerance,
+            f"active-memory samples drifted: {active_samples}",
+        )
+
+    def test_identity_commit_selector_is_fail_closed(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(full_accept_identity_commit_enabled())
+        with mock.patch.dict(
+            os.environ, {FULL_ACCEPT_IDENTITY_COMMIT_ENV: "0"}, clear=False
+        ):
+            self.assertFalse(full_accept_identity_commit_enabled())
+        with mock.patch.dict(
+            os.environ, {FULL_ACCEPT_IDENTITY_COMMIT_ENV: "2"}, clear=False
+        ):
+            with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+                full_accept_identity_commit_enabled()
 
     def test_layer_count_mismatch_falls_back_before_graph_build(self):
         array_states = _synthetic_array_states(3, width=3)
@@ -416,6 +649,126 @@ class BatchedReplaySSMTest(unittest.TestCase):
             telemetry["latest_attestation"],
             transaction.batched_replayssm_attestation,
         )
+
+    def test_identity_eval_failure_rolls_back_every_cache(self):
+        model = _tiny_model()
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2]], dtype=mx.uint32), cache=cache)
+        mx.eval(prefill, _cache_arrays(cache))
+        initial_array_states = {
+            index: list(entry.cache)
+            for index, entry in enumerate(cache)
+            if isinstance(entry, ArraysCache)
+        }
+        initial_kv_states = {
+            index: (entry.keys, entry.values, entry.offset)
+            for index, entry in enumerate(cache)
+            if not isinstance(entry, ArraysCache)
+        }
+        environment = {
+            REPLAYSSM_SPECULATIVE_ENV: "1",
+            BATCHED_REPLAYSSM_COMMIT_ENV: "1",
+            BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV: "3",
+            FULL_ACCEPT_IDENTITY_COMMIT_ENV: "1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=False):
+            transaction = model.begin_speculative_cache(cache, 3)
+            wide = model(mx.array([[3, 4, 5]], dtype=mx.uint32), cache=cache)
+            mx.eval(wide)
+            with mock.patch(
+                "mlx_lm.models.kimi_k3.mx.eval",
+                side_effect=RuntimeError("injected identity evaluation failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected identity"):
+                    model.resolve_speculative_cache(transaction, consumed=3)
+
+        self.assertFalse(transaction.active)
+        self.assertEqual(
+            transaction.batched_replayssm_attestation["status"],
+            "identity_error_rolled_back",
+        )
+        for index, expected in initial_array_states.items():
+            for actual_state, expected_state in zip(
+                cache[index].cache, expected, strict=True
+            ):
+                self.assertIs(actual_state, expected_state)
+        for index, (keys, values, offset) in initial_kv_states.items():
+            self.assertIs(cache[index].keys, keys)
+            self.assertIs(cache[index].values, values)
+            self.assertEqual(cache[index].offset, offset)
+        counters = batched_replayssm_commit_counters()
+        self.assertEqual(counters["identity_prepares"], 1)
+        self.assertEqual(counters["identity_errors"], 1)
+        self.assertEqual(counters["identity_commits"], 0)
+        telemetry = batched_replayssm_commit_telemetry()
+        self.assertEqual(
+            telemetry["latest_attestation"],
+            transaction.batched_replayssm_attestation,
+        )
+
+    def test_identity_mid_commit_failure_rolls_back_every_cache(self):
+        model = _tiny_model()
+        cache = model.make_cache()
+        prefill = model(mx.array([[1, 2]], dtype=mx.uint32), cache=cache)
+        mx.eval(prefill, _cache_arrays(cache))
+        initial_array_states = {
+            index: list(entry.cache)
+            for index, entry in enumerate(cache)
+            if isinstance(entry, ArraysCache)
+        }
+        initial_kv_states = {
+            index: (entry.keys, entry.values, entry.offset)
+            for index, entry in enumerate(cache)
+            if not isinstance(entry, ArraysCache)
+        }
+        environment = {
+            REPLAYSSM_SPECULATIVE_ENV: "1",
+            BATCHED_REPLAYSSM_COMMIT_ENV: "1",
+            BATCHED_REPLAYSSM_EXPECTED_LAYERS_ENV: "3",
+            FULL_ACCEPT_IDENTITY_COMMIT_ENV: "1",
+        }
+        original_commit = ArraysCache.commit_speculative
+        commit_calls = 0
+
+        def fail_second_commit(layer_cache, states):
+            nonlocal commit_calls
+            commit_calls += 1
+            if commit_calls == 2:
+                raise RuntimeError("injected identity mid-commit failure")
+            return original_commit(layer_cache, states)
+
+        with mock.patch.dict(os.environ, environment, clear=False):
+            transaction = model.begin_speculative_cache(cache, 3)
+            wide = model(mx.array([[3, 4, 5]], dtype=mx.uint32), cache=cache)
+            mx.eval(wide)
+            with mock.patch.object(
+                ArraysCache,
+                "commit_speculative",
+                autospec=True,
+                side_effect=fail_second_commit,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "mid-commit"):
+                    model.resolve_speculative_cache(transaction, consumed=3)
+
+        self.assertEqual(commit_calls, 2)
+        self.assertFalse(transaction.active)
+        self.assertEqual(
+            transaction.batched_replayssm_attestation["status"],
+            "identity_error_rolled_back",
+        )
+        for index, expected in initial_array_states.items():
+            for actual_state, expected_state in zip(
+                cache[index].cache, expected, strict=True
+            ):
+                self.assertIs(actual_state, expected_state)
+        for index, (keys, values, offset) in initial_kv_states.items():
+            self.assertIs(cache[index].keys, keys)
+            self.assertIs(cache[index].values, values)
+            self.assertEqual(cache[index].offset, offset)
+        counters = batched_replayssm_commit_counters()
+        self.assertEqual(counters["identity_prepares"], 1)
+        self.assertEqual(counters["identity_errors"], 1)
+        self.assertEqual(counters["identity_commits"], 0)
 
 
 if __name__ == "__main__":
