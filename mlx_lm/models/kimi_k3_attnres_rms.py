@@ -56,40 +56,18 @@ _FUSED_ATTNRES_RMS_SOURCE = r"""
     }
 
     threadgroup float mix_sums[NACC * MIX_NSIMD];
-    // A vector simd_sum folds each component through the same tree as a
-    // scalar call, so the per-accumulator associations are unchanged.
     if (tid < MIX_THREADS) {
-      for (int i = 0; i + 4 <= NACC; i += 4) {
-        const float4 sums =
-            simd_sum(float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]));
+      for (int i = 0; i < NACC; ++i) {
+        const float value = simd_sum(acc[i]);
         if (lane == 0) {
-          mix_sums[i * MIX_NSIMD + sg] = sums.x;
-          mix_sums[(i + 1) * MIX_NSIMD + sg] = sums.y;
-          mix_sums[(i + 2) * MIX_NSIMD + sg] = sums.z;
-          mix_sums[(i + 3) * MIX_NSIMD + sg] = sums.w;
-        }
-      }
-      if constexpr (NACC % 4 >= 2) {
-        const int i = (NACC / 4) * 4;
-        const float2 sums = simd_sum(float2(acc[i], acc[i + 1]));
-        if (lane == 0) {
-          mix_sums[i * MIX_NSIMD + sg] = sums.x;
-          mix_sums[(i + 1) * MIX_NSIMD + sg] = sums.y;
-        }
-      }
-      if constexpr (NACC % 2 == 1) {
-        const float s = simd_sum(acc[NACC - 1]);
-        if (lane == 0) {
-          mix_sums[(NACC - 1) * MIX_NSIMD + sg] = s;
+          mix_sums[i * MIX_NSIMD + sg] = value;
         }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Every thread folds the partial sums and softmax in the same order, so
-    // the weights need no shared array or barrier to broadcast them.
-    float mix_weights[K + 1];
-    {
+    threadgroup float mix_weights[K + 1];
+    if (tid == 0) {
       float totals[NACC];
       for (int i = 0; i < NACC; ++i) {
         totals[i] = 0.0f;
@@ -118,59 +96,30 @@ _FUSED_ATTNRES_RMS_SOURCE = r"""
         mix_weights[k] = logits[k] / denominator;
       }
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // This cast is the stock AttnRes materialization boundary.  RMSNorm must
     // consume the rounded BF16 value, rather than the float accumulator.
-    // The fill, reduction, and output loops all use the same element-to-lane
-    // map, so each thread keeps its rounded values in registers and the
-    // shared mixed array plus its barrier can go.
-    constexpr uint MIX_ITERS =
-        (D + RMS_THREADS * RMS_N_READS - 1) / (RMS_THREADS * RMS_N_READS);
-    InT mvals[MIX_ITERS][RMS_N_READS];
+    threadgroup InT mixed[D];
     const float partial_weight = mix_weights[K];
-    for (uint iter = 0u; iter < MIX_ITERS; ++iter) {
-      const uint base =
-          iter * RMS_THREADS * RMS_N_READS + tid * RMS_N_READS;
-      if (base < D) {
-        const uint2 packed_p =
-            *reinterpret_cast<const device uint2*>(partial + base);
-        float values[RMS_N_READS];
-        {
-          const ushort bits[4] = {
-              ushort(packed_p.x), ushort(packed_p.x >> 16),
-              ushort(packed_p.y), ushort(packed_p.y >> 16)};
-          for (int i = 0; i < RMS_N_READS; ++i) {
-            values[i] =
-                partial_weight * static_cast<float>(as_type<InT>(bits[i]));
-          }
-        }
-        for (int k = 0; k < K; ++k) {
-          const uint2 packed_r =
-              *reinterpret_cast<const device uint2*>(raw + k * D + base);
-          const ushort bits[4] = {
-              ushort(packed_r.x), ushort(packed_r.x >> 16),
-              ushort(packed_r.y), ushort(packed_r.y >> 16)};
-          const float weight_k = mix_weights[k];
-          for (int i = 0; i < RMS_N_READS; ++i) {
-            values[i] +=
-                weight_k * static_cast<float>(as_type<InT>(bits[i]));
-          }
-        }
-        for (int i = 0; i < RMS_N_READS; ++i) {
-          mvals[iter][i] = static_cast<InT>(values[i]);
-        }
+    for (uint d = tid; d < D; d += RMS_THREADS) {
+      float value = partial_weight * static_cast<float>(partial[d]);
+      for (int k = 0; k < K; ++k) {
+        value += mix_weights[k] * static_cast<float>(raw[k * D + d]);
       }
+      mixed[d] = static_cast<InT>(value);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Reproduce MLX rms_looped for D=7168: four adjacent values per thread,
     // a 1024-thread looped reduction, and precise rsqrt.
     float rms_acc = 0.0f;
-    for (uint iter = 0u; iter < MIX_ITERS; ++iter) {
-      const uint base =
-          iter * RMS_THREADS * RMS_N_READS + tid * RMS_N_READS;
-      if (base < D) {
-        for (int i = 0; i < RMS_N_READS; ++i) {
-          const float value = static_cast<float>(mvals[iter][i]);
+    for (uint r = 0; r < D; r += RMS_THREADS * RMS_N_READS) {
+      const uint base = r + tid * RMS_N_READS;
+      for (int i = 0; i < RMS_N_READS; ++i) {
+        const uint d = base + i;
+        if (d < D) {
+          const float value = static_cast<float>(mixed[d]);
           rms_acc += value * value;
         }
       }
@@ -178,35 +127,33 @@ _FUSED_ATTNRES_RMS_SOURCE = r"""
     rms_acc = simd_sum(rms_acc);
 
     threadgroup float rms_sums[RMS_SIMD];
+    threadgroup float rms_inv[1];
+    if (sg == 0) {
+      rms_sums[lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) {
       rms_sums[sg] = rms_acc;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Every SIMD group folds the 32 partials itself, so the inverse RMS needs
-    // no shared broadcast or extra barrier.
-    const float rms_inv =
-        metal::precise::rsqrt(simd_sum(rms_sums[lane]) / D + eps[0]);
+    if (sg == 0) {
+      rms_acc = simd_sum(rms_sums[lane]);
+      if (lane == 0) {
+        rms_inv[0] = metal::precise::rsqrt(rms_acc / D + eps[0]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint iter = 0u; iter < MIX_ITERS; ++iter) {
-      const uint base =
-          iter * RMS_THREADS * RMS_N_READS + tid * RMS_N_READS;
-      if (base < D) {
-        const uint2 packed_w =
-            *reinterpret_cast<const device uint2*>(norm_weight + base);
-        const ushort w_bits[4] = {
-            ushort(packed_w.x), ushort(packed_w.x >> 16),
-            ushort(packed_w.y), ushort(packed_w.y >> 16)};
-        ushort out_bits[4];
-        for (int i = 0; i < RMS_N_READS; ++i) {
+    for (uint r = 0; r < D; r += RMS_THREADS * RMS_N_READS) {
+      const uint base = r + tid * RMS_N_READS;
+      for (int i = 0; i < RMS_N_READS; ++i) {
+        const uint d = base + i;
+        if (d < D) {
           // Keep the same intermediate cast and multiply order as rms_looped.
-          out_bits[i] = as_type<ushort>(
-              as_type<InT>(w_bits[i]) *
+          out[d] = norm_weight[d] *
               static_cast<InT>(
-                  static_cast<float>(mvals[iter][i]) * rms_inv));
+                  static_cast<float>(mixed[d]) * rms_inv[0]);
         }
-        *reinterpret_cast<device uint2*>(out + base) = uint2(
-            uint(out_bits[0]) | (uint(out_bits[1]) << 16),
-            uint(out_bits[2]) | (uint(out_bits[3]) << 16));
       }
     }
 """
@@ -225,7 +172,6 @@ _fused_attnres_rms_kernel = (
         ],
         output_names=["out"],
         source=_FUSED_ATTNRES_RMS_SOURCE,
-        ensure_row_contiguous=True,
     )
     if mx.metal.is_available()
     else None

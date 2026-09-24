@@ -218,38 +218,16 @@ _ATTN_RES_SOURCE = """
     }
 
     threadgroup float shm[NACC * NSIMD];
-    // A vector simd_sum folds each component through the same tree as a
-    // scalar call, so the per-accumulator associations are unchanged.
-    for (int i = 0; i + 4 <= NACC; i += 4) {
-      const float4 sums =
-          simd_sum(float4(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]));
+    for (int i = 0; i < NACC; ++i) {
+      float s = simd_sum(acc[i]);
       if (lane == 0) {
-        shm[i * NSIMD + sg] = sums.x;
-        shm[(i + 1) * NSIMD + sg] = sums.y;
-        shm[(i + 2) * NSIMD + sg] = sums.z;
-        shm[(i + 3) * NSIMD + sg] = sums.w;
-      }
-    }
-    if constexpr (NACC % 4 >= 2) {
-      const int i = (NACC / 4) * 4;
-      const float2 sums = simd_sum(float2(acc[i], acc[i + 1]));
-      if (lane == 0) {
-        shm[i * NSIMD + sg] = sums.x;
-        shm[(i + 1) * NSIMD + sg] = sums.y;
-      }
-    }
-    if constexpr (NACC % 2 == 1) {
-      const float s = simd_sum(acc[NACC - 1]);
-      if (lane == 0) {
-        shm[(NACC - 1) * NSIMD + sg] = s;
+        shm[i * NSIMD + sg] = s;
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Every thread folds the partial sums and softmax in the same order, so
-    // the weights need no shared array or barrier to broadcast them.
-    float weights[K + 1];
-    {
+    threadgroup float weights[K + 1];
+    if (tid == 0) {
       float tot[NACC];
       for (int i = 0; i < NACC; ++i) {
         tot[i] = 0.0f;
@@ -275,62 +253,16 @@ _ATTN_RES_SOURCE = """
         weights[k] = logits[k] / denom;
       }
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float wp = weights[K];
+    float wp = weights[K];
     auto out_ = out + n * D;
-    if constexpr (sizeof(InT) == 2 && D % 8 == 0) {
-      // One uint4 moves eight BF16 values per access; every output element is
-      // independent, so the per-element arithmetic is unchanged.
-      for (uint r = 0; r < D; r += THREADS * 8) {
-        const uint base = r + tid * 8;
-        if (base < D) {
-          const uint4 packed_p =
-              *reinterpret_cast<const device uint4*>(partial_ + base);
-          float values[8];
-          {
-            const ushort bits[8] = {
-                ushort(packed_p.x), ushort(packed_p.x >> 16),
-                ushort(packed_p.y), ushort(packed_p.y >> 16),
-                ushort(packed_p.z), ushort(packed_p.z >> 16),
-                ushort(packed_p.w), ushort(packed_p.w >> 16)};
-            for (int i = 0; i < 8; ++i) {
-              values[i] =
-                  wp * static_cast<float>(as_type<InT>(bits[i]));
-            }
-          }
-          for (int k = 0; k < K; ++k) {
-            const uint4 packed_r = *reinterpret_cast<const device uint4*>(
-                raw + (k * N + n) * D + base);
-            const ushort bits[8] = {
-                ushort(packed_r.x), ushort(packed_r.x >> 16),
-                ushort(packed_r.y), ushort(packed_r.y >> 16),
-                ushort(packed_r.z), ushort(packed_r.z >> 16),
-                ushort(packed_r.w), ushort(packed_r.w >> 16)};
-            const float weight_k = weights[k];
-            for (int i = 0; i < 8; ++i) {
-              values[i] +=
-                  weight_k * static_cast<float>(as_type<InT>(bits[i]));
-            }
-          }
-          *reinterpret_cast<device uint4*>(out_ + base) = uint4(
-              uint(as_type<ushort>(static_cast<InT>(values[0]))) |
-                  (uint(as_type<ushort>(static_cast<InT>(values[1]))) << 16),
-              uint(as_type<ushort>(static_cast<InT>(values[2]))) |
-                  (uint(as_type<ushort>(static_cast<InT>(values[3]))) << 16),
-              uint(as_type<ushort>(static_cast<InT>(values[4]))) |
-                  (uint(as_type<ushort>(static_cast<InT>(values[5]))) << 16),
-              uint(as_type<ushort>(static_cast<InT>(values[6]))) |
-                  (uint(as_type<ushort>(static_cast<InT>(values[7]))) << 16));
-        }
+    for (uint d = tid; d < D; d += THREADS) {
+      float o = wp * static_cast<float>(partial_[d]);
+      for (int k = 0; k < K; ++k) {
+        o += weights[k] * static_cast<float>(raw[(k * N + n) * D + d]);
       }
-    } else {
-      for (uint d = tid; d < D; d += THREADS) {
-        float o = wp * static_cast<float>(partial_[d]);
-        for (int k = 0; k < K; ++k) {
-          o += weights[k] * static_cast<float>(raw[(k * N + n) * D + d]);
-        }
-        out_[d] = static_cast<InT>(o);
-      }
+      out_[d] = static_cast<InT>(o);
     }
 """
 
@@ -340,7 +272,6 @@ _attn_res_kernel = (
         input_names=["raw", "inv_rms", "partial", "w_eff", "eps", "N"],
         output_names=["out"],
         source=_ATTN_RES_SOURCE,
-        ensure_row_contiguous=True,
     )
     if mx.metal.is_available()
     else None

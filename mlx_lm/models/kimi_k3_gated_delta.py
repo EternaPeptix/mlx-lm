@@ -33,23 +33,11 @@ def _make_gated_delta_kernel(
         g_setup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
         g_access = "g_[s_idx]"
         g_advance = "g_ += Hv * Dk;"
-        g_vec_unpack = """
-              const ushort4 g_quad =
-                  *reinterpret_cast<const device ushort4*>(
-                      g_ + n_per_t * dk_idx);
-              g_reg[0] = static_cast<float>(as_type<InT>(g_quad.x));
-              g_reg[1] = static_cast<float>(as_type<InT>(g_quad.y));
-              g_reg[2] = static_cast<float>(as_type<InT>(g_quad.z));
-              g_reg[3] = static_cast<float>(as_type<InT>(g_quad.w));"""
     else:
         g_comment = "// g: [B, T, Hv]"
         g_setup = "auto g_ = g + b_idx * T * Hv;"
         g_access = "g_[hv_idx]"
         g_advance = "g_ += Hv;"
-        g_vec_unpack = """
-              for (int i = 0; i < n_per_t; ++i) {
-                g_reg[i] = static_cast<float>(g_[hv_idx]);
-              }"""
 
     state_history_write = (
         """
@@ -118,7 +106,12 @@ def _make_gated_delta_kernel(
             float q_reg[n_per_t];
             float k_reg[n_per_t];
             float g_reg[n_per_t];
-            if constexpr (sizeof(InT) == 2 && n_per_t == 4) {{
+            // g is FP32 from compute_g, not InT, so it keeps scalar loads.
+            for (int i = 0; i < n_per_t; ++i) {{
+              auto s_idx = n_per_t * dk_idx + i;
+              g_reg[i] = static_cast<float>({g_access});
+            }}
+            if constexpr (sizeof(InT) == 2 && sizeof(KT) == 2 && n_per_t == 4) {{
               const ushort4 q_quad =
                   *reinterpret_cast<const device ushort4*>(
                       q_ + n_per_t * dk_idx);
@@ -129,17 +122,15 @@ def _make_gated_delta_kernel(
               q_reg[1] = static_cast<float>(as_type<InT>(q_quad.y));
               q_reg[2] = static_cast<float>(as_type<InT>(q_quad.z));
               q_reg[3] = static_cast<float>(as_type<InT>(q_quad.w));
-              k_reg[0] = static_cast<float>(as_type<InT>(k_quad.x));
-              k_reg[1] = static_cast<float>(as_type<InT>(k_quad.y));
-              k_reg[2] = static_cast<float>(as_type<InT>(k_quad.z));
-              k_reg[3] = static_cast<float>(as_type<InT>(k_quad.w));
-{g_vec_unpack}
+              k_reg[0] = static_cast<float>(as_type<KT>(k_quad.x));
+              k_reg[1] = static_cast<float>(as_type<KT>(k_quad.y));
+              k_reg[2] = static_cast<float>(as_type<KT>(k_quad.z));
+              k_reg[3] = static_cast<float>(as_type<KT>(k_quad.w));
             }} else {{
               for (int i = 0; i < n_per_t; ++i) {{
                 auto s_idx = n_per_t * dk_idx + i;
                 q_reg[i] = static_cast<float>(q_[s_idx]);
                 k_reg[i] = static_cast<float>(k_[s_idx]);
-                g_reg[i] = static_cast<float>({g_access});
               }}
             }}
             float kv_mem = 0.0f;
@@ -275,30 +266,13 @@ def _make_experimental_kda_row_prefill_kernel():
         float state[RowsPerSimd][n_per_t];
         for (int row = 0; row < RowsPerSimd; ++row) {
           auto dv_idx = dv_base + row;
-          if constexpr (sizeof(StT) == 4 && n_per_t == 4) {
-            if (dv_idx < Dv) {
-              const float4 state_quad =
-                  *reinterpret_cast<const device float4*>(
-                      i_state_head + dv_idx * Dk + n_per_t * lane);
-              state[row][0] = state_quad.x;
-              state[row][1] = state_quad.y;
-              state[row][2] = state_quad.z;
-              state[row][3] = state_quad.w;
-            } else {
-              state[row][0] = 0.0f;
-              state[row][1] = 0.0f;
-              state[row][2] = 0.0f;
-              state[row][3] = 0.0f;
-            }
-          } else {
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * lane + i;
-              state[row][i] =
-                  dv_idx < Dv
-                      ? static_cast<float>(
-                            i_state_head[dv_idx * Dk + s_idx])
-                      : 0.0f;
-            }
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * lane + i;
+            state[row][i] =
+                dv_idx < Dv
+                    ? static_cast<float>(
+                          i_state_head[dv_idx * Dk + s_idx])
+                    : 0.0f;
           }
         }
 
@@ -310,35 +284,11 @@ def _make_experimental_kda_row_prefill_kernel():
           float q_reg[n_per_t];
           float k_reg[n_per_t];
           float g_reg[n_per_t];
-          if constexpr (sizeof(InT) == 2 && n_per_t == 4) {
-            const ushort4 q_quad =
-                *reinterpret_cast<const device ushort4*>(
-                    q_ + n_per_t * lane);
-            const ushort4 k_quad =
-                *reinterpret_cast<const device ushort4*>(
-                    k_ + n_per_t * lane);
-            const ushort4 g_quad =
-                *reinterpret_cast<const device ushort4*>(
-                    g_ + n_per_t * lane);
-            q_reg[0] = static_cast<float>(as_type<InT>(q_quad.x));
-            q_reg[1] = static_cast<float>(as_type<InT>(q_quad.y));
-            q_reg[2] = static_cast<float>(as_type<InT>(q_quad.z));
-            q_reg[3] = static_cast<float>(as_type<InT>(q_quad.w));
-            k_reg[0] = static_cast<float>(as_type<InT>(k_quad.x));
-            k_reg[1] = static_cast<float>(as_type<InT>(k_quad.y));
-            k_reg[2] = static_cast<float>(as_type<InT>(k_quad.z));
-            k_reg[3] = static_cast<float>(as_type<InT>(k_quad.w));
-            g_reg[0] = static_cast<float>(as_type<InT>(g_quad.x));
-            g_reg[1] = static_cast<float>(as_type<InT>(g_quad.y));
-            g_reg[2] = static_cast<float>(as_type<InT>(g_quad.z));
-            g_reg[3] = static_cast<float>(as_type<InT>(g_quad.w));
-          } else {
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * lane + i;
-              q_reg[i] = static_cast<float>(q_[s_idx]);
-              k_reg[i] = static_cast<float>(k_[s_idx]);
-              g_reg[i] = static_cast<float>(g_[s_idx]);
-            }
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * lane + i;
+            q_reg[i] = static_cast<float>(q_[s_idx]);
+            k_reg[i] = static_cast<float>(k_[s_idx]);
+            g_reg[i] = static_cast<float>(g_[s_idx]);
           }
           auto beta_value = static_cast<float>(beta_[hv_idx]);
 
@@ -380,20 +330,10 @@ def _make_experimental_kda_row_prefill_kernel():
         for (int row = 0; row < RowsPerSimd; ++row) {
           auto dv_idx = dv_base + row;
           if (dv_idx < Dv) {
-            if constexpr (sizeof(StT) == 4 && n_per_t == 4) {
-              *reinterpret_cast<device float4*>(
-                  o_state_head + dv_idx * Dk + n_per_t * lane) =
-                  float4(
-                      state[row][0],
-                      state[row][1],
-                      state[row][2],
-                      state[row][3]);
-            } else {
-              for (int i = 0; i < n_per_t; ++i) {
-                auto s_idx = n_per_t * lane + i;
-                o_state_head[dv_idx * Dk + s_idx] =
-                    static_cast<StT>(state[row][i]);
-              }
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * lane + i;
+              o_state_head[dv_idx * Dk + s_idx] =
+                  static_cast<StT>(state[row][i]);
             }
           }
         }
@@ -648,6 +588,7 @@ def gated_delta_kernel(
         inputs=inputs,
         template=[
             ("InT", input_type),
+            ("KT", k.dtype),
             ("StT", state_type),
             ("Dk", Dk),
             ("Dv", Dv),

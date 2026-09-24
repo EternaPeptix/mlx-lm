@@ -24,58 +24,25 @@ inline float k3_tuned_load_x_2bit(
     const device T* x,
     thread float* x_thread) {
   float sum = 0.0f;
-  if constexpr (sizeof(T) == 2) {
-    // Two 16-byte reads carry the same sixteen values the scalar walk loads;
-    // callers always hand in freshly allocated, 16-byte-aligned activations.
-    const device uint4* x_octets =
-        reinterpret_cast<const device uint4*>(x);
-    for (int i = 0; i < 16; i += 8) {
-      const uint4 octet = x_octets[i / 8];
-      const thread T values[8] = {
-          as_type<T>(ushort(octet.x)),
-          as_type<T>(ushort(octet.x >> 16)),
-          as_type<T>(ushort(octet.y)),
-          as_type<T>(ushort(octet.y >> 16)),
-          as_type<T>(ushort(octet.z)),
-          as_type<T>(ushort(octet.z >> 16)),
-          as_type<T>(ushort(octet.w)),
-          as_type<T>(ushort(octet.w >> 16)),
-      };
-      // Keep the same expression types and association as MLX's load_vector.
-      sum += values[0] + values[1] + values[2] + values[3];
-      x_thread[i] = values[0];
-      x_thread[i + 1] = values[1] / 4.0f;
-      x_thread[i + 2] = values[2] / 16.0f;
-      x_thread[i + 3] = values[3] / 64.0f;
-      sum += values[4] + values[5] + values[6] + values[7];
-      x_thread[i + 4] = values[4];
-      x_thread[i + 5] = values[5] / 4.0f;
-      x_thread[i + 6] = values[6] / 16.0f;
-      x_thread[i + 7] = values[7] / 64.0f;
-    }
-  } else {
-    for (int i = 0; i < 16; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 4.0f;
-      x_thread[i + 2] = x[i + 2] / 16.0f;
-      x_thread[i + 3] = x[i + 3] / 64.0f;
-    }
+  for (int i = 0; i < 16; i += 4) {
+    sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+    x_thread[i] = x[i];
+    x_thread[i + 1] = x[i + 1] / 4.0f;
+    x_thread[i + 2] = x[i + 2] / 16.0f;
+    x_thread[i + 3] = x[i + 3] / 64.0f;
   }
   return sum;
 }
 
 inline float k3_tuned_qdot_2bit(
-    const uint packed_word,
+    const device uint8_t* w,
     const thread float* x_thread,
     float scale,
     float bias,
     float sum) {
-  // The caller issues the one 32-bit read per row up front so a block's
-  // loads can all be in flight; every weight pointer is four-byte aligned.
   float accum = 0.0f;
   for (int i = 0; i < 4; ++i) {
-    const uint8_t packed = uint8_t((packed_word >> (8 * i)) & 0xffu);
+    uint8_t packed = w[i];
     accum +=
         x_thread[4 * i] * (packed & 0x03) +
         x_thread[4 * i + 1] * (packed & 0x0c) +
@@ -128,89 +95,36 @@ const device T* bias_ptr =
 thread float x_thread[VALUES_PER_THREAD];
 thread float result[RESULTS] = {0.0f};
 
-// Register double-buffering: the next block's DRAM loads are issued before
-// the current block's dot products, so they stay in flight during the FMAs.
-// Loads are pure, so the arithmetic itself is unchanged.
-uint weight_words[RESULTS];
-T scale_values[RESULTS];
-T bias_values[RESULTS];
-for (int row = 0; row < RESULTS; ++row) {
-  weight_words[row] = *reinterpret_cast<const device uint*>(
-      weight_ptr + row * packed_input_width);
-  scale_values[row] = scale_ptr[row * scale_width];
-  if constexpr (!DERIVE_BIAS) {
-    bias_values[row] = bias_ptr[row * scale_width];
-  }
-}
-
 for (uint k = 0; k < input_width; k += BLOCK_SIZE) {
-  const bool has_next = k + BLOCK_SIZE < input_width;
-  uint next_words[RESULTS];
-  T next_scales[RESULTS];
-  T next_biases[RESULTS];
-  if (has_next) {
-    weight_ptr += BLOCK_SIZE / 4;
-    scale_ptr += BLOCK_SIZE / GROUP_SIZE;
-    bias_ptr += BLOCK_SIZE / GROUP_SIZE;
-    for (int row = 0; row < RESULTS; ++row) {
-      next_words[row] = *reinterpret_cast<const device uint*>(
-          weight_ptr + row * packed_input_width);
-      next_scales[row] = scale_ptr[row * scale_width];
-      if constexpr (!DERIVE_BIAS) {
-        next_biases[row] = bias_ptr[row * scale_width];
-      }
-    }
-  }
   float sum = k3_tuned_load_x_2bit<T>(x_ptr, x_thread);
   for (int row = 0; row < RESULTS; ++row) {
-    const float scale = static_cast<float>(scale_values[row]);
-    const float bias =
-        DERIVE_BIAS
-            ? k3_tuned_derive_affine2_bias<T>(scale_values[row])
-            : static_cast<float>(bias_values[row]);
+    T scale_value = scale_ptr[row * scale_width];
+    float scale = static_cast<float>(scale_value);
+    float bias;
+    if constexpr (DERIVE_BIAS) {
+      bias = k3_tuned_derive_affine2_bias<T>(scale_value);
+    } else {
+      bias = static_cast<float>(bias_ptr[row * scale_width]);
+    }
     result[row] += k3_tuned_qdot_2bit(
-        weight_words[row],
+        weight_ptr + row * packed_input_width,
         x_thread,
         scale,
         bias,
         sum);
   }
-  if (has_next) {
-    for (int row = 0; row < RESULTS; ++row) {
-      weight_words[row] = next_words[row];
-      scale_values[row] = next_scales[row];
-      if constexpr (!DERIVE_BIAS) {
-        bias_values[row] = next_biases[row];
-      }
-    }
-  }
   x_ptr += BLOCK_SIZE;
+  weight_ptr += BLOCK_SIZE / 4;
+  scale_ptr += BLOCK_SIZE / GROUP_SIZE;
+  bias_ptr += BLOCK_SIZE / GROUP_SIZE;
 }
 
-thread float result_sums[RESULTS];
-// A vector simd_sum folds each component through the same tree as a scalar
-// call, so the per-row associations are unchanged.
-for (int row = 0; row + 4 <= RESULTS; row += 4) {
-  const float4 sums = simd_sum(
-      float4(result[row], result[row + 1], result[row + 2], result[row + 3]));
-  result_sums[row] = sums.x;
-  result_sums[row + 1] = sums.y;
-  result_sums[row + 2] = sums.z;
-  result_sums[row + 3] = sums.w;
-}
-if constexpr (RESULTS % 4 >= 2) {
-  const int row = (RESULTS / 4) * 4;
-  const float2 sums = simd_sum(float2(result[row], result[row + 1]));
-  result_sums[row] = sums.x;
-  result_sums[row + 1] = sums.y;
-}
-if constexpr (RESULTS % 2 == 1) {
-  result_sums[RESULTS - 1] = simd_sum(result[RESULTS - 1]);
-}
-// Run the RESULTS output casts on parallel lanes instead of serially.
-if (lane < RESULTS) {
-  y[expert_slot * output_width + output_base + lane] =
-      static_cast<T>(result_sums[lane]);
+for (int row = 0; row < RESULTS; ++row) {
+  float value = simd_sum(result[row]);
+  if (lane == 0) {
+    y[expert_slot * output_width + output_base + row] =
+        static_cast<T>(value);
+  }
 }
 """
 
