@@ -81,50 +81,58 @@ const uint simdgroup = simdgroup_index_in_threadgroup;
 const uint row = threadgroup_position_in_grid.y;
 const device GateT* row_gates = gates + row * EXPERTS;
 
-// Cache the authoritative FP32 sigmoid once per expert.  At 896 experts this
-// is a bounded 3.5 KiB of threadgroup storage and avoids an extra dispatch
-// without paying for repeated exponentials when a winning lane is rescanned.
-threadgroup float row_scores[EXPERTS];
-for (uint slot = 0u; slot < EXPERTS_PER_THREAD; ++slot) {
-  const uint expert = thread_id + slot * THREADS;
-  if (expert < EXPERTS) {
-    row_scores[expert] =
-        k3_router_sigmoid(static_cast<float>(row_gates[expert]));
-  }
-}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-
-// Each thread owns at most four strided experts.  Keep only its current
-// maximum and rescan that thread when (and only when) it supplies a global
-// winner.
-uint selected_mask = 0u;
-float lane_score = 0.0f;
-uint lane_index = UINT_MAX;
-uint lane_slot = UINT_MAX;
+// Sort each thread's strided candidates once, best first.  The raw score
+// stays out of shared memory: every thread reevaluates the deterministic
+// sigmoid for its own candidates and for each round's winner, which is
+// cheaper than the barrier a shared score table would need.  Extraction
+// rounds then only pop the winning thread's head, so the selection order
+// is identical to repeated maximum extraction without any rescan.
+float lane_scores_list[EXPERTS_PER_THREAD];
+uint lane_indices_list[EXPERTS_PER_THREAD];
+uint lane_count = 0u;
 for (uint slot = 0u; slot < EXPERTS_PER_THREAD; ++slot) {
   const uint expert = thread_id + slot * THREADS;
   if (expert >= EXPERTS) {
     continue;
   }
-  const float corrected = row_scores[expert] + bias[expert];
-  if (k3_router_better(
-          corrected, expert, lane_score, lane_index)) {
-    lane_score = corrected;
-    lane_index = expert;
-    lane_slot = slot;
+  const float corrected =
+      k3_router_sigmoid(static_cast<float>(row_gates[expert])) +
+      bias[expert];
+  uint pos = 0u;
+  while (pos < lane_count &&
+         k3_router_better(
+             lane_scores_list[pos],
+             lane_indices_list[pos],
+             corrected,
+             expert)) {
+    ++pos;
   }
+  for (uint shift = lane_count; shift > pos; --shift) {
+    lane_scores_list[shift] = lane_scores_list[shift - 1];
+    lane_indices_list[shift] = lane_indices_list[shift - 1];
+  }
+  lane_scores_list[pos] = corrected;
+  lane_indices_list[pos] = expert;
+  ++lane_count;
 }
+uint lane_head = 0u;
 
 uint selected_index = 0u;
-threadgroup float simdgroup_scores[SIMDGROUPS];
-threadgroup uint simdgroup_indices[SIMDGROUPS];
-threadgroup uint global_winner;
-threadgroup float selected_scores[TOP_K];
-threadgroup float denominator;
+float my_scores[TOP_K];
+// Double-buffering lets the next round overwrite the other bank while
+// stragglers still read this one, so one barrier suffices per round.
+threadgroup float simdgroup_scores[2][SIMDGROUPS];
+threadgroup uint simdgroup_indices[2][SIMDGROUPS];
 
 for (uint rank = 0u; rank < TOP_K; ++rank) {
-  float simd_winner_score = lane_score;
-  uint simd_winner_index = lane_index;
+  const uint bank = rank & 1u;
+  const float head_score =
+      lane_head < lane_count ? lane_scores_list[lane_head] : 0.0f;
+  const uint head_index =
+      lane_head < lane_count ? lane_indices_list[lane_head] : UINT_MAX;
+
+  float simd_winner_score = head_score;
+  uint simd_winner_index = head_index;
 
   for (ushort delta = 16; delta > 0; delta >>= 1) {
     const float other_score = simd_shuffle_down(simd_winner_score, delta);
@@ -141,81 +149,59 @@ for (uint rank = 0u; rank < TOP_K; ++rank) {
   }
 
   if (lane == 0u) {
-    simdgroup_scores[simdgroup] = simd_winner_score;
-    simdgroup_indices[simdgroup] = simd_winner_index;
+    simdgroup_scores[bank][simdgroup] = simd_winner_score;
+    simdgroup_indices[bank][simdgroup] = simd_winner_index;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (simdgroup == 0u) {
-    float block_score =
-        lane < SIMDGROUPS ? simdgroup_scores[lane] : 0.0f;
-    uint block_index =
-        lane < SIMDGROUPS ? simdgroup_indices[lane] : UINT_MAX;
-    for (ushort delta = 16; delta > 0; delta >>= 1) {
-      const float other_score = simd_shuffle_down(block_score, delta);
-      const uint other_index = simd_shuffle_down(block_index, delta);
-      if (lane + delta < 32u &&
-          k3_router_better(
-              other_score, other_index, block_score, block_index)) {
-        block_score = other_score;
-        block_index = other_index;
-      }
-    }
-    if (lane == 0u) {
-      global_winner = block_index;
+  // Every SIMD group replays the block reduction, so the winner is broadcast
+  // without a second shared-memory round trip or a trailing barrier.  Only
+  // SIMDGROUPS lanes hold candidates and the comparison is a strict total
+  // order, so the shorter butterfly finds the same unique winner.
+  float block_score =
+      lane < SIMDGROUPS ? simdgroup_scores[bank][lane] : 0.0f;
+  uint block_index =
+      lane < SIMDGROUPS ? simdgroup_indices[bank][lane] : UINT_MAX;
+  for (ushort delta = SIMDGROUPS / 2; delta > 0; delta >>= 1) {
+    const float other_score = simd_shuffle_down(block_score, delta);
+    const uint other_index = simd_shuffle_down(block_index, delta);
+    if (lane + delta < 32u &&
+        k3_router_better(
+            other_score, other_index, block_score, block_index)) {
+      block_score = other_score;
+      block_index = other_index;
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  const uint winner = global_winner;
-  const uint winner_thread = winner % THREADS;
-  if (thread_id == winner_thread && rank + 1u < TOP_K) {
-    selected_mask |= 1u << lane_slot;
-    lane_score = 0.0f;
-    lane_index = UINT_MAX;
-    lane_slot = UINT_MAX;
-    for (uint slot = 0u; slot < EXPERTS_PER_THREAD; ++slot) {
-      if ((selected_mask & (1u << slot)) != 0u) {
-        continue;
-      }
-      const uint expert = thread_id + slot * THREADS;
-      if (expert >= EXPERTS) {
-        continue;
-      }
-      const float corrected = row_scores[expert] + bias[expert];
-      if (k3_router_better(
-              corrected, expert, lane_score, lane_index)) {
-        lane_score = corrected;
-        lane_index = expert;
-        lane_slot = slot;
-      }
-    }
+  // The shuffle_down butterfly completes on lane 0 only.
+  const uint winner = simd_broadcast_first(block_index);
+  my_scores[rank] =
+      k3_router_sigmoid(static_cast<float>(row_gates[winner]));
+  if (winner == head_index) {
+    ++lane_head;
   }
   if (thread_id == rank) {
     selected_index = winner;
-    selected_scores[rank] = row_scores[winner];
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 // MLX's small-row reduction handles each supported row in one thread and
 // folds the values from slot 0 through slot TOP_K-1.  Preserve that exact
 // association: a SIMD reduction can differ by one FP32 ULP, which is enough
-// to cross a BF16 rounding midpoint after normalization.
-if (thread_id == 0u) {
-  float total = 0.0f;
-  for (uint rank = 0u; rank < TOP_K; ++rank) {
-    total = selected_scores[rank] + total;
-  }
-  denominator = total + 1.0e-20f;
+// to cross a BF16 rounding midpoint after normalization.  Every thread
+// recorded the same per-round scores, so it folds the denominator locally
+// with no shared table or barrier.
+float denominator = 0.0f;
+for (uint rank = 0u; rank < TOP_K; ++rank) {
+  denominator = my_scores[rank] + denominator;
 }
-threadgroup_barrier(mem_flags::mem_threadgroup);
+denominator += 1.0e-20f;
 
 if (thread_id < TOP_K) {
   const uint output = row * TOP_K + thread_id;
   indices[output] = selected_index;
   weights[output] =
-      static_cast<WeightT>(selected_scores[thread_id] / denominator);
+      static_cast<WeightT>(my_scores[thread_id] / denominator);
 }
 """
 
@@ -227,7 +213,7 @@ def _kernel(top_k: int):
     if not _metal_available():
         return None
     return mx.fast.metal_kernel(
-        name=f"k3_fused_router_top{top_k}_v5",
+        name=f"k3_fused_router_top{top_k}_v6",
         input_names=["gates", "bias"],
         output_names=["indices", "weights"],
         header=_HEADER,

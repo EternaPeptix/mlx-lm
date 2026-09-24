@@ -38,20 +38,45 @@ _SOURCE = r"""
     const device T* input = (use_k ? k : q) + local_row * D;
     device T* output = (use_k ? out_k : out_q) + local_row * D;
 
+    thread T values[NREADS];
+    if constexpr (sizeof(T) == 2 && NREADS == 4) {
+      const ushort4 quad =
+          *reinterpret_cast<const device ushort4*>(input + lid * NREADS);
+      values[0] = as_type<T>(quad.x);
+      values[1] = as_type<T>(quad.y);
+      values[2] = as_type<T>(quad.z);
+      values[3] = as_type<T>(quad.w);
+    } else {
+      for (uint i = 0; i < NREADS; ++i) {
+        values[i] = input[lid * NREADS + i];
+      }
+    }
     float acc = 0.0f;
     for (uint i = 0; i < NREADS; ++i) {
-      float value = static_cast<float>(input[lid * NREADS + i]);
+      float value = static_cast<float>(values[i]);
       acc += value * value;
     }
     acc = simd_sum(acc);
     float inv = metal::precise::rsqrt(acc / D + eps[0]);
     float scale = scales[use_k ? 1 : 0];
-    for (uint i = 0; i < NREADS; ++i) {
-      uint index = lid * NREADS + i;
-      // Stock mx.fast.rms_norm stores BF16 before the separate BF16 scalar
-      // multiply. Preserve both boundaries exactly.
-      T rms = static_cast<T>(static_cast<float>(input[index]) * inv);
-      output[index] = static_cast<T>(static_cast<float>(rms) * scale);
+    if constexpr (sizeof(T) == 2 && NREADS == 4) {
+      ushort packed_out[4];
+      for (uint i = 0; i < NREADS; ++i) {
+        // Stock mx.fast.rms_norm stores BF16 before the separate BF16 scalar
+        // multiply. Preserve both boundaries exactly.
+        T rms = static_cast<T>(static_cast<float>(values[i]) * inv);
+        packed_out[i] = as_type<ushort>(
+            static_cast<T>(static_cast<float>(rms) * scale));
+      }
+      *reinterpret_cast<device uint2*>(output + lid * NREADS) = uint2(
+          uint(packed_out[0]) | (uint(packed_out[1]) << 16),
+          uint(packed_out[2]) | (uint(packed_out[3]) << 16));
+    } else {
+      for (uint i = 0; i < NREADS; ++i) {
+        uint index = lid * NREADS + i;
+        T rms = static_cast<T>(static_cast<float>(values[i]) * inv);
+        output[index] = static_cast<T>(static_cast<float>(rms) * scale);
+      }
     }
 """
 
@@ -61,6 +86,7 @@ _KERNEL = (
         input_names=["q", "k", "eps", "scales"],
         output_names=["out_q", "out_k"],
         source=_SOURCE,
+        ensure_row_contiguous=True,
     )
     if mx.metal.is_available()
     else None

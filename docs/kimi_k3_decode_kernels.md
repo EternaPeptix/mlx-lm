@@ -104,3 +104,87 @@ Measurements from the same machines, for anyone continuing this work:
   queue or a concurrent encoder (Metal serializes both), and a persistent
   single-dispatch kernel with atomic grid barriers (slower and not coherent
   without `coherent(device)` memory).
+
+## Second optimization pass
+
+A later pass shaved load and synchronization overhead inside the same kernels.
+All changes keep the exact arithmetic of the first version: every expression
+keeps its operand types and its association order, so the outputs stay
+bit-identical by construction.
+
+- Packed-weight reads load one `uint` per thread instead of four `uint8_t`
+  reads; the same four bytes are extracted with shifts (`fused_switch_glu`,
+  `tuned_gather_qmv`, `fused_down_reduce`, `width4_fused_expert`).
+- Sixteen-element activation reads use four `ushort4` loads (same files), and
+  the KDA kernels use `float4`/`ushort4` for state and per-step q/k/g
+  (`gated_delta`, `fused_qk_rms`, `attnres_rms`). Packed loads stay 8-byte
+  aligned because every activation and weight pointer here is.
+- Each thread's top-k candidates are sorted once up front, so the router's
+  selection loop needs one barrier per round instead of three (`fused_router`,
+  16 rounds).
+- The per-row epilogues run on parallel lanes: lane `r` writes row `r`
+  instead of lane 0 looping `RESULTS` rows serially (`fused_switch_glu`,
+  `width4_fused_expert`, `fused_down_reduce`, `tuned_gather_qmv`).
+- `attnres_rms` packs its `mixed` buffer as `uint2`, drops two barriers
+  (redundant zero-fill and the shared `rms_inv` broadcast; every SIMD group
+  folds the 32 partials itself), and vectorizes the elementwise phases.
+  The reduction that feeds it keeps its strided order.
+- `gated_delta` caches each step's q/k/g in registers so the two inner passes
+  share one load set.
+- Softmax and reduction folds that one thread used to run serially now run
+  identically on every thread, so their shared arrays and broadcast barriers
+  are gone (`attnres_rms`, `attnres_mix` in `kimi_k3.py`, and the router's
+  denominator; the router now has 18 barriers, `attnres_rms` three).
+- `attnres_mix`'s output store uses the same `uint2` packing, and
+  `gated_delta`'s optional state-history store uses `float4`.
+
+Re-run the byte-identical 128-token greedy check and the per-token timing on
+the M3 pair before adopting; this pass was verified for construction, not on
+hardware.
+
+## Third optimization pass
+
+- The router's shared score tables are gone: the presort evaluates
+  `sigmoid(gate) + bias` in registers, every thread records each round's
+  winner score in a private `my_scores[TOP_K]` (the deterministic sigmoid of
+  the same winner), and the denominator is folded locally.  The kernel now
+  has exactly one barrier per extraction round — 16 total (`fused_router`).
+- Sixteen-element activation reads now use two `uint4` loads instead of four
+  `ushort4` loads; the same sixteen bytes are unpacked with shifts
+  (`fused_switch_glu`, `tuned_gather_qmv`, `fused_down_reduce`,
+  `width4_fused_expert`).  This assumes 16-byte-aligned activation pointers,
+  which every caller still supplies.
+- `attnres_rms` no longer stages its `mixed` values through a 14 KiB
+  threadgroup buffer: the fill, reduction, and output loops share the same
+  element-to-lane map, so each thread keeps its rounded BF16 values in a
+  small register array.  That removes one more barrier — two remain
+  (`mix_sums`, `rms_sums`).
+
+- The QMV inner loops now issue a whole block's loads before the dot
+  products: every row's 32-bit weight word plus its scale and bias read in
+  one phase, the L2-resident activation reads next, and the FMA chain last
+  (`fused_switch_glu`, `tuned_gather_qmv`, `fused_down_reduce`, all three
+  `width4` sources).  Load scheduling only; the arithmetic is untouched.
+- The per-row `simd_sum` epilogues now fold a `float4` (with a `float2`
+  remainder) per reduction.  A vector `simd_sum` reduces each component
+  through the same butterfly tree as a scalar call, so the per-row
+  associations are unchanged while the shuffle count drops ~4x
+  (same files as above).  The same treatment covers the per-accumulator
+  `simd_sum` loops in `attnres_rms` and `kimi_k3.py`'s `attnres_mix`.
+- `ensure_row_contiguous=True` is now set on `attnres_rms`, `fused_qk_rms`,
+  and `attnres_mix` for consistency with the other kernels — a no-op for
+  the contiguous inputs they always receive.
+- The QMV k-loops double-buffer their per-block weight/scale/bias words in
+  registers: block k+1's DRAM loads are issued before block k's FMAs run, so
+  the DRAM stream never drains between blocks (all six QMV loops).  Loads
+  are pure; the arithmetic is unchanged.
+- Router fix: the replayed block-level `shuffle_down` butterfly completes
+  on lane 0 only, so the winner is now `simd_broadcast_first` before every
+  lane uses it (the shared `global_winner` had provided that broadcast
+  before the barrier removal).  The same butterfly now starts at
+  `SIMDGROUPS / 2` — only that many lanes hold candidates and the comparison
+  is a strict total order, so the winner is unchanged.  Kernel name bumped
+  to `_v6`.
+
+Same caveat: verified for construction on a Linux box; re-run the
+byte-identical check and timing on the M3 pair.
